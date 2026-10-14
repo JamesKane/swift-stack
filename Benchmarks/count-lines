@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+Benchmarks/count-lines
+Counts non-blank, non-comment physical source lines for Swift and C files.
+Per docs/architecture/14-measurement-methodology.md §5.
+"""
+
+import sys
+import os
+
+def count_source_lines(filepath: str) -> int:
+    try:
+        with open(filepath, 'rb') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}", file=sys.stderr)
+        return 0
+
+    lines = content.split(b'\n')
+    non_blank_non_comment = 0
+    in_block_comment = 0  # nesting level for Swift comments
+
+    for line in lines:
+        line_str = line.strip()
+        if not line_str:
+            continue
+
+        i = 0
+        n = len(line_str)
+        has_code = False
+
+        while i < n:
+            if in_block_comment > 0:
+                if i + 1 < n and line_str[i:i+2] == b'*/':
+                    in_block_comment -= 1
+                    i += 2
+                    continue
+                elif i + 1 < n and line_str[i:i+2] == b'/*':
+                    # Nested comments in Swift
+                    in_block_comment += 1
+                    i += 2
+                    continue
+                else:
+                    i += 1
+                    continue
+
+            # Not in block comment
+            if i + 1 < n and line_str[i:i+2] == b'//':
+                # Rest of line is comment
+                break
+            elif i + 1 < n and line_str[i:i+2] == b'/*':
+                in_block_comment += 1
+                i += 2
+                continue
+            elif line_str[i:i+1] in b' \t\r':
+                i += 1
+                continue
+            else:
+                has_code = True
+                i += 1
+
+        if has_code:
+            non_blank_non_comment += 1
+
+    return non_blank_non_comment
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <file_or_dir> ...", file=sys.stderr)
+        sys.exit(1)
+
+    total_lines = 0
+    total_files = 0
+
+    files_to_process = []
+    for arg in sys.argv[1:]:
+        if os.path.isdir(arg):
+            for root, _, files in os.walk(arg):
+                for file in sorted(files):
+                    if file.endswith(('.swift', '.c', '.h', '.S', '.s')):
+                        files_to_process.append(os.path.join(root, file))
+        elif os.path.isfile(arg):
+            files_to_process.append(arg)
+        else:
+            print(f"Warning: {arg} not found", file=sys.stderr)
+
+    for path in sorted(files_to_process):
+        count = count_source_lines(path)
+        print(f"{count:8d} {path}")
+        total_lines += count
+        total_files += 1
+
+    if total_files > 1:
+        print(f"{total_lines:8d} total ({total_files} files)")
+
+if __name__ == '__main__':
+    main()

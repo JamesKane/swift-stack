@@ -1,11 +1,10 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
-// Planned structure (docs/architecture/00 D10, 09 §4.1): the compiler, assemblers and linker
-// are ONE library module, `SwiftStack`, organized by folders (Source/, Lex/, Parse/, Sem/,
-// AIR/, Opt/, LIR/, Codegen/, Encode/, Object/, Asm/, Linker/), plus a thin `Driver`
-// executable. One module lets hot generics (`Column`, handles) specialize and inline
-// everywhere. Merging the current `Source` and `Lex` targets into `SwiftStack` is an M0 task.
+// docs/architecture/00 D10, 09 §4.1: The compiler, assemblers, and linker are ONE library module,
+// `SwiftStack`, organized by folders (Source/, Lex/, Parse/, Sem/, AIR/, Opt/, LIR/, Codegen/,
+// Encode/, Object/, Asm/, Linker/, Profile/, Census/), plus thin executable targets.
+// One module lets hot generics (`Column`, handles) specialize and inline everywhere.
 
 let package = Package(
     name: "swift-stack",
@@ -13,14 +12,43 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .library(name: "SwiftStackSource", targets: ["Source"]),
-        .library(name: "SwiftStackLex", targets: ["Lex"]),
+        .library(name: "SwiftStack", targets: ["SwiftStack"]),
+        .executable(name: "swift-stack", targets: ["Driver"]),
+        .executable(name: "ss-census", targets: ["CensusTool"]),
     ],
     targets: [
-        // Source memory management and file buffering
-        .target(name: "Source"),
+        // Low-level hardware timer & cycle counter support (rdtsc, cntvct_el0)
+        .target(
+            name: "CSupport",
+            path: "Sources/CSupport"
+        ),
 
-        // Lexical analysis & C23 preprocessor (SoA TokenBuffer)
-        .target(name: "Lex", dependencies: ["Source"]),
+        // Core single library module containing the entire compiler pipeline
+        .target(
+            name: "SwiftStack",
+            dependencies: ["CSupport"],
+            path: "Sources/SwiftStack"
+        ),
+
+        // Driver executable (swift-stack)
+        .executableTarget(
+            name: "Driver",
+            dependencies: ["SwiftStack"],
+            path: "Sources/Driver"
+        ),
+
+        // Feature census and roadmap ordering tool (ss-census)
+        .executableTarget(
+            name: "CensusTool",
+            dependencies: ["SwiftStack"],
+            path: "Sources/CensusTool"
+        ),
+
+        // Comprehensive test suite
+        .testTarget(
+            name: "SwiftStackTests",
+            dependencies: ["SwiftStack"],
+            path: "Tests/SwiftStackTests"
+        ),
     ]
 )
