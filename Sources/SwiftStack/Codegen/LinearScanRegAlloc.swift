@@ -15,7 +15,7 @@ struct LiveInterval {
 
 /// A linear scan register allocator for x86-64 LIR (04-backend.md §4.5).
 public struct LinearScanRegAlloc {
-    private let availablePool: [X86Register] = [.r10, .r11, .rbx, .r12, .r13, .r14, .r15]
+    private let availablePool: [X86Register] = [.rbx, .r12, .r13, .r14, .r15]
 
     public init() {}
 
@@ -114,23 +114,23 @@ public struct LinearScanRegAlloc {
             var finalS1 = s1
             var finalS2 = s2
 
-            // Handle src1 spill load if needed
+            // Handle src1 spill load if needed (use r11 scratch)
             if s1.isVirtual {
                 if let preg = regMap[s1.regIndex] {
                     finalS1 = .preg(preg)
                 } else if let off = spillMap[s1.regIndex] {
-                    finalS1 = .preg(.rax) // temp scratch
-                    newLir.append(opcode: .mov_rm, dst: .preg(.rax), imm: off)
+                    finalS1 = .preg(.r11)
+                    newLir.append(opcode: .mov_rm, dst: .preg(.r11), imm: off)
                 }
             }
 
-            // Handle src2 spill load if needed
+            // Handle src2 spill load if needed (use r10 scratch)
             if s2.isVirtual {
                 if let preg = regMap[s2.regIndex] {
                     finalS2 = .preg(preg)
                 } else if let off = spillMap[s2.regIndex] {
-                    finalS2 = .preg(.rdx) // temp scratch
-                    newLir.append(opcode: .mov_rm, dst: .preg(.rdx), imm: off)
+                    finalS2 = .preg(.r10)
+                    newLir.append(opcode: .mov_rm, dst: .preg(.r10), imm: off)
                 }
             }
 
@@ -139,8 +139,16 @@ public struct LinearScanRegAlloc {
                 if let preg = regMap[dst.regIndex] {
                     finalDst = .preg(preg)
                 } else if let off = spillMap[dst.regIndex] {
-                    finalDst = .preg(.rax)
+                    finalDst = .preg(.r10)
                     needsSpillStore = off
+
+                    // For read-modify-write operations, preload dst from its spill slot
+                    let isRMW = (op == .add_rr || op == .sub_rr || op == .imul_rr ||
+                                 op == .and_rr || op == .or_rr || op == .xor_rr ||
+                                 op == .shl_rr || op == .sar_rr)
+                    if isRMW {
+                        newLir.append(opcode: .mov_rm, dst: .preg(.r10), imm: off)
+                    }
                 }
             }
 
@@ -156,7 +164,7 @@ public struct LinearScanRegAlloc {
 
             // Emit spill store if dst spilled
             if let off = needsSpillStore {
-                newLir.append(opcode: .mov_mr, src1: .preg(.rax), imm: off)
+                newLir.append(opcode: .mov_mr, src1: .preg(.r10), imm: off)
             }
         }
 

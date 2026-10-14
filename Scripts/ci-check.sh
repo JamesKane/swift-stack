@@ -81,6 +81,23 @@ if ! cmp -s "$TMP_RUN1" "$TMP_RUN2"; then
     exit 1
 fi
 
+# Callee collision and ordering determinism (fcel/fkba test)
+TMP_COLLISION=$(mktemp --suffix=.c)
+cat << 'EOF' > "$TMP_COLLISION"
+int fcel() { return 11; }
+int fkba() { return 22; }
+int main() { return fcel(); }
+EOF
+"$SWIFT_STACK_BIN" "$TMP_COLLISION" -o "$TMP_RUN1"
+"$SWIFT_STACK_BIN" "$TMP_COLLISION" -o "$TMP_RUN2"
+
+if ! cmp -s "$TMP_RUN1" "$TMP_RUN2"; then
+    echo "ERROR: D6 violation! Non-deterministic binary output on fcel/fkba collision test"
+    rm -f "$TMP_RUN1" "$TMP_RUN2" "$TMP_COLLISION"
+    exit 1
+fi
+rm -f "$TMP_COLLISION"
+
 rm -f "$TMP_RUN1" "$TMP_RUN2"
 echo "PASSED: Output determinism (D6) verified byte-identical."
 
@@ -90,9 +107,9 @@ echo "PASSED: Output determinism (D6) verified byte-identical."
 echo ""
 echo "==> [Gate 4/5] Checking Instruction Count Gate..."
 if command -v perf >/dev/null 2>&1; then
-    # Baseline for synth_50k.swift: ~126,000,000 instructions
-    # Gate allows up to 3% headroom (130,000,000 instructions)
-    MAX_ALLOWED_INSTRUCTIONS=130000000
+    # Baseline for synth_50k.swift: ~74,000,000 instructions (busy-wait removed)
+    # Budget allows up to 8% headroom (80,000,000 instructions)
+    MAX_ALLOWED_INSTRUCTIONS=80000000
     
     PERF_OUT=$(perf stat -e instructions:u "$SWIFT_STACK_BIN" "$CORPUS_SWIFT" 2>&1)
     INSN_COUNT=$(echo "$PERF_OUT" | grep "instructions:u" | awk '{print $1}' | tr -d ',')
@@ -105,7 +122,9 @@ if command -v perf >/dev/null 2>&1; then
         fi
         echo "PASSED: Instruction count within budget."
     else
-        echo "WARNING: Could not parse perf instruction counter. Skipping instruction limit check."
+        echo "ERROR: Could not parse perf instruction counter output:"
+        echo "$PERF_OUT"
+        exit 1
     fi
 else
     echo "WARNING: perf not found in PATH; skipping hardware instruction counter gate."

@@ -151,6 +151,22 @@ public struct SwiftLexer: ~Copyable {
                             cursor += 1
                         }
                     }
+                    if depth > 0 {
+                        // Unterminated block comment at EOF
+                        let tokenStart = cursor
+                        let startOffset = baseLoc + UInt32(tokenStart - start)
+                        var tokenFlag: UInt8 = flagHasError
+                        if hasLeadingSpace { tokenFlag |= flagLeadingSpace }
+                        if hasLeadingNewline { tokenFlag |= flagLeadingNewline }
+                        if count < capacity {
+                            kinds[count] = 255 // errorToken
+                            flags[count] = tokenFlag
+                            starts[count] = startOffset
+                            ends[count] = startOffset
+                            count += 1
+                        }
+                        break
+                    }
                     continue
                 }
             }
@@ -224,6 +240,7 @@ public struct SwiftLexer: ~Copyable {
             case .quote:
                 cursor += 1
                 var escaped = false
+                var closed = false
                 while cursor < end {
                     let c = cursor.pointee
                     if escaped {
@@ -234,6 +251,7 @@ public struct SwiftLexer: ~Copyable {
                         cursor += 1
                     } else if c == 0x22 /* '"' */ {
                         cursor += 1
+                        closed = true
                         break
                     } else if c == 0x0A || c == 0x0D {
                         tokenFlag |= flagHasError
@@ -242,7 +260,12 @@ public struct SwiftLexer: ~Copyable {
                         cursor += 1
                     }
                 }
-                tokenKind = 5 // stringLiteral
+                if !closed {
+                    tokenFlag |= flagHasError
+                    tokenKind = 255 // errorToken
+                } else {
+                    tokenKind = 5 // stringLiteral
+                }
 
             case .lParen:
                 cursor += 1
@@ -409,7 +432,8 @@ public struct SwiftLexer: ~Copyable {
             if w == 0x74696e69 { return 24 } // init
             if w == 0x6d756e65 { return 21 } // enum
         case 5:
-            if ptr[0] == 0x77 && ptr[1] == 0x68 && ptr[2] == 0x69 && ptr[3] == 0x6C && ptr[4] == 0x62 { return 15 } // while
+            if ptr[0] == 0x77 && ptr[1] == 0x68 && ptr[2] == 0x69 && ptr[3] == 0x6C && ptr[4] == 0x65 { return 15 } // while
+            if ptr[0] == 0x62 && ptr[1] == 0x72 && ptr[2] == 0x65 && ptr[3] == 0x61 && ptr[4] == 0x6B { return 33 } // break
             if ptr[0] == 0x63 && ptr[1] == 0x6C && ptr[2] == 0x61 && ptr[3] == 0x73 && ptr[4] == 0x73 { return 20 } // class
             if ptr[0] == 0x67 && ptr[1] == 0x75 && ptr[2] == 0x61 && ptr[3] == 0x72 && ptr[4] == 0x64 { return 28 } // guard
             if ptr[0] == 0x64 && ptr[1] == 0x65 && ptr[2] == 0x66 && ptr[3] == 0x65 && ptr[4] == 0x72 { return 29 } // defer
@@ -439,6 +463,12 @@ public struct SwiftLexer: ~Copyable {
             if ptr[0] == 0x65 && ptr[1] == 0x78 && ptr[2] == 0x74 && ptr[3] == 0x65 && ptr[4] == 0x6E && ptr[5] == 0x73 && ptr[6] == 0x69 && ptr[7] == 0x6F && ptr[8] == 0x6E { return 23 } // extension
             if ptr[0] == 0x74 && ptr[1] == 0x79 && ptr[2] == 0x70 && ptr[3] == 0x65 && ptr[4] == 0x61 && ptr[5] == 0x6C && ptr[6] == 0x69 && ptr[7] == 0x61 && ptr[8] == 0x73 { return 26 } // typealias
             if ptr[0] == 0x73 && ptr[1] == 0x75 && ptr[2] == 0x62 && ptr[3] == 0x73 && ptr[4] == 0x63 && ptr[5] == 0x72 && ptr[6] == 0x69 && ptr[7] == 0x70 && ptr[8] == 0x74 { return 52 } // subscript
+        case 11:
+            // fallthrough
+            if ptr[0] == 0x66 && ptr[1] == 0x61 && ptr[2] == 0x6C && ptr[3] == 0x6C && ptr[4] == 0x74 && ptr[5] == 0x68 && ptr[6] == 0x72 && ptr[7] == 0x6F && ptr[8] == 0x75 && ptr[9] == 0x67 && ptr[10] == 0x68 { return 35 } // fallthrough
+        case 15:
+            // precedencegroup
+            if ptr[0] == 0x70 && ptr[1] == 0x72 && ptr[2] == 0x65 && ptr[3] == 0x63 && ptr[4] == 0x65 && ptr[5] == 0x64 && ptr[6] == 0x65 && ptr[7] == 0x6E && ptr[8] == 0x63 && ptr[9] == 0x65 && ptr[10] == 0x67 && ptr[11] == 0x72 && ptr[12] == 0x6F && ptr[13] == 0x75 && ptr[14] == 0x70 { return 54 } // precedencegroup
         default:
             break
         }

@@ -123,15 +123,33 @@ public struct CLexer: ~Copyable {
                 } else if next == 0x2A { // block comment
                     hasLeadingSpace = true
                     cursor += 2
+                    var closed = false
                     while cursor < end {
                         if cursor.pointee == 0x2A && cursor + 1 < end && cursor[1] == 0x2F {
                             cursor += 2
+                            closed = true
                             break
                         }
                         if cursor.pointee == 0x0A {
                             hasLeadingNewline = true
                         }
                         cursor += 1
+                    }
+                    if !closed {
+                        // Unterminated block comment at EOF
+                        let tokenStart = cursor
+                        let startOffset = baseLoc + UInt32(tokenStart - start)
+                        var tokenFlag: UInt8 = flagHasError
+                        if hasLeadingSpace { tokenFlag |= flagLeadingSpace }
+                        if hasLeadingNewline { tokenFlag |= flagLeadingNewline }
+                        if count < capacity {
+                            kinds[count] = 255 // errorToken
+                            flags[count] = tokenFlag
+                            starts[count] = startOffset
+                            ends[count] = startOffset
+                            count += 1
+                        }
+                        break
                     }
                     continue
                 }
@@ -195,6 +213,7 @@ public struct CLexer: ~Copyable {
             case .quote:
                 cursor += 1
                 var escaped = false
+                var closed = false
                 while cursor < end {
                     let c = cursor.pointee
                     if escaped {
@@ -205,6 +224,7 @@ public struct CLexer: ~Copyable {
                         cursor += 1
                     } else if c == 0x22 /* '"' */ {
                         cursor += 1
+                        closed = true
                         break
                     } else if c == 0x0A || c == 0x0D {
                         tokenFlag |= flagHasError
@@ -213,11 +233,17 @@ public struct CLexer: ~Copyable {
                         cursor += 1
                     }
                 }
-                tokenKind = 5 // stringLiteral
+                if !closed {
+                    tokenFlag |= flagHasError
+                    tokenKind = 255 // errorToken
+                } else {
+                    tokenKind = 5 // stringLiteral
+                }
 
             case .singleQuote:
                 cursor += 1
                 var escaped = false
+                var closed = false
                 while cursor < end {
                     let c = cursor.pointee
                     if escaped {
@@ -228,6 +254,7 @@ public struct CLexer: ~Copyable {
                         cursor += 1
                     } else if c == 0x27 {
                         cursor += 1
+                        closed = true
                         break
                     } else if c == 0x0A || c == 0x0D {
                         tokenFlag |= flagHasError
@@ -236,7 +263,12 @@ public struct CLexer: ~Copyable {
                         cursor += 1
                     }
                 }
-                tokenKind = 4 // charLiteral
+                if !closed {
+                    tokenFlag |= flagHasError
+                    tokenKind = 255 // errorToken
+                } else {
+                    tokenKind = 4 // charLiteral
+                }
 
             case .lParen:
                 cursor += 1
@@ -286,7 +318,12 @@ public struct CLexer: ~Copyable {
 
             case .slash:
                 cursor += 1
-                tokenKind = 74 // slash
+                if cursor < end && cursor.pointee == 0x3D {
+                    cursor += 1
+                    tokenKind = 102 // slashEqual
+                } else {
+                    tokenKind = 74 // slash
+                }
 
             case .operatorChar:
                 let op = b
@@ -295,38 +332,67 @@ public struct CLexer: ~Copyable {
 
                 switch op {
                 case 0x2B: // '+'
-                    if next == 0x2B { cursor += 1; tokenKind = 84 }
+                    if next == 0x2B { cursor += 1; tokenKind = 84 /* ++ */ }
+                    else if next == 0x3D { cursor += 1; tokenKind = 99 /* += */ }
                     else { tokenKind = 71 }
                 case 0x2D: // '-'
-                    if next == 0x2D { cursor += 1; tokenKind = 85 }
-                    else if next == 0x3E { cursor += 1; tokenKind = 70 }
+                    if next == 0x2D { cursor += 1; tokenKind = 85 /* -- */ }
+                    else if next == 0x3E { cursor += 1; tokenKind = 70 /* -> */ }
+                    else if next == 0x3D { cursor += 1; tokenKind = 100 /* -= */ }
                     else { tokenKind = 72 }
                 case 0x2A: // '*'
-                    tokenKind = 73
+                    if next == 0x3D { cursor += 1; tokenKind = 101 /* *= */ }
+                    else { tokenKind = 73 }
                 case 0x25: // '%'
-                    tokenKind = 75
+                    if next == 0x3D { cursor += 1; tokenKind = 103 /* %= */ }
+                    else { tokenKind = 75 }
                 case 0x26: // '&'
-                    if next == 0x26 { cursor += 1; tokenKind = 92 }
+                    if next == 0x26 { cursor += 1; tokenKind = 92 /* && */ }
+                    else if next == 0x3D { cursor += 1; tokenKind = 104 /* &= */ }
                     else { tokenKind = 76 }
                 case 0x7C: // '|'
-                    if next == 0x7C { cursor += 1; tokenKind = 93 }
+                    if next == 0x7C { cursor += 1; tokenKind = 93 /* || */ }
+                    else if next == 0x3D { cursor += 1; tokenKind = 105 /* |= */ }
                     else { tokenKind = 77 }
                 case 0x5E: // '^'
-                    tokenKind = 78
+                    if next == 0x3D { cursor += 1; tokenKind = 106 /* ^= */ }
+                    else { tokenKind = 78 }
                 case 0x21: // '!'
-                    if next == 0x3D { cursor += 1; tokenKind = 91 }
+                    if next == 0x3D { cursor += 1; tokenKind = 91 /* != */ }
                     else { tokenKind = 80 }
                 case 0x3D: // '='
-                    if next == 0x3D { cursor += 1; tokenKind = 90 }
+                    if next == 0x3D { cursor += 1; tokenKind = 90 /* == */ }
                     else { tokenKind = 81 }
                 case 0x3C: // '<'
-                    if next == 0x3C { cursor += 1; tokenKind = 86 }
-                    else if next == 0x3D { cursor += 1; tokenKind = 88 }
-                    else { tokenKind = 82 }
+                    if next == 0x3C {
+                        cursor += 1
+                        if cursor < end && cursor.pointee == 0x3D {
+                            cursor += 1
+                            tokenKind = 107 // <<=
+                        } else {
+                            tokenKind = 86 // <<
+                        }
+                    } else if next == 0x3D {
+                        cursor += 1
+                        tokenKind = 88 // <=
+                    } else {
+                        tokenKind = 82 // <
+                    }
                 case 0x3E: // '>'
-                    if next == 0x3E { cursor += 1; tokenKind = 87 }
-                    else if next == 0x3D { cursor += 1; tokenKind = 89 }
-                    else { tokenKind = 83 }
+                    if next == 0x3E {
+                        cursor += 1
+                        if cursor < end && cursor.pointee == 0x3D {
+                            cursor += 1
+                            tokenKind = 108 // >>=
+                        } else {
+                            tokenKind = 87 // >>
+                        }
+                    } else if next == 0x3D {
+                        cursor += 1
+                        tokenKind = 89 // >=
+                    } else {
+                        tokenKind = 83 // >
+                    }
                 case 0x7E: // '~'
                     tokenKind = 79
                 case 0x3F: // '?'

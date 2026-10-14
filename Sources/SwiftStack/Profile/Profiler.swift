@@ -37,10 +37,10 @@ public final class Profiler: @unchecked Sendable {
     private let lock = Mutex()
     public private(set) var cpuFrequencyHz: Double = 3_500_000_000.0 // Default 3.5 GHz
     private var startEpochCycle: UInt64 = 0
+    private var isCalibrated: Bool = false
 
     public init() {
         self.startEpochCycle = Profiler.readCycles()
-        calibrate()
     }
 
     /// Reads the CPU hardware cycle counter directly (rdtsc on x86-64, cntvct_el0 on ARM64).
@@ -51,6 +51,8 @@ public final class Profiler: @unchecked Sendable {
 
     /// Calibrates the cycle counter against monotonic nanoseconds.
     public func calibrate() {
+        guard !isCalibrated else { return }
+        isCalibrated = true
         let t0_ns = ss_monotonic_time_ns()
         let c0 = Profiler.readCycles()
 
@@ -111,6 +113,7 @@ public final class Profiler: @unchecked Sendable {
 
     /// Exports recorded trace events as Chrome trace JSON.
     public func exportTraceJSON() -> String {
+        calibrate()
         return lock.withLock {
             var json = "[\n"
             let count = events.count

@@ -101,14 +101,16 @@ public final class SourceFile: @unchecked Sendable {
     /// Base pointer to buffer, includes 64 zero sentinel bytes past `length`.
     public let buffer: UnsafeBufferPointer<UInt8>
     public let length: Int
+    public let baseLocation: SourceLocation
     private var cachedLineTable: LineTable?
     private let lock = Mutex()
 
-    public init(id: FileId, path: String, buffer: UnsafeBufferPointer<UInt8>, length: Int) {
+    public init(id: FileId, path: String, buffer: UnsafeBufferPointer<UInt8>, length: Int, baseLocation: SourceLocation = .zero) {
         self.id = id
         self.path = path
         self.buffer = buffer
         self.length = length
+        self.baseLocation = baseLocation
         self.cachedLineTable = nil
     }
 
@@ -135,6 +137,7 @@ public final class SourceFile: @unchecked Sendable {
 /// Indexed by 32-bit FileId, with FileId(0) being the nil file (Principles 2 and 7).
 public final class SourceManager: @unchecked Sendable {
     private var files: [SourceFile?] = []
+    private var nextBaseLocation: UInt32 = 0
     private let lock = Mutex()
 
     public init() {
@@ -145,7 +148,8 @@ public final class SourceManager: @unchecked Sendable {
             id: FileId(0),
             path: "<nil>",
             buffer: UnsafeBufferPointer(start: nilBuffer, count: 64),
-            length: 0
+            length: 0,
+            baseLocation: .zero
         )
         self.files.append(nilFile)
     }
@@ -175,11 +179,14 @@ public final class SourceManager: @unchecked Sendable {
 
         return lock.withLock {
             let fileId = FileId(UInt32(files.count))
+            let baseLoc = SourceLocation(nextBaseLocation)
+            nextBaseLocation += UInt32(length)
             let sourceFile = SourceFile(
                 id: fileId,
                 path: path,
                 buffer: UnsafeBufferPointer(start: ptr, count: total),
-                length: length
+                length: length,
+                baseLocation: baseLoc
             )
             files.append(sourceFile)
             return fileId
@@ -232,14 +239,33 @@ public final class SourceManager: @unchecked Sendable {
 
         return lock.withLock {
             let fileId = FileId(UInt32(files.count))
+            let baseLoc = SourceLocation(nextBaseLocation)
+            nextBaseLocation += UInt32(bytesRead)
             let sourceFile = SourceFile(
                 id: fileId,
                 path: path,
                 buffer: UnsafeBufferPointer(start: ptr, count: total),
-                length: bytesRead
+                length: bytesRead,
+                baseLocation: baseLoc
             )
             files.append(sourceFile)
             return fileId
+        }
+    }
+
+    /// Finds the source file containing a given global source location, and its relative offset.
+    public func file(containing location: SourceLocation) -> (file: SourceFile, offset: UInt32)? {
+        let loc = location.rawValue
+        return lock.withLock {
+            for file in files.compactMap({ $0 }) {
+                guard file.id.isValid else { continue }
+                let start = file.baseLocation.rawValue
+                let end = start + UInt32(file.length)
+                if loc >= start && loc <= end {
+                    return (file, loc - start)
+                }
+            }
+            return nil
         }
     }
 

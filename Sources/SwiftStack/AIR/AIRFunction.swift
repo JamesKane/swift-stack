@@ -31,11 +31,13 @@ public enum AIROpcode: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
     case br = 24           // aux = target BlockId
     case cond_br = 25      // op0 = condition, aux = target BlockId true, op1 = target BlockId false
     case param = 26        // aux = param index
+    case iconst64 = 27      // op0 = high 32 bits, aux = low 32 bits
 
     public var description: String {
         switch self {
         case .nilOp: return "nil"
         case .iconst: return "iconst"
+        case .iconst64: return "iconst64"
         case .stringConst: return "string_const"
         case .alloca: return "alloca"
         case .load: return "load"

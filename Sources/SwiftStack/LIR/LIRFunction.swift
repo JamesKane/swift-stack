@@ -143,6 +143,10 @@ public enum X86Opcode: UInt16, Sendable, BitwiseCopyable, CustomStringConvertibl
     case pop_r = 34
     case syscall = 35
     case label = 36      // imm = BlockId
+    case mov_stack_arg = 37    // mov dst, [rbp + imm]
+    case store_stack_arg = 38  // mov [rsp + imm], src1
+    case sub_rsp = 39          // sub rsp, imm
+    case add_rsp = 40          // add rsp, imm
 
     public var description: String {
         switch self {
@@ -183,6 +187,10 @@ public enum X86Opcode: UInt16, Sendable, BitwiseCopyable, CustomStringConvertibl
         case .pop_r: return "pop_r"
         case .syscall: return "syscall"
         case .label: return "label"
+        case .mov_stack_arg: return "mov_stack_arg"
+        case .store_stack_arg: return "store_stack_arg"
+        case .sub_rsp: return "sub_rsp"
+        case .add_rsp: return "add_rsp"
         }
     }
 }

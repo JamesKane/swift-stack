@@ -150,6 +150,98 @@ struct SwiftStackTests {
         #expect(foundTrue)
     }
 
+    @Test("SwiftLexer keyword matching, while bug, and token descriptions")
+    func testSwiftLexerKeywordsAndDescription() {
+        let sm = SourceManager()
+        let src = "while break continue fallthrough precedencegroup func let var"
+        let fileId = sm.addBuffer(bytes: Array(src.utf8), path: "keywords.swift")
+        let file = sm[fileId]
+
+        var tokenBuffer = TokenBuffer()
+        let lexer = SwiftLexer(fileId: fileId, buffer: file.buffer, length: file.length, baseLocation: file.baseLocation)
+        lexer.lexInto(&tokenBuffer)
+
+        #expect(tokenBuffer.kind(of: TokenId(1)) == SwiftTokenKind.kwWhile.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(2)) == SwiftTokenKind.kwBreak.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(3)) == SwiftTokenKind.kwContinue.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(4)) == SwiftTokenKind.kwFallthrough.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(5)) == SwiftTokenKind.kwPrecedencegroup.rawValue)
+
+        // Verify description on all Swift and C token kinds does not segfault
+        for raw in 0...UInt8(255) {
+            if let sk = SwiftTokenKind(rawValue: raw) {
+                _ = sk.description
+            }
+            if let ck = CTokenKind(rawValue: raw) {
+                _ = ck.description
+            }
+        }
+    }
+
+    @Test("CLexer compound assignments and unterminated error handling")
+    func testCLexerCompoundsAndErrors() {
+        let sm = SourceManager()
+        let src = "+= -= *= /= %= &= |= ^= <<= >>="
+        let fileId = sm.addBuffer(bytes: Array(src.utf8), path: "compounds.c")
+        let file = sm[fileId]
+
+        var tokenBuffer = TokenBuffer()
+        let lexer = CLexer(fileId: fileId, buffer: file.buffer, length: file.length, baseLocation: file.baseLocation)
+        lexer.lexInto(&tokenBuffer)
+
+        #expect(tokenBuffer.kind(of: TokenId(1)) == CTokenKind.plusEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(2)) == CTokenKind.minusEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(3)) == CTokenKind.starEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(4)) == CTokenKind.slashEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(5)) == CTokenKind.percentEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(6)) == CTokenKind.ampEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(7)) == CTokenKind.pipeEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(8)) == CTokenKind.caretEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(9)) == CTokenKind.lessLessEqual.rawValue)
+        #expect(tokenBuffer.kind(of: TokenId(10)) == CTokenKind.greaterGreaterEqual.rawValue)
+
+        // Unterminated block comment in C
+        let unclosedCComment = "int x = 1; /* unclosed comment"
+        let ucId = sm.addBuffer(bytes: Array(unclosedCComment.utf8), path: "uc.c")
+        var ucBuf = TokenBuffer()
+        CLexer(fileId: ucId, buffer: sm[ucId].buffer, length: sm[ucId].length).lexInto(&ucBuf)
+        var hasErrorToken = false
+        for i in 1..<ucBuf.count {
+            if ucBuf.kind(of: TokenId(UInt32(i))) == CTokenKind.errorToken.rawValue ||
+               (ucBuf.flag(of: TokenId(UInt32(i))) & (1 << 7)) != 0 {
+                hasErrorToken = true
+            }
+        }
+        #expect(hasErrorToken)
+
+        // Unterminated string in Swift
+        let unclosedSwiftString = "let s = \"hello"
+        let usId = sm.addBuffer(bytes: Array(unclosedSwiftString.utf8), path: "us.swift")
+        var usBuf = TokenBuffer()
+        SwiftLexer(fileId: usId, buffer: sm[usId].buffer, length: sm[usId].length).lexInto(&usBuf)
+        var hasSwiftErrorToken = false
+        for i in 1..<usBuf.count {
+            if usBuf.kind(of: TokenId(UInt32(i))) == SwiftTokenKind.errorToken.rawValue ||
+               (usBuf.flag(of: TokenId(UInt32(i))) & (1 << 7)) != 0 {
+                hasSwiftErrorToken = true
+            }
+        }
+        #expect(hasSwiftErrorToken)
+    }
+
+    @Test("Multi-file location uniqueness")
+    func testMultiFileLocationUniqueness() {
+        let sm = SourceManager()
+        let file1Id = sm.addBuffer(bytes: Array("int a = 1;".utf8), path: "a.c")
+        let file2Id = sm.addBuffer(bytes: Array("int b = 2;".utf8), path: "b.c")
+
+        let file1 = sm[file1Id]
+        let file2 = sm[file2Id]
+
+        #expect(file1.baseLocation.rawValue != file2.baseLocation.rawValue)
+        #expect(file2.baseLocation.rawValue >= file1.baseLocation.rawValue + UInt32(file1.length))
+    }
+
     @Test("Profiler and RepetitionTester")
     func testProfilerAndRepetitionTester() {
         let profiler = Profiler.shared
@@ -294,4 +386,227 @@ struct SwiftStackTests {
             #expect(exitCode == expectedCode, "Execution of \(relPath) returned \(exitCode), expected \(expectedCode)")
         }
     }
+
+    @Test("Compiler miscompilation regression suite (Bugs 1-10)")
+    func testMiscompilationRegressions() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+
+        func compileAndRun(cCode: String) throws -> Int32 {
+            let srcPath = tempDir.appendingPathComponent("reg_\(UUID().uuidString).c").path
+            let binPath = tempDir.appendingPathComponent("reg_\(UUID().uuidString).bin").path
+            defer {
+                try? FileManager.default.removeItem(atPath: srcPath)
+                try? FileManager.default.removeItem(atPath: binPath)
+            }
+            try cCode.write(toFile: srcPath, atomically: true, encoding: .utf8)
+            var opts = DriverOptions()
+            opts.inputFiles = [srcPath]
+            opts.outputBinaryPath = binPath
+            opts.runBinary = true
+            let pipeline = DriverPipeline(options: opts)
+            return try pipeline.run()
+        }
+
+        // Bug 1: Saved callee-saved registers sharing stack slots with locals
+        let bug1 = """
+        int sub(int x) { return x - 1; }
+        int compute(int n) {
+            int x = 100;
+            int i = 0;
+            while (i < n) {
+                x = x - sub(2);
+                i = i + 1;
+            }
+            return x;
+        }
+        int main() { return compute(6); }
+        """
+        #expect(try compileAndRun(cCode: bug1) == 94)
+
+        // Bug 2: Spilling both operands in arithmetic operation
+        let bug2 = """
+        int test_spill(int a, int b, int c, int d, int e, int f) {
+            int v1 = a + 1;
+            int v2 = b + 2;
+            int v3 = c + 3;
+            int v4 = d + 4;
+            int v5 = e + 5;
+            int v6 = f + 6;
+            return (v1 + v6) + (v2 + v5) + (v3 + v4);
+        }
+        int main() { return test_spill(1, 2, 3, 4, 5, 6); }
+        """
+        #expect(try compileAndRun(cCode: bug2) == 42)
+
+        // Bug 3: Spilled divisor in division
+        let bug3 = """
+        int test_div_spill(int a, int b, int c, int d, int e, int f) {
+            int v1 = a + 1;
+            int v2 = b + 2;
+            int v3 = c + 3;
+            int v4 = d + 4;
+            int v5 = e + 5;
+            int v6 = f + 6;
+            int div = 100 / v1;
+            return div + v2 + v3 + v4 + v5 + v6;
+        }
+        int main() { return test_div_spill(1, 2, 3, 4, 5, 6); }
+        """
+        #expect(try compileAndRun(cCode: bug3) == 90)
+
+        // Bug 4: Store through spilled pointer
+        let bug4 = """
+        int test_ptr_spill(int a, int b, int c, int d, int e, int f) {
+            int target = 0;
+            int *ptr = &target;
+            int v1 = a + 1;
+            int v2 = b + 2;
+            int v3 = c + 3;
+            int v4 = d + 4;
+            int v5 = e + 5;
+            int v6 = f + 6;
+            *ptr = 42;
+            return target + (v1 - 2) + (v2 - 4) + (v3 - 6) + (v4 - 8) + (v5 - 10) + (v6 - 12);
+        }
+        int main() { return test_ptr_spill(1, 2, 3, 4, 5, 6); }
+        """
+        #expect(try compileAndRun(cCode: bug4) == 42)
+
+        // Bug 5: 7+ arguments and parameters (System V stack passing)
+        let bug5 = """
+        int sum8(int a, int b, int c, int d, int e, int f, int g, int h) {
+            return a + b + c + d + e + f + g + h;
+        }
+        int main() { return sum8(1, 2, 3, 4, 5, 6, 7, 8); }
+        """
+        #expect(try compileAndRun(cCode: bug5) == 36)
+
+        // Bug 6: Logical AND/OR short-circuiting and boolean results
+        let bug6 = """
+        int side_effect(int *p) {
+            *p = *p + 1;
+            return 1;
+        }
+        int main() {
+            int x = 0;
+            int a = 0 && side_effect(&x);
+            int b = 1 || side_effect(&x);
+            int c = (2 && 3);
+            int d = (4 || 0);
+            return x + a + b + c + d;
+        }
+        """
+        #expect(try compileAndRun(cCode: bug6) == 3)
+
+        // Bug 7: Global variables rejection
+        let bug7 = """
+        int global_var = 10;
+        int main() { return global_var; }
+        """
+        #expect(try compileAndRun(cCode: bug7) != 0)
+
+        // Bug 8: 64-bit integer literal evaluation
+        let bug8 = """
+        long test_large() {
+            long x = 4294967301;
+            return x - 4294967296;
+        }
+        int main() { return test_large(); }
+        """
+        #expect(try compileAndRun(cCode: bug8) == 5)
+
+        // Bug 9: Pointer arithmetic scaling and difference
+        let bug9 = """
+        int test_ptr_diff() {
+            int a = 0;
+            int b = 0;
+            int c = 0;
+            int *p0 = &a;
+            int *p3 = p0 + 3;
+            long diff = p3 - p0;
+            return diff;
+        }
+        int main() { return test_ptr_diff(); }
+        """
+        #expect(try compileAndRun(cCode: bug9) == 3)
+
+        // Bug 10: Determinism with colliding function names fcel/fkba
+        let bug10 = """
+        int fcel() { return 11; }
+        int fkba() { return 22; }
+        int main() { return fcel(); }
+        """
+        let src10 = tempDir.appendingPathComponent("bug10.c").path
+        let bin10A = tempDir.appendingPathComponent("bug10_a.bin").path
+        let bin10B = tempDir.appendingPathComponent("bug10_b.bin").path
+        defer {
+            try? FileManager.default.removeItem(atPath: src10)
+            try? FileManager.default.removeItem(atPath: bin10A)
+            try? FileManager.default.removeItem(atPath: bin10B)
+        }
+        try bug10.write(toFile: src10, atomically: true, encoding: .utf8)
+        var optA = DriverOptions()
+        optA.inputFiles = [src10]
+        optA.outputBinaryPath = bin10A
+        _ = try DriverPipeline(options: optA).run()
+
+        var optB = DriverOptions()
+        optB.inputFiles = [src10]
+        optB.outputBinaryPath = bin10B
+        _ = try DriverPipeline(options: optB).run()
+
+        let dataA = try Data(contentsOf: URL(fileURLWithPath: bin10A))
+        let dataB = try Data(contentsOf: URL(fileURLWithPath: bin10B))
+        #expect(dataA == dataB)
+    }
+
+    @Test("Differential testing against GCC on C-subset corpus")
+    func testDifferentialGCC() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+
+        let programs = [
+            "Benchmarks/corpora/c-subset/00_exit42.c",
+            "Benchmarks/corpora/c-subset/02_arith.c",
+            "Benchmarks/corpora/c-subset/03_bitwise.c",
+            "Benchmarks/corpora/c-subset/04_locals.c",
+            "Benchmarks/corpora/c-subset/05_if_else.c",
+            "Benchmarks/corpora/c-subset/06_while_sum.c",
+            "Benchmarks/corpora/c-subset/07_functions.c",
+            "Benchmarks/corpora/c-subset/08_recursion.c",
+            "Benchmarks/corpora/c-subset/09_pointers.c",
+            "Benchmarks/corpora/c-subset/10_collatz.c",
+        ]
+
+        for relPath in programs {
+            let ssBin = tempDir.appendingPathComponent("ss_\(UUID().uuidString)").path
+            let gccBin = tempDir.appendingPathComponent("gcc_\(UUID().uuidString)").path
+            defer {
+                try? FileManager.default.removeItem(atPath: ssBin)
+                try? FileManager.default.removeItem(atPath: gccBin)
+            }
+
+            var opts = DriverOptions()
+            opts.inputFiles = [relPath]
+            opts.outputBinaryPath = ssBin
+            opts.runBinary = true
+            let ssExit = try DriverPipeline(options: opts).run()
+
+            // Run GCC
+            let gccProcess = Process()
+            gccProcess.executableURL = URL(fileURLWithPath: "/usr/bin/gcc")
+            gccProcess.arguments = [relPath, "-o", gccBin]
+            try gccProcess.run()
+            gccProcess.waitUntilExit()
+            #expect(gccProcess.terminationStatus == 0)
+
+            let runProcess = Process()
+            runProcess.executableURL = URL(fileURLWithPath: gccBin)
+            try runProcess.run()
+            runProcess.waitUntilExit()
+            let gccExit = runProcess.terminationStatus
+
+            #expect(ssExit == gccExit, "Differential mismatch on \(relPath): ss=\(ssExit), gcc=\(gccExit)")
+        }
+    }
 }
+

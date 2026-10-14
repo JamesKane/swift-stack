@@ -52,6 +52,14 @@ public struct InstructionSelector {
                 let immVal = Int64(Int32(bitPattern: aux))
                 lir.append(opcode: .mov_ri, dst: dst, imm: immVal)
 
+            case .iconst64:
+                let dst = nextVreg()
+                airToLirVreg[id] = dst
+                let high = UInt64(v0.rawIndex)
+                let low = UInt64(aux)
+                let immVal = Int64(bitPattern: (high << 32) | low)
+                lir.append(opcode: .mov_ri, dst: dst, imm: immVal)
+
             case .stringConst:
                 let dst = nextVreg()
                 airToLirVreg[id] = dst
@@ -82,7 +90,7 @@ public struct InstructionSelector {
                     lir.append(opcode: .mov_mr, src1: valReg, imm: off)
                 } else {
                     let ptrReg = resolveOperand(v1, airToLirVreg: airToLirVreg)
-                    lir.append(opcode: .mov_store, dst: ptrReg, src1: valReg)
+                    lir.append(opcode: .mov_store, src1: ptrReg, src2: valReg)
                 }
 
             case .add, .sub, .mul, .band, .bor, .bxor:
@@ -181,7 +189,25 @@ public struct InstructionSelector {
                     lir.append(opcode: .mov_rr, dst: .preg(argRegs[argIdx]), src1: argReg)
                 }
 
+                // If argCount > 6, pass on stack (16-byte aligned)
+                var stackSpace: Int64 = 0
+                if argCount > argRegs.count {
+                    let stackArgCount = argCount - argRegs.count
+                    stackSpace = Int64(((stackArgCount * 8) + 15) & ~15)
+                    lir.append(opcode: .sub_rsp, imm: stackSpace)
+                    for i in 0..<stackArgCount {
+                        let argIdx = argRegs.count + i
+                        let extraIdx = ExtraId(UInt32(extraStart + argIdx))
+                        let argVal = ValueId(airFn.extra[extraIdx])
+                        let argReg = resolveOperand(argVal, airToLirVreg: airToLirVreg)
+                        lir.append(opcode: .store_stack_arg, src1: argReg, imm: Int64(i * 8))
+                    }
+                }
+
                 lir.append(opcode: .call, imm: calleeId)
+                if stackSpace > 0 {
+                    lir.append(opcode: .add_rsp, imm: stackSpace)
+                }
                 let dst = nextVreg()
                 airToLirVreg[id] = dst
                 lir.append(opcode: .mov_rr, dst: dst, src1: .preg(.rax))
@@ -193,6 +219,9 @@ public struct InstructionSelector {
                 airToLirVreg[id] = dst
                 if paramIdx < argRegs.count {
                     lir.append(opcode: .mov_rr, dst: dst, src1: .preg(argRegs[paramIdx]))
+                } else {
+                    let offset = Int64(16 + (paramIdx - argRegs.count) * 8)
+                    lir.append(opcode: .mov_stack_arg, dst: dst, imm: offset)
                 }
             }
         }

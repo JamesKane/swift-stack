@@ -9,7 +9,7 @@ public struct TokenBuffer: ~Copyable {
     public var ends: Column<TokenId, UInt32>
 
     /// Initializes a TokenBuffer with reserved column capacity.
-    public init(reservedCapacity: Int = 16_777_216) {
+    public init(reservedCapacity: Int = 67_108_864) {
         self.kinds = Column<TokenId, UInt8>(reservedCapacity: reservedCapacity)
         self.flags = Column<TokenId, UInt8>(reservedCapacity: reservedCapacity)
         self.starts = Column<TokenId, UInt32>(reservedCapacity: reservedCapacity)

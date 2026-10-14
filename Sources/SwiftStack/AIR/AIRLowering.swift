@@ -271,13 +271,24 @@ public struct AIRLowering {
             let tok = tree.pointee.token(of: exprNode)
             let txt = spelling(of: tok)
             let val = parseInteger(txt)
-            let inst = airFn.appendInstruction(
-                opcode: .iconst,
-                type: exprType,
-                aux: UInt32(bitPattern: val),
-                inBlock: currentBlock
-            )
-            return ValueId.instResult(inst)
+            if val > UInt64(UInt32.max) {
+                let inst = airFn.appendInstruction(
+                    opcode: .iconst64,
+                    type: exprType,
+                    op0: ValueId(UInt32(val >> 32)),
+                    aux: UInt32(truncatingIfNeeded: val),
+                    inBlock: currentBlock
+                )
+                return ValueId.instResult(inst)
+            } else {
+                let inst = airFn.appendInstruction(
+                    opcode: .iconst,
+                    type: exprType,
+                    aux: UInt32(truncatingIfNeeded: val),
+                    inBlock: currentBlock
+                )
+                return ValueId.instResult(inst)
+            }
 
         case .charLiteral:
             let tok = tree.pointee.token(of: exprNode)
@@ -384,11 +395,129 @@ public struct AIRLowering {
         case .binaryExpr:
             let children = tree.pointee.children(of: exprNode)
             guard children.count == 2 else { return .nilId }
-            let v0 = lowerExpression(children[0], airFn: &airFn, currentBlock: &currentBlock)
-            let v1 = lowerExpression(children[1], airFn: &airFn, currentBlock: &currentBlock)
-
             let opTok = tree.pointee.token(of: exprNode)
             let opKind = CTokenKind(rawValue: tokens.pointee.kind(of: opTok)) ?? .errorToken
+
+            // Handle short-circuiting && and ||
+            if opKind == .ampAmp {
+                // a && b
+                airFn.stackFrameSize += 8
+                let slotOffset = UInt32(airFn.stackFrameSize)
+                let resSlot = airFn.appendInstruction(opcode: .alloca, type: .int, aux: slotOffset, inBlock: currentBlock)
+                let zeroVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: 0, inBlock: currentBlock))
+                _ = airFn.appendInstruction(opcode: .store, type: .void, op0: zeroVal, op1: ValueId.instResult(resSlot), inBlock: currentBlock)
+
+                let evalRhsBlock = airFn.createBlock()
+                let mergeBlock = airFn.createBlock()
+
+                let v0 = lowerExpression(children[0], airFn: &airFn, currentBlock: &currentBlock)
+                let cond0 = airFn.appendInstruction(opcode: .icmp_ne, type: .int, op0: v0, op1: zeroVal, inBlock: currentBlock)
+                _ = airFn.appendInstruction(
+                    opcode: .cond_br,
+                    type: .void,
+                    op0: ValueId.instResult(cond0),
+                    op1: ValueId(mergeBlock.rawIndex),
+                    aux: evalRhsBlock.rawIndex,
+                    inBlock: currentBlock
+                )
+
+                currentBlock = evalRhsBlock
+                let v1 = lowerExpression(children[1], airFn: &airFn, currentBlock: &currentBlock)
+                let cond1 = airFn.appendInstruction(opcode: .icmp_ne, type: .int, op0: v1, op1: zeroVal, inBlock: currentBlock)
+                _ = airFn.appendInstruction(opcode: .store, type: .void, op0: ValueId.instResult(cond1), op1: ValueId.instResult(resSlot), inBlock: currentBlock)
+                _ = airFn.appendInstruction(
+                    opcode: .br,
+                    type: .void,
+                    aux: mergeBlock.rawIndex,
+                    inBlock: currentBlock
+                )
+
+                currentBlock = mergeBlock
+                let finalVal = airFn.appendInstruction(opcode: .load, type: .int, op0: ValueId.instResult(resSlot), inBlock: currentBlock)
+                return ValueId.instResult(finalVal)
+            }
+
+            if opKind == .pipePipe {
+                // a || b
+                airFn.stackFrameSize += 8
+                let slotOffset = UInt32(airFn.stackFrameSize)
+                let resSlot = airFn.appendInstruction(opcode: .alloca, type: .int, aux: slotOffset, inBlock: currentBlock)
+                let oneVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: 1, inBlock: currentBlock))
+                let zeroVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: 0, inBlock: currentBlock))
+                _ = airFn.appendInstruction(opcode: .store, type: .void, op0: oneVal, op1: ValueId.instResult(resSlot), inBlock: currentBlock)
+
+                let evalRhsBlock = airFn.createBlock()
+                let mergeBlock = airFn.createBlock()
+
+                let v0 = lowerExpression(children[0], airFn: &airFn, currentBlock: &currentBlock)
+                let cond0 = airFn.appendInstruction(opcode: .icmp_ne, type: .int, op0: v0, op1: zeroVal, inBlock: currentBlock)
+                _ = airFn.appendInstruction(
+                    opcode: .cond_br,
+                    type: .void,
+                    op0: ValueId.instResult(cond0),
+                    op1: ValueId(evalRhsBlock.rawIndex),
+                    aux: mergeBlock.rawIndex,
+                    inBlock: currentBlock
+                )
+
+                currentBlock = evalRhsBlock
+                let v1 = lowerExpression(children[1], airFn: &airFn, currentBlock: &currentBlock)
+                let cond1 = airFn.appendInstruction(opcode: .icmp_ne, type: .int, op0: v1, op1: zeroVal, inBlock: currentBlock)
+                _ = airFn.appendInstruction(opcode: .store, type: .void, op0: ValueId.instResult(cond1), op1: ValueId.instResult(resSlot), inBlock: currentBlock)
+                _ = airFn.appendInstruction(
+                    opcode: .br,
+                    type: .void,
+                    aux: mergeBlock.rawIndex,
+                    inBlock: currentBlock
+                )
+
+                currentBlock = mergeBlock
+                let finalVal = airFn.appendInstruction(opcode: .load, type: .int, op0: ValueId.instResult(resSlot), inBlock: currentBlock)
+                return ValueId.instResult(finalVal)
+            }
+
+            let t0 = semResult.nodeTypes[children[0]] ?? .int
+            let t1 = semResult.nodeTypes[children[1]] ?? .int
+            var v0 = lowerExpression(children[0], airFn: &airFn, currentBlock: &currentBlock)
+            var v1 = lowerExpression(children[1], airFn: &airFn, currentBlock: &currentBlock)
+
+            // Pointer arithmetic element size scaling
+            if opKind == .plus {
+                if typePool.isPointer(type: t0) {
+                    let elem = typePool.pointeeType(of: t0)
+                    let sz = typePool.size(of: elem)
+                    if sz > 1 {
+                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
+                        v1 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v1, op1: szVal, inBlock: currentBlock))
+                    }
+                } else if typePool.isPointer(type: t1) {
+                    let elem = typePool.pointeeType(of: t1)
+                    let sz = typePool.size(of: elem)
+                    if sz > 1 {
+                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
+                        v0 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v0, op1: szVal, inBlock: currentBlock))
+                    }
+                }
+            } else if opKind == .minus {
+                if typePool.isPointer(type: t0) && typePool.isPointer(type: t1) {
+                    let elem = typePool.pointeeType(of: t0)
+                    let sz = typePool.size(of: elem)
+                    let diff = airFn.appendInstruction(opcode: .sub, type: .int, op0: v0, op1: v1, inBlock: currentBlock)
+                    if sz > 1 {
+                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
+                        let scaled = airFn.appendInstruction(opcode: .sdiv, type: .int, op0: ValueId.instResult(diff), op1: szVal, inBlock: currentBlock)
+                        return ValueId.instResult(scaled)
+                    }
+                    return ValueId.instResult(diff)
+                } else if typePool.isPointer(type: t0) {
+                    let elem = typePool.pointeeType(of: t0)
+                    let sz = typePool.size(of: elem)
+                    if sz > 1 {
+                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
+                        v1 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v1, op1: szVal, inBlock: currentBlock))
+                    }
+                }
+            }
 
             let airOp: AIROpcode
             switch opKind {
@@ -532,9 +661,9 @@ public struct AIRLowering {
                 _ = airFn.appendExtra(arg)
             }
 
-            // Aux encodes: high 16 bits = arg count, low 16 bits = callee name hash
-            let calleeHash = fnv1a16(calleeName)
-            let auxVal = (UInt32(argVals.count) << 16) | calleeHash
+            // Aux encodes: high 16 bits = arg count, low 16 bits = deterministic callee ID
+            let calleeId = deterministicCalleeId(calleeName)
+            let auxVal = (UInt32(argVals.count) << 16) | (calleeId & 0xFFFF)
 
             let callInst = airFn.appendInstruction(
                 opcode: .call,
@@ -548,6 +677,17 @@ public struct AIRLowering {
         default:
             return .nilId
         }
+    }
+
+    private func deterministicCalleeId(_ name: String) -> UInt32 {
+        if name == "write" { return 1 }
+        if name == "exit" { return 2 }
+        for (idx, fn) in semResult.functionOrder.enumerated() {
+            if fn == name {
+                return UInt32(3 + idx)
+            }
+        }
+        return 0
     }
 
     private func unescapeString(_ s: String) -> String {
@@ -574,18 +714,18 @@ public struct AIRLowering {
         return result
     }
 
-    private func parseInteger(_ txt: String) -> Int32 {
-        var clean = txt
-        if clean.hasSuffix("u") || clean.hasSuffix("U") || clean.hasSuffix("l") || clean.hasSuffix("L") {
-            clean = clean.trimmingCharacters(in: CharacterSet(charactersIn: "uUlL"))
+    private func parseInteger(_ txt: String) -> UInt64 {
+        var clean = txt.replacingOccurrences(of: "'", with: "")
+        while clean.hasSuffix("u") || clean.hasSuffix("U") || clean.hasSuffix("l") || clean.hasSuffix("L") {
+            clean.removeLast()
         }
         if clean.hasPrefix("0x") || clean.hasPrefix("0X") {
-            return Int32(clean.dropFirst(2), radix: 16) ?? 0
+            return UInt64(clean.dropFirst(2), radix: 16) ?? 0
         } else if clean.hasPrefix("0b") || clean.hasPrefix("0B") {
-            return Int32(clean.dropFirst(2), radix: 2) ?? 0
+            return UInt64(clean.dropFirst(2), radix: 2) ?? 0
         } else if clean.hasPrefix("0") && clean.count > 1 {
-            return Int32(clean.dropFirst(1), radix: 8) ?? 0
+            return UInt64(clean.dropFirst(1), radix: 8) ?? 0
         }
-        return Int32(clean) ?? 0
+        return UInt64(clean) ?? 0
     }
 }

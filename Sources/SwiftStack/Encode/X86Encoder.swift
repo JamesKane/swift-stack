@@ -86,15 +86,21 @@ public struct X86Encoder {
         // mov rbp, rsp
         emitByte(0x48); emitByte(0x89); emitByte(0xE5)
 
-        // Save callee-saved registers
-        for reg in usedCallee {
-            emitPush(reg)
+        // Allocate total frame size = local/spill frameSize + callee-saved slots, 16-byte aligned
+        let calleeSize = UInt32(usedCallee.count * 8)
+        let totalAlloc = UInt32(((frameSize + calleeSize) + 15) & ~15)
+        if totalAlloc > 0 {
+            emitByte(0x48); emitByte(0x81); emitByte(0xEC)
+            emitInt32(Int32(totalAlloc))
         }
 
-        // sub rsp, frameSize
-        if frameSize > 0 {
-            emitByte(0x48); emitByte(0x81); emitByte(0xEC)
-            emitInt32(Int32(frameSize))
+        // Save callee-saved registers into dedicated slots below frameSize
+        for (idx, reg) in usedCallee.enumerated() {
+            let offset = Int32(frameSize + UInt32((idx + 1) * 8))
+            emitByte(rex(w: 1, r: reg, b: .rbp))
+            emitByte(0x89)
+            emitByte(modrm(mod: 2, reg: reg, rm: .rbp))
+            emitInt32(-offset)
         }
 
         // --- Body Instructions ---
@@ -154,19 +160,42 @@ public struct X86Encoder {
                     emitByte(modrm(mod: 0, reg: d, rm: s))
                 }
 
-            case .mov_store: // mov [dst], src1
-                guard let d = dst, let s = s1 else { break }
-                emitByte(rex(w: 1, r: s, b: d))
+            case .mov_store: // mov [src1], src2 (both read operands)
+                guard let ptr = s1, let val = s2 else { break }
+                emitByte(rex(w: 1, r: val, b: ptr))
                 emitByte(0x89)
-                if d == .rsp || d == .r12 {
-                    emitByte(modrm(mod: 0, reg: s, rm: .rsp))
+                if ptr == .rsp || ptr == .r12 {
+                    emitByte(modrm(mod: 0, reg: val, rm: .rsp))
                     emitByte(0x24)
-                } else if d == .rbp || d == .r13 {
-                    emitByte(modrm(mod: 1, reg: s, rm: .rbp))
+                } else if ptr == .rbp || ptr == .r13 {
+                    emitByte(modrm(mod: 1, reg: val, rm: .rbp))
                     emitByte(0x00)
                 } else {
-                    emitByte(modrm(mod: 0, reg: s, rm: d))
+                    emitByte(modrm(mod: 0, reg: val, rm: ptr))
                 }
+
+            case .mov_stack_arg: // mov dst, [rbp + imm]
+                guard let d = dst else { break }
+                emitByte(rex(w: 1, r: d, b: .rbp))
+                emitByte(0x8B)
+                emitByte(modrm(mod: 2, reg: d, rm: .rbp))
+                emitInt32(Int32(imm))
+
+            case .store_stack_arg: // mov [rsp + imm], src1
+                guard let s = s1 else { break }
+                emitByte(rex(w: 1, r: s, b: .rsp))
+                emitByte(0x89)
+                emitByte(modrm(mod: 2, reg: s, rm: .rsp))
+                emitByte(0x24) // SIB
+                emitInt32(Int32(imm))
+
+            case .sub_rsp:
+                emitByte(0x48); emitByte(0x81); emitByte(0xEC)
+                emitInt32(Int32(imm))
+
+            case .add_rsp:
+                emitByte(0x48); emitByte(0x81); emitByte(0xC4)
+                emitInt32(Int32(imm))
 
             case .lea_stack: // lea dst, [rbp - imm]
                 guard let d = dst else { break }
@@ -301,7 +330,9 @@ public struct X86Encoder {
             case .call:
                 emitByte(0xE8)
                 let calleeId = UInt32(imm & 0xFFFF)
-                let calleeName = calleeNames[calleeId] ?? "write"
+                guard let calleeName = calleeNames[calleeId] else {
+                    fatalError("Unknown callee ID \(calleeId) in function \(fnName). Known: \(calleeNames)")
+                }
                 relocations.append(RelocationRecord(
                     offset: code.count,
                     symbol: calleeName,
@@ -357,14 +388,14 @@ public struct X86Encoder {
     }
 
     private mutating func emitEpilogue(frameSize: UInt32, usedCallee: [X86Register]) {
-        if frameSize > 0 {
-            emitByte(0x48); emitByte(0x81); emitByte(0xC4)
-            emitInt32(Int32(frameSize))
+        for (idx, reg) in usedCallee.enumerated() {
+            let offset = Int32(frameSize + UInt32((idx + 1) * 8))
+            emitByte(rex(w: 1, r: reg, b: .rbp))
+            emitByte(0x8B)
+            emitByte(modrm(mod: 2, reg: reg, rm: .rbp))
+            emitInt32(-offset)
         }
-        for reg in usedCallee.reversed() {
-            emitPop(reg)
-        }
-        emitByte(0x5D) // pop rbp
+        emitByte(0xC9) // leave (mov rsp, rbp; pop rbp)
         emitByte(0xC3) // ret
     }
 

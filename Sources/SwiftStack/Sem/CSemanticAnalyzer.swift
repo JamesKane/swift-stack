@@ -240,6 +240,7 @@ public struct CSemanticAnalyzer {
             _ = analyzeExpression(initExpr, tree: tree, tokens: tokens)
         }
 
+        diagnostics.append("Global variable '\(name)' is not supported in M0.5")
         currentScope.insert(symbol: CSymbol(name: name, type: varType, storage: .global(name: name)))
     }
 

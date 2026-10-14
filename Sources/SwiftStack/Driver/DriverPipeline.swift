@@ -113,10 +113,10 @@ public final class DriverPipeline {
                 let prevCount = tokenBuffer.count
 
                 if lang == .swift {
-                    let lexer = SwiftLexer(fileId: fileId, buffer: sourceFile.buffer, length: sourceFile.length)
+                    let lexer = SwiftLexer(fileId: fileId, buffer: sourceFile.buffer, length: sourceFile.length, baseLocation: sourceFile.baseLocation)
                     lexer.lexInto(&tokenBuffer)
                 } else {
-                    let lexer = CLexer(fileId: fileId, buffer: sourceFile.buffer, length: sourceFile.length)
+                    let lexer = CLexer(fileId: fileId, buffer: sourceFile.buffer, length: sourceFile.length, baseLocation: sourceFile.baseLocation)
                     lexer.lexInto(&tokenBuffer)
                 }
 
@@ -182,6 +182,11 @@ public final class DriverPipeline {
             self.parseTreeCommittedBytes = tree.bytesCommitted
             self.parseTreeReservedBytes = tree.bytesReserved
 
+            if tree.count > 1 && tree.hasError(node: NodeId(tree.count - 1)) {
+                FileHandle.standardError.write(Data("Parse error: source contains syntax errors or unsupported constructs\n".utf8))
+                return 1
+            }
+
             if options.dumpStage == "parse-tree" {
                 dumpParseTree(tree: tree)
                 return 0
@@ -214,6 +219,12 @@ public final class DriverPipeline {
                 for diag in semRes.diagnostics {
                     FileHandle.standardError.write(Data("Semantic error: \(diag)\n".utf8))
                 }
+                return 1
+            }
+
+            if semRes.functionOrder.isEmpty {
+                FileHandle.standardError.write(Data("Error: no function definitions found in source\n".utf8))
+                return 1
             }
 
             // Phase 4: AIR Lowering
@@ -261,17 +272,19 @@ public final class DriverPipeline {
                 let regAlloc = LinearScanRegAlloc()
                 var encoder = X86Encoder()
 
+                var calleeMap: [UInt32: String] = [
+                    1: "write",
+                    2: "exit"
+                ]
+                for (idx, name) in semRes.functionOrder.enumerated() {
+                    calleeMap[UInt32(3 + idx)] = name
+                }
+
                 for i in 0..<module.functionCount {
                     module.withFunction(i) { airFn in
                         let lir = selector.select(function: airFn)
                         totalLIRCount += Int(lir.instructionCount)
                         let allocFn = regAlloc.allocate(function: lir)
-                        var calleeMap: [UInt32: String] = [:]
-                        for (name, _) in semRes.functions {
-                            calleeMap[fnv1a16(name)] = name
-                        }
-                        calleeMap[fnv1a16("write")] = "write"
-                        calleeMap[fnv1a16("exit")] = "exit"
 
                         let enc = encoder.encode(
                             function: allocFn,
