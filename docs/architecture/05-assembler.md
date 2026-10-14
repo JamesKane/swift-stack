@@ -1,134 +1,243 @@
-# 05. Native Assembler Architecture (AMD64, ARM64, RV64 & Extensible Target Framework)
+# 05. Native Assemblers: AMD64, ARM64, RV64
 
-## 1. Overview & Purpose
+| | |
+|---|---|
+| **Status** | Draft |
+| **Depends on** | [00](00-overview-and-principles.md), [01](01-frontend.md), [04](04-backend.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [14](14-measurement-methodology.md) |
 
-In operating system development and systems programming (such as [Todhchai OS](file:///home/jkane/Projects/OS/todhchai)), compilers alone are insufficient. Systems code requires standalone assembly files (`.s` and `.S`) for:
-- Low-level process entry stubs (`system/sys/floor/start.S`).
-- Microkernel traps, interrupt gates, and thread context switching routines.
-- Hardware-specific register configuration (page tables, control registers, timer setup).
-- Hand-optimized vector and SWAR kernels (cryptography, codecs, and memory primitives).
+## 1. Summary
 
-Traditional toolchains force developers to install and coordinate external assemblers (GNU `as`, `nasm`, or Clang's integrated assembler), introducing toolchain fragmentation and slow sub-process invocation.
+Systems code needs hand-written assembly: process entry stubs (`system/sys/floor/start.S`), trap and interrupt entry, context switching, control-register setup, and hand-tuned memory and crypto kernels. Swift-Stack includes built-in assemblers for AMD64, ARM64 and RV64, so building Todhchai needs no external `as`.
 
-Swift-Stack incorporates **built-in, data-oriented native assemblers** for **AMD64**, **ARM64**, and **RV64**, while providing an extensible target architecture for future platforms.
+The assembler:
+
+- runs `.S` files through the C23 preprocessor ([01](01-frontend.md)) in assembler mode;
+- parses a GNU-`as`-compatible directive and macro language;
+- encodes instructions with the **same `Encode` tables the compiler backend uses** ([04](04-backend.md));
+- relaxes branches to a fixpoint; and
+- produces an `Object.RelocatableObject` ([06](06-linker.md)), handed to the linker in memory or written to disk with `-c`.
+
+## 2. Goals
+
+- Assemble Todhchai's existing assembly sources without modifying them. This needs GNU `as` dialect compatibility for the directives and syntax those files actually use.
+- Have exactly one encoding source of truth (`Encode`), shared with codegen and the disassembler.
+- Produce deterministic output (D6): the same input and flags give identical bytes.
+- Produce `.eh_frame` from CFI directives, and produce or verify CUD records ([07](07-debugging-and-sdi.md)) from the same information.
+- Report errors with precise source locations, including locations inside macro expansions.
+
+## 3. Non-goals (v1)
+
+- Intel syntax for x86 (planned after AT&T; see §4.6).
+- EVEX encodings (AVX-512) and SVE, until there is a concrete user. VEX (AVX, in the x86-64 baseline; AVX2, opt-in) and all RVA23 extensions (including RVV 1.0, Zba/Zbb/Zbs, Zicond, Zfa, Zcb) are supported, because the backend uses them and they come from the shared `Encode` tables ([04](04-backend.md) §4.9, [17](17-simd-and-vectorization.md)). That keeps hand-written kernels possible on every architecture.
+- MASM, NASM, or armasm dialects.
+- RISC-V linker relaxation (`R_RISCV_RELAX`/`R_RISCV_ALIGN` emission). The v1 policy is in [04 §4.12](04-backend.md).
+- Target-specific features of GNU `as` that Todhchai sources do not use. Each directive is added when a corpus file needs it.
+
+## 4. Design
+
+### 4.1 Pipeline
 
 ```
-Assembly Source (*.s, *.S)
-            │
-            ▼  (SourceManager with 64-byte sentinel zero-padding)
-     Assembly Lexer  (SWAR scanning of mnemonics, registers, labels, directives)
-            │
-            ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                      PLUGGABLE ASSEMBLER TARGET                        │
-├────────────────────┬────────────────────┬──────────────────────────────┤
-│ AMD64 (x86_64)     │ ARM64 (AArch64)    │ RV64 (RISC-V 64GC)           │
-│ - Intel & AT&T     │ - Standard ARM UAL │ - Base 32-bit + 16-bit C ext │
-│ - ModR/M, SIB, REX │ - 32-bit fixed     │ - Pseudoinstruction expansion│
-│ - Branch relaxation│ - ADRP/ADD pairs   │ - li, la, call, tail, ret    │
-└────────────────────┴────────────────────┴──────────────────────────────┘
-            │
-            ▼  (Zero-Copy In-Memory Direct Output)
-Relocatable Sections (.text, .rela.text, .symtab, .eh_frame)
-            │
-            ▼  (Direct handoff to in-process Linker)
-      Native Linker
+*.S                          *.s
+ │                            │
+ ▼ C23 preprocessor ("assembler-with-cpp" mode, 01)
+ │                            │
+ └────────────┬───────────────┘
+              ▼  Assembly lexer (shared Lex primitives; per-arch comment and separator rules)
+         Statement stream: label | directive | instruction
+              ▼  Macro and conditional expansion (.macro/.rept/.irp/.if...)
+              ▼  Per-target instruction parsing (AssemblerTarget) → Encode
+         Fragments per section: fixed bytes | relaxable branch | alignment | fill | data expression
+              ▼  Layout + branch relaxation to a fixpoint (§4.5)
+              ▼  Fixup resolution: local → patched bytes; external or section-relative → relocations
+              ▼  CFI → .eh_frame FDEs; CUD synthesis or verification (§4.9)
+Object.RelocatableObject ──► Linker (06) in memory, or ELF/Mach-O .o via -c
 ```
 
----
+### 4.2 Module structure
 
-## 2. Extensible Architecture Framework
+| Module | Role |
+|---|---|
+| `Asm` | Statement parser, directives, macro engine, expression evaluator, layout and relaxation, CFI processing, `AssemblerTarget` implementations |
+| `Encode` | Instruction tables, encoders, disassemblers (shared with `Codegen`; [04 §4.9](04-backend.md)) |
+| `Object` | `RelocatableObject` model and ELF/Mach-O writers (canonical in [06](06-linker.md)) |
+| `Lex` | SWAR scanning primitives and the C23 preprocessor |
 
-The assembler is decoupled from machine-specific encoding via a high-performance, data-oriented target protocol:
+`Asm` depends on `Source`, `Lex`, `Encode` and `Object`. It does **not** depend on `Codegen`. `Package.swift` should reflect this once `Encode` and `Object` exist.
+
+### 4.3 The `AssemblerTarget` protocol
+
+The generic layer owns everything shared across targets: lexing, directives, macros, expressions, sections, symbols, layout, relaxation and CFI. A target supplies only instruction parsing, relaxation rules and relocation mapping.
 
 ```swift
 public protocol AssemblerTarget: Sendable {
-    /// Human-readable architecture identifier (e.g. "x86_64", "aarch64", "riscv64")
-    static var targetName: String { get }
+    /// Architecture whose `Encode` tables this target uses.
+    static var architecture: Encode.Architecture { get }
 
-    /// Assembles an assembly token stream directly into in-memory relocatable sections.
-    static func assemble(
-        source: SourceManager.Buffer,
-        tokens: TokenBuffer,
-        output: inout RelocatableSection
-    ) throws
+    /// Comment and statement-separator conventions for this target's GNU dialect
+    /// (x86: `#`; AArch64: `//`; RISC-V: `#`; `;` separates statements on all three).
+    static var lexicalRules: AsmLexicalRules { get }
+
+    /// Parses one instruction statement and appends one fragment: fixed bytes,
+    /// or a relaxable fragment with its short-form encoding.
+    static func parseInstruction(
+        _ statement: AsmStatement,
+        tokens: borrowing TokenBuffer,
+        into section: inout FragmentBuilder,
+        diagnostics: inout DiagnosticBag
+    )
+
+    /// Returns the encoding size for a relaxable fragment, given the current
+    /// displacement to its target. Must be monotonic: never shrink a fragment.
+    static func relaxedSize(of fragment: RelaxableFragment, displacement: Int64) -> UInt8
+
+    /// Maps a symbolic operand modifier (`:lo12:`, `%pcrel_hi`, `@GOTPCREL`, ...)
+    /// to the target relocation kind for the current object format.
+    static func relocationKind(
+        for modifier: OperandModifier, format: Object.Format
+    ) -> Object.RelocationKind?
 }
 ```
 
-### Planned Extensibility
-While AMD64, ARM64, and RV64 are the base requirements, the framework provides clean abstraction hooks for future target backends (such as WebAssembly text format `wat` or future ISA extensions) without altering the frontend parser or linker pipeline.
+Adding an architecture means adding `Encode` tables and one `AssemblerTarget` conformance. The directive, macro, layout and object layers do not change.
 
----
+### 4.4 Common language (all targets)
 
-## 3. Base Target: AMD64 (x86-64 / x86-64-v2)
+The assembler implements the GNU `as` subset used by the Todhchai corpus. The list grows only when a corpus file needs a new directive.
 
-### 1. Grammar & Syntax Support
-- Supports both **AT&T Syntax** (standard for OS kernel stubs, `%rax, (%rdi)`) and **Intel Syntax** (`[rdi], rax`).
-- Full directive parser:
-  - Data definitions: `.byte`, `.short`, `.long`, `.quad`, `.ascii`, `.asciz`, `.space`, `.fill`.
-  - Symbol linkage: `.globl`, `.local`, `.weak`, `.hidden`, `.type`, `.size`.
-  - Alignment: `.align`, `.p2align`.
-  - Sections: `.section .text`, `.section .rodata`, `.bss`.
-  - Dwarf unwinding: `.cfi_startproc`, `.cfi_endproc`, `.cfi_def_cfa_offset`, `.cfi_offset`.
-  - Numeric local labels (`1:`, `1b` [backwards], `1f` [forwards]).
+| Category | Directives / features |
+|---|---|
+| Sections | `.text`, `.data`, `.bss`, `.section name, "flags", @type`, `.pushsection`/`.popsection`, `.previous` |
+| Data | `.byte`, `.short`/`.2byte`, `.long`/`.4byte`, `.quad`/`.8byte`, `.ascii`, `.asciz`/`.string`, `.zero`, `.space`, `.fill` |
+| Symbols | `.globl`/`.global`, `.local`, `.weak`, `.hidden`, `.type sym, @function/@object`, `.size`, `.set`/`.equ`, `=` |
+| Alignment | `.align` (target-specific meaning: bytes on x86, power of two on ARM and RISC-V, as in GNU `as`), `.balign`, `.p2align` |
+| Macros | `.macro name args` / `.endm`, default and `:req` arguments, `\arg` substitution, `\@` counter, `.exitm` |
+| Repetition | `.rept n` / `.endr`, `.irp sym, values` / `.endr`, `.irpc` |
+| Conditionals | `.if expr`, `.ifdef`/`.ifndef`, `.ifc`/`.ifnc`, `.else`, `.elseif`, `.endif` |
+| Inclusion | `.include "file"`, `.incbin "file"[, skip[, count]]` (shares the `BinaryAssetPool` with `#embed`) |
+| Labels | Named labels; numeric local labels `1:` with `1b` (nearest backward) and `1f` (nearest forward) |
+| CFI | `.cfi_startproc`/`.cfi_endproc`, `.cfi_def_cfa`, `.cfi_def_cfa_offset`, `.cfi_def_cfa_register`, `.cfi_offset`, `.cfi_rel_offset`, `.cfi_restore`, `.cfi_undefined`, `.cfi_remember_state`/`.cfi_restore_state`, `.cfi_adjust_cfa_offset`, `.cfi_signal_frame` |
+| Misc | `.file`, `.loc` (line info), `.ident` (ignored), `.option` (RISC-V; §4.8) |
 
-### 2. Instruction Encoding Engine
-- REX prefixes (`0x40 - 0x4F`) for 64-bit operand sizes and extended registers (`R8-R15`).
-- VEX/EVEX prefix generation for AVX and AVX-512 SIMD vector instructions.
-- ModR/M and SIB byte calculation with automatic displacement sizing (0, 8-bit, or 32-bit).
-- Two-Pass Branch Relaxation:
-  - First pass emits 8-bit short branch instructions (`JMP`, `Jcc`).
-  - If target displacement exceeds $[-128, 127]$, automatically relaxes to 32-bit near branches in a single linear pass.
+**`.S` preprocessing.** `.S` files go through the C23 preprocessor ([01](01-frontend.md)) in *assembler-with-cpp* mode:
 
----
+- Lines starting with `#` that are not preprocessing directives pass through unchanged, because they are assembler comments on x86 and RISC-V.
+- Unbalanced `'` and `"` characters do not cause errors.
+- Token pasting and stringizing behave as in C.
 
-## 4. Base Target: ARM64 (AArch64)
+Each output line keeps its expansion location, so diagnostics point at both the macro use and the source line.
 
-### 1. Grammar & Syntax Support
-- Standard ARM Unified Assembler Language (UAL).
-- Register names:
-  - 64-bit scalar: `x0`–`x30`, `sp`, `xzr` (zero register).
-  - 32-bit scalar: `w0`–`w30`, `wzr`.
-  - SIMD/Vector: `v0`–`v31`, `q0`–`q31`, `d0`–`d31`, `s0`–`s31`, `b0`–`b31`.
-  - System registers: `TPIDR_EL0`, `DAIF`, `NZCV`, `VBAR_EL1`.
+**Expressions.** Integer expressions use GNU operator precedence, symbol arithmetic, and `.` (current location). Each value is one of: an absolute constant; a section-relative value (`sym + c`); a difference of symbols in the same section, resolved after layout; or an external symbol plus addend, which becomes a relocation.
 
-### 2. Instruction Encoding Engine
-- Strict fixed 32-bit instruction word generation:
-  - Branch instructions: `B`, `BL`, `CBZ`, `CBNZ`, `TBZ`, `TBNZ`, `B.cond`.
-  - Load/Store pairs: `LDP`, `STP` with pre-index `[sp, #-16]!` and post-index `[sp], #16` addressing.
-  - PC-relative addressing: Generates `ADRP` and `ADD` instruction pairs with associated relocations (`R_AARCH64_ADR_PREL_PG_HI21` and `R_AARCH64_ADD_ABS_LO12_NC`).
-  - Bitfield instructions: `UBFM`, `SBFM`, `EXTR`, `BFM`.
+### 4.5 Layout and relaxation
 
----
+Each section is a sequence of fragments:
 
-## 5. Base Target: RV64 (RISC-V 64GC)
+| Fragment | Size |
+|---|---|
+| Fixed bytes | Known at parse time |
+| Relaxable instruction | Short or long form, decided by layout |
+| Alignment | Depends on the fragment's address |
+| Fill / space | Known, or determined by an absolute expression |
+| Data expression | Fixed width; value resolved after layout or turned into a relocation |
 
-### 1. Grammar & Syntax Support
-- Standard RISC-V assembly grammar and ABI register aliases:
-  - Integer: `zero`, `ra`, `sp`, `gp`, `tp`, `t0`–`t6`, `s0`–`s11`, `a0`–`a7`.
-  - Floating Point: `ft0`–`ft11`, `fs0`–`fs11`, `fa0`–`fa7`.
-  - Control & Status Registers (CSRs): `mstatus`, `sstatus`, `satp`, `sie`, `sip`, `stvec`, `sepc`, `scause`.
+**Relaxation algorithm:**
 
-### 2. Pseudoinstruction Expansion
-In RISC-V, assembly code heavily relies on pseudoinstructions that expand into sequences of hardware instructions. The RV64 assembler natively synthesizes:
-- `li rd, imm` (Load Immediate): Automatically selects the shortest instruction sequence (1 to 6 instructions using `addi`, `lui`, `slli`, `add`) to materialize any 64-bit constant.
-- `la rd, symbol` (Load Address): Expands to `auipc rd, %pcrel_hi(symbol)` and `addi rd, rd, %pcrel_lo(symbol)`.
-- `call symbol` / `tail symbol`: Expands to `auipc` + `jalr`.
-- `ret`: Expands to `jalr zero, 0(ra)`.
-- `nop`: Expands to `addi zero, zero, 0` (or `c.nop`).
-- `mv rd, rs`: Expands to `addi rd, rs, 0`.
+1. Start every relaxable fragment in its short form.
+2. Assign addresses in one forward pass, computing alignment padding from current addresses.
+3. For every relaxable fragment whose target is in the same section, compute the displacement. If it is out of range for the current form, grow the fragment to the next form.
+4. If any fragment grew, go back to step 2.
 
-### 3. Compressed Instructions (C Extension)
-- Emits 16-bit compressed instructions (`c.li`, `c.mv`, `c.add`, `c.ld`, `c.sd`, `c.addi4spn`, `c.addi16sp`) whenever operands and registers conform to the compressed instruction subset, cutting binary footprint by 25–35%.
+Fragments **never shrink**, even if another fragment's growth reduces some padding. Each fragment has finitely many forms, so the loop terminates after at most (fragments × forms) iterations; in practice it takes two or three. A single linear pass is not enough, because growing one branch can push others out of range.
 
----
+Branches to symbols that are undefined, external, or in another section are encoded in their long form immediately and get a relocation. They never take part in relaxation.
 
-## 6. Zero-Disk In-Memory Integration
+### 4.6 AMD64 (x86-64)
 
-Traditional tools invoke an external assembler via `execvp("as", ...)` writing to a temporary file on disk.
+- **Syntax:** AT&T syntax (`movq %rax, (%rdi)`) is implemented first. *Assumption to verify before M1:* Todhchai's existing x86-64 `.S` files use GNU AT&T syntax. Intel syntax (`.intel_syntax noprefix`) is a later item, added when a corpus file needs it.
+- **Operands:** registers (`%rax`… `%r15`, sub-registers, `%xmm0`–`%xmm15`, segment and control registers), immediates (`$expr`), memory operands `disp(base, index, scale)` including RIP-relative `sym(%rip)`, and operand-size suffixes (`b/w/l/q`), inferred from registers when omitted.
+- **Encoding:** through `Encode` tables (legacy prefixes, REX, ModR/M, SIB, maps `0F`/`0F38`/`0F3A`). The displacement size (none, 8-bit, or 32-bit) is chosen at encode time when the value is known; symbolic displacements are always 32-bit with a relocation.
+- **Relaxable:** `JMP` and `Jcc` (rel8 → rel32).
+- **Relocations:**
+  - ELF: `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_GOTPCREL(X)`, `R_X86_64_64`, `R_X86_64_32S`, TLS (`R_X86_64_TPOFF32`, `R_X86_64_GOTTPOFF`).
+  - Mach-O: `X86_64_RELOC_*` equivalents.
+- **Privileged instructions** needed by kernel and stub code: `syscall`/`sysret`, `iretq`, `swapgs`, `lgdt`/`lidt`, `mov %crN`, `rdmsr`/`wrmsr`, `xsave`/`xrstor`, `cpuid`, `rdtsc`, `pause`, `hlt`, `invlpg`.
 
-Swift-Stack's assemblers:
-1. Parse the assembly file in memory using the fast SWAR lexer.
-2. Emit machine code bytes directly into memory-backed `RelocatableSection` buffers.
-3. Hand the resulting section buffers directly to the internal Linker (`swift-ld`).
-4. Total execution time for typical OS kernel assembly files (e.g. `start.S` or `context_switch.S`): **under 1 millisecond**.
+### 4.7 ARM64 (AArch64)
+
+- **Syntax:** GNU AArch64 syntax (the A64 forms of Arm's unified assembler language).
+- **Registers:**
+  - general: `x0`–`x30`, `w0`–`w30`, `sp`, `wsp`, `xzr`, `wzr`;
+  - SIMD and FP: `v0`–`v31` with arrangement specifiers (`v0.4s`), `q`/`d`/`s`/`h`/`b` views;
+  - system registers by name or by `S<op0>_<op1>_<Cn>_<Cm>_<op2>`: `TPIDR_EL0`, `DAIF`, `NZCV`, `VBAR_EL1`, `TTBR0_EL1`, `SCTLR_EL1`, `ESR_EL1`, `ELR_EL1`, `SPSR_EL1`.
+- **Encoding (fixed 32-bit words):**
+  - branches: `B`, `BL`, `B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`, `BLR`, `RET`;
+  - loads and stores, including `LDP`/`STP` with pre-index (`[sp, #-16]!`) and post-index (`[sp], #16`) addressing;
+  - bitfield instructions (`UBFM`, `SBFM`, `BFM`, `EXTR` and their aliases);
+  - logical immediates (bitmask encoding);
+  - `MOVZ`/`MOVK`/`MOVN`, the `mov` alias, and `MSR`/`MRS`;
+  - barriers (`DMB`, `DSB`, `ISB`), `ERET`, `SVC`/`HVC`/`SMC`.
+- **Relaxable:**
+  - `B.cond`/`CBZ`/`CBNZ` (±1 MiB) and `TBZ`/`TBNZ` (±32 KiB) relax to an inverted branch over `B`;
+  - `ldr xN, =imm` literal loads use a literal pool flushed at `.ltorg` or at the end of the section.
+- **Symbol modifiers:**
+  - ELF: `:lo12:`, `:got:`, `:got_lo12:`, `:tprel_hi12:`, `:tprel_lo12_nc:`;
+  - Mach-O: `sym@PAGE`, `sym@PAGEOFF`, `sym@GOTPAGE`, `sym@GOTPAGEOFF`.
+- **Relocations:**
+  - ELF: `R_AARCH64_ADR_PREL_PG_HI21`, `R_AARCH64_ADD_ABS_LO12_NC`, `R_AARCH64_LDST{8,16,32,64,128}_ABS_LO12_NC`, `R_AARCH64_CALL26`, `R_AARCH64_JUMP26`, `R_AARCH64_CONDBR19`, `R_AARCH64_TSTBR14`, `R_AARCH64_ADR_GOT_PAGE`, `R_AARCH64_LD64_GOT_LO12_NC`, `R_AARCH64_ABS64`, `R_AARCH64_PREL32`, and the TLS LE relocations.
+  - Mach-O: the `ARM64_RELOC_*` equivalents.
+
+### 4.8 RV64 (RISC-V 64GC)
+
+- **Registers:** ABI and numeric names: `zero`, `ra`, `sp`, `gp`, `tp`, `t0`–`t6`, `s0`/`fp`–`s11`, `a0`–`a7`, `x0`–`x31`; `ft0`–`ft11`, `fs0`–`fs11`, `fa0`–`fa7`, `f0`–`f31`. CSRs by name (`mstatus`, `sstatus`, `satp`, `sie`, `sip`, `stvec`, `sepc`, `scause`, `stval`, `sscratch`, `time`, `cycle`) or by number.
+- **Pseudoinstructions:**
+  - `li rd, imm`: materializes any 64-bit constant in **up to 8 instructions** (`lui`/`addi(w)` followed by `slli`/`addi` pairs). It searches for shorter forms using trailing-zero shifts and sign-extended 32-bit values, and uses compressed forms (`c.li`, `c.lui`, `c.slli`, `c.addi`) where possible.
+  - `la rd, sym`: `auipc` + `addi` with `%pcrel_hi`/`%pcrel_lo` when the symbol is local. In PIC mode for preemptible symbols, it becomes `auipc` + `ld` through the GOT (`%got_pcrel_hi`).
+  - `lla`; `call sym` / `tail sym` (`auipc` + `jalr`, `R_RISCV_CALL_PLT`); `ret`; `nop` (`c.nop` when C is enabled); `mv`, `not`, `neg`, `seqz`, `snez`, `beqz`, `bnez`, `bgt`, `ble`, `j`, `jr`, `csrr`, `csrw`, `csrs`, `csrc`, `fence`, `fmv`.
+- **Compressed instructions:** when `.option rvc` is in effect (the default; C and Zcb are part of RVA23), each instruction is emitted in its 16-bit C form if registers and immediates fit (`c.li`, `c.mv`, `c.add`, `c.addi`, `c.addi16sp`, `c.addi4spn`, `c.ld`, `c.sd`, `c.ldsp`, `c.sdsp`, `c.j`, `c.beqz`, `c.bnez`, `c.jr`, `c.jalr`). `.option norvc` disables this. `.option push`/`.option pop` are supported.
+- **Relaxation (v1):** `.option relax` is accepted, but the assembler behaves as `norelax` per [04 §4.12](04-backend.md):
+  - it never emits `R_RISCV_RELAX` or `R_RISCV_ALIGN`;
+  - alignment padding is exact;
+  - `%pcrel_lo` refers to the label of its paired `auipc`, as in GNU `as`.
+- **Relaxable branches (assembler-local):** `c.beqz`/`c.bnez` → `beq`/`bne` → inverted branch over `jal`; `c.j` → `jal`.
+- **Relocations (ELF only; there is no RISC-V Mach-O):** `R_RISCV_PCREL_HI20`, `R_RISCV_PCREL_LO12_I/S`, `R_RISCV_HI20`, `R_RISCV_LO12_I/S`, `R_RISCV_CALL_PLT`, `R_RISCV_JAL`, `R_RISCV_BRANCH`, `R_RISCV_RVC_JUMP`, `R_RISCV_RVC_BRANCH`, `R_RISCV_GOT_HI20`, `R_RISCV_64`, `R_RISCV_32`, and TLS LE (`R_RISCV_TPREL_HI20`/`LO12_I`/`LO12_S`/`ADD`).
+
+### 4.9 CFI, `.eh_frame`, and CUD
+
+CFI directives in hand-written assembly serve two purposes, reconciling the unwind policy in [04 §4.11](04-backend.md) and [07](07-debugging-and-sdi.md):
+
+1. **`.eh_frame` generation.** Each `.cfi_startproc`…`.cfi_endproc` region produces one FDE (and a CIE, shared where identical). This is the canonical unwind info on Linux and FreeBSD, and the fallback on Todhchai and macOS.
+2. **CUD synthesis.** The assembler interprets each region's CFI program symbolically. If the final state at every instruction past the prologue matches a CUD-describable layout (frame pointer established, fixed frame size, callee-saved registers at fixed offsets), it emits a CUD record and, on Todhchai, drops the FDE. Otherwise the function is marked *CUD-inexpressible* and keeps its FDE. A note-level diagnostic lists such functions.
+
+Functions with no CFI region (common in entry stubs and context switches) get no unwind info. Unwinders stop at them.
+
+- `_start` and similar entry points SHOULD mark the end of the stack explicitly with `.cfi_undefined` on the return-address register, following existing practice in glibc and FreeBSD. CUD records this as a terminal frame.
+- Context-switch routines that change stacks SHOULD carry `.cfi_signal_frame`, or no CFI at all, so unwinders do not walk across stacks.
+
+### 4.10 Integration
+
+- **In-process (default):** the assembler's `RelocatableObject` goes to the linker with the compiler's objects. No temporary files are written.
+- **`-c`:** `Object`'s ELF or Mach-O writer serializes a standard relocatable `.o` that GNU `ld`, `lld` and Apple `ld` can consume. This keeps Swift-Stack assembly usable in external builds and lets host linkers act as differential oracles.
+- **Line info:** `.loc`/`.file` directives, or automatic line rows when `-g` is given without them, produce line-table rows for SDI ([07](07-debugging-and-sdi.md)) and DWARF `.debug_line` on hosts.
+- **Throughput target:** typical stub and context-switch files (a few hundred lines) assemble in **under 1 ms**. This is a target, measured per [14](14-measurement-methodology.md).
+
+### 4.11 Verification
+
+- **Round trip:** every `Encode` table entry is assembled from text, disassembled, and compared with the original statement.
+- **Differential:** each corpus file is assembled with Swift-Stack and with host GNU `as` / `llvm-mc`. The `.text` bytes, symbol tables and relocations are compared (after normalizing for documented differences such as RISC-V relaxation).
+- **Corpus:** Todhchai `system/sys/floor/start.S`, context-switch and trap sources for all three architectures, plus synthetic tests for every directive in §4.4.
+
+## 5. Alternatives considered
+
+- **Separate encoders for the assembler and codegen:** this was the original design implied by doc 04, which described encoders twice. Rejected: two encoders drift apart, and every bug has to be fixed twice.
+- **Driving the backend's LIR from the assembler (assembly → LIR → encoder):** LIR is SSA- and virtual-register-oriented and does not model directives or exact user-chosen encodings. The assembler instead talks to `Encode` directly.
+- **Single-pass "optimistic" relaxation:** incorrect, as shown in §4.5. Rejected in favor of the fixpoint.
+- **Requiring Intel syntax or a new assembly dialect:** would force rewriting existing Todhchai sources and break compatibility with GNU-syntax references.
+
+## 6. Open questions
+
+1. **Corpus syntax audit:** confirm that all Todhchai x86-64 `.S` files use AT&T syntax, and list exactly which directives the corpus uses, to fix the v1 directive set.
+2. **Custom unwind directive:** should Swift-Stack add one (e.g. `.ss_unwind none|terminal`) for cases CFI expresses badly, or rely only on standard CFI?
+3. **Foreign RISC-V objects with `R_RISCV_ALIGN`:** the linker ([06](06-linker.md)) must handle these even though the assembler never emits them. The minimum correct behavior needs to be decided.
+4. **Mach-O assembler dialect differences** (Apple `as` uses `sym@PAGE`, different section directives such as `.section __TEXT,__text`, and `.subsections_via_symbols`): how much is needed for macOS host builds?
+5. **Inline assembly (D7):** the C frontend's basic `asm("...")` statements should be parsed and encoded by this assembler. Extended asm with operand constraints needs an interface with register allocation ([04](04-backend.md)), and its v1 scope is not yet decided.

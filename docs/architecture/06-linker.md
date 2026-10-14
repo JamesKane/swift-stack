@@ -1,150 +1,251 @@
-# 06. Data-Oriented Native Linker Architecture
+# 06. Data-Oriented Native Linker
 
-## 1. Overview & The "Modern Linker Redundancy" Problem
+| | |
+|---|---|
+| **Status** | Draft |
+| **Depends on** | [00](00-overview-and-principles.md), [04](04-backend.md), [05](05-assembler.md), [07](07-debugging-and-sdi.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md) |
 
-In traditional C and Swift toolchains, the linker is one of the most frustrating, error-prone, and bottlenecked components. As analyzed by Jonathan Blow and Sean Barrett (in *Redundancies in Modern Linkers*), traditional linkers do enormous amounts of redundant, useless work while failing to provide basic safety:
+## 1. Summary
 
-1. **The Header & DWARF Duplication Tax:**
-   In the classical C/C++ compilation model, every single translation unit that includes a header file generates duplicate debug information and struct definitions for every type in that header. The linker is then burdened with deduplicating millions of identical DIE records. This process is slow, memory-intensive, and prone to subtle bugs.
-2. **Redundant Address Assignment vs Modern Loaders:**
-   A large part of a traditional linker's original historic purpose was to statically fix addresses at link time so the OS loader wouldn't have to. With modern Address Space Layout Randomization (ASLR), modern OS loaders relocate code at startup anyway, causing work to be performed twice unless the toolchain is co-designed with the system loader.
-3. **Flawed "First-Come, First-Served" Symbol Resolution:**
-   Standard linkers place all global symbols into a flat global bucket. If multiple translation units or libraries define the same symbol, the first one encountered silently claims the slot. This leads to accidental symbol collisions, silent hijacking of functions, and phantom bugs that evade both compilers and linkers.
-4. **Zero Type Safety at Link Time:**
-   Compilers enforce strict type safety across arguments and return values, but the moment code transitions to the linker, that type safety completely vanishes. The linker sees only untyped strings. C++ uses complex name mangling as an awkward, brittle workaround; plain C has no link-time type verification at all, resulting in silent ABI mismatches when headers and implementations fall out of sync.
-5. **The Disk Serialization Waste:**
-   Compilers spend millions of cycles formatting and writing relocatable object files (`.o`) to disk, only for the linker process to immediately read those exact same bytes back off disk, re-parse the ELF/Mach-O headers, and reconstruct identical symbol tables.
+The Swift-Stack linker (`ss-ld`) runs in-process with the compiler. It consumes relocatable objects in a shared in-memory **object model** (the `Object` module, defined canonically in this chapter), whether they were produced by Codegen, by the native assemblers, or read from foreign ELF / Mach-O `.o` and `.a` files. It produces static ELF executables for Todhchai OS and static or dynamic executables for the POSIX host targets.
 
-Swift-Stack replaces this legacy architecture with an **in-process, data-oriented native linker** (`swift-ld` / `todh-ld`). It resolves symbols with **typed, module-scoped descriptors**, emits **single-instance debug information**, and operates directly on **in-memory section buffers**.
+Relative to a conventional linker it adds three things, without changing ordinary ELF/Mach-O symbol semantics:
 
-```
-Backend In-Memory Relocatable Sections
-           │
-           ▼  (Zero-Copy In-Memory Direct Handoff)
-Phase 1: Typed, Module-Scoped Symbol Resolution
-  - Lock-free concurrent symbol table (Hopscotch / Radix hash)
-  - Explicit (ModuleId, SymbolName, TypeSignatureHash) verification
-  - Zero silent symbol hijacking
-           │
-           ▼
-Phase 2: Section Allocation & Address Layout
-  - Co-designed with Todhchai loader: Base 0x1000000, 4 KiB Page Alignment
-  - Segments: RX (Text), R (Rodata/Debug), RW (Data/BSS), TLS (PT_TLS)
-           │
-           ▼
-Phase 3: Concurrent Relocation Processing
-  - Memory-mapped output executable
-  - Slices of .text (64 KiB chunks) processed by worker threads concurrently
-  - In-place binary patching: (S + A - P) / (S + A)
-           │
-           ▼
-Phase 4: Synthetic Sections & Single-Emission Debug Info
-  - .eh_frame_hdr (Binary search index)
-  - .note.gnu.build-id (Fast BLAKE3 checksum)
-  - Native Compact Debug Index (.todh_debug) - Emitted ONCE per module!
-           │
-           ▼
-Final Static / Dynamic Executable Binary
-```
+1. **Link-time type checking** of symbol references, using type-signature hashes carried in a side section (`.ss_symtypes`).
+2. **Debug-info merging without DIE deduplication**, by consuming per-module SDI fragments (see [07](07-debugging-and-sdi.md)).
+3. **Deterministic parallel linking**: output is bitwise identical regardless of thread count (D6).
 
----
+## 2. Motivation
 
-## 2. Typed, Module-Scoped Symbol Binding
+The design is motivated by the redundancies discussed by Jonathan Blow and Sean Barrett (*Redundancies in Modern Linkers*) and by the observed costs of conventional toolchains:
 
-To permanently eliminate the silent aliasing flaws of legacy linkers, Swift-Stack implements **explicitly scoped, type-checked symbol binding**:
+- **Debug-info duplication.** In the classical C model every translation unit that includes a header emits debug records for the header's types, and the linker (or a post-link tool) spends significant time deduplicating them. Swift-Stack emits type debug information once per module and merges modules by content hash (§7, [07](07-debugging-and-sdi.md)).
+- **First-come symbol resolution.** Archive member selection and weak/strong rules let an unrelated definition satisfy a reference silently. Swift-Stack keeps standard semantics (so foreign code links as expected) but adds optional provider-module constraints and type checks (§4).
+- **No type information at link time.** In plain C, a declaration and a definition can disagree on a signature without any diagnostic. `.ss_symtypes` lets the linker report such mismatches when both sides were compiled by Swift-Stack.
+- **Disk round-trips.** Writing `.o` files only to have the linker re-parse them is unnecessary when compiler and linker share a process. In-process handoff (§3.3) removes this; on-disk objects remain supported for separate compilation and caching ([13](13-modules-and-incremental-builds.md)).
+
+A note on loaders: the original document claimed that ASLR makes link-time address assignment redundant. That overstates it. Position-independent executables use PC-relative code, so text is not patched at load time; the loader applies mostly `R_*_RELATIVE` and GOT/`JUMP_SLOT` relocations to data. Link-time layout remains necessary. What *can* be co-designed with the Todhchai loader is the set of load-time relocations (zero for static `ET_EXEC`).
+
+## 3. Goals
+
+- MUST link objects from Codegen, the native assemblers, and foreign ELF objects/archives (Mach-O on macOS) with standard symbol semantics.
+- MUST produce identical output bytes for identical inputs and flags, independent of thread count and scheduling (D6).
+- MUST support the targets in §8 in the staged order given there.
+- MUST verify `.ss_symtypes` type hashes when both the reference and the definition carry them.
+- SHOULD meet the link-time targets in §11 (hypotheses, measured per [14](14-measurement-methodology.md)).
+
+## 4. Non-goals
+
+- PE/COFF and Windows (project non-goal, [00](00-overview-and-principles.md)).
+- Producing shared libraries in v1 (dynamic *executables* linking against system shared libraries are in scope for host targets).
+- Linker scripts beyond a small fixed set of built-in layouts.
+- LTO. Cross-module optimization happens in the compiler using inlinable bodies from module interfaces ([13](13-modules-and-incremental-builds.md)).
+- Binary compatibility with swiftc-produced Swift objects (D1).
+
+## 5. Design
+
+### 5.1 The `Object` model (canonical)
+
+`Object` is the shared relocatable-object model used by Codegen ([04](04-backend.md)), the assemblers ([05](05-assembler.md)), the foreign-object readers, and the linker. All tables are `Column<T>` storage (D8, [00](00-overview-and-principles.md)); there are no per-symbol or per-relocation heap objects.
 
 ```swift
-public struct SymbolDescriptor: Hashable {
-    public var moduleId: ModuleId           // 4 bytes: Identifies defining library/module
-    public var name: AtomId                 // 4 bytes: Interned symbol name
-    public var typeSignatureHash: UInt64    // 8 bytes: Hash of parameter & return types
-    public var flags: SymbolFlags           // 2 bytes: isExported, isWeak, isTrivial
+public struct RelocatableObject: ~Copyable {
+    public var origin: ObjectOrigin             // compiled, assembled, foreignELF, foreignMachO
+    public var moduleId: ModuleId               // Swift-Stack module, or .foreign
+    public var inputPriority: UInt32            // command-line order; used for deterministic tie-breaks
+
+    // Sections
+    public var sectionNames: Column<AtomId>
+    public var sectionKinds: Column<SectionKind>    // text, rodata, data, bss, tdata, tbss, eh_frame, ss_symtypes, ss_debug, ...
+    public var sectionAligns: Column<UInt8>         // log2 alignment
+    public var sectionBytes: Column<ByteRange>      // range into `bytes`; bss/tbss have size only
+    public var bytes: Column<UInt8>
+
+    // Symbols
+    public var symbolNames: Column<AtomId>          // mangled `_SS…` for Swift, plain for C/asm
+    public var symbolSections: Column<SectionIndex> // or .undefined / .absolute / .common
+    public var symbolValues: Column<UInt64>
+    public var symbolSizes: Column<UInt64>
+    public var symbolBindings: Column<SymbolBinding> // local, global, weak
+    public var symbolVisibility: Column<SymbolVisibility>
+    public var symbolTypes: Column<SymbolTypeRecord> // optional; from .ss_symtypes (§5.3)
+
+    // Relocations, grouped by section (CSR layout)
+    public var relocSectionStart: Column<UInt32>    // per section, offset into relocation columns
+    public var relocOffsets: Column<UInt64>
+    public var relocKinds: Column<RelocKind>        // target-neutral enum, mapped from ELF/Mach-O types
+    public var relocSymbols: Column<SymbolIndex>
+    public var relocAddends: Column<Int64>
+
+    // Unwind and debug
+    public var unwind: Column<UnwindRecord>         // CUD records (07 §5.5); FDEs stay in an eh_frame section
+    public var debugFragment: SDIFragmentRef?       // per-module SDI fragment (07 §5.6)
 }
 ```
 
-### Eliminating Silent Aliasing & Mismatches
+Rules:
 
-1. **Module Scoping:**
-   References can specify the target library (e.g. `libtodhchai::Loop.openWindow`). The linker guarantees that the symbol resolves exclusively against that module, preventing an application or third-party library from accidentally overriding an internal system API.
-2. **Link-Time Type Verification:**
-   Every symbol import and export carries a 64-bit `typeSignatureHash` derived from its canonical `TypeId` representation in the `TypePool`.
-   - If an imported C function is declared as `int open(const char*, int)` in one file but implemented as `long open(const char*, unsigned int)` in another, the linker immediately halts with an explicit **Link-Time Type Mismatch Error**, specifying both the caller's expectation and the provider's actual definition.
-   - This eliminates the silent memory corruption and ABI bugs that have plagued C for decades.
-3. **No Name Mangling Tax for Type Safety:**
-   Because types are verified via 64-bit signature hashes, the compiler does not need to inflate symbol names with hundreds of bytes of mangled type strings. Symbol names remain clean, short, and readable in debug traces.
+- `RelocKind` is a target-neutral enumeration with a 1:1 mapping to each object format's relocation types, so that foreign objects round-trip without loss.
+- Codegen and the assemblers produce `RelocatableObject` values directly. The ELF and Mach-O readers `mmap` the input and fill the same columns; section bytes may alias the mapping (zero-copy).
+- An `ObjectWriter` can serialize a `RelocatableObject` to a standard ELF `.o` (or Mach-O on macOS). This is used for caching ([13](13-modules-and-incremental-builds.md)), for `-c` builds, and for interoperation with external tools.
 
----
+### 5.2 Symbol resolution
 
-## 3. Single-Emission Debug Information (No DWARF Merging Tax)
+Symbol semantics follow ELF (and Mach-O on macOS) so that foreign code behaves as it does under `ld.lld`:
 
-In Swift-Stack, **type definitions and debug information are never duplicated across translation units**:
-- In C23, types declared in shared header files are registered in the module's shared `TypePool`.
-- The compiler emits debug information **once per module** directly into the `.todh_debug` section (or canonical `.debug_info`).
-- The linker is completely freed from the burden of parsing, decompressing, and deduplicating millions of identical DIE trees. Debug info generation becomes a simple, linear append operation that completes in under 5 milliseconds.
+- Strong vs. weak definitions, common symbols, and lazy archive-member extraction follow the standard rules.
+- Duplicate strong definitions are an error. The diagnostic names both input objects and, when available, both source locations (from SDI fragments).
+- Archive member extraction is iterated to a fixed point in a deterministic order (input priority, then member index).
 
----
+**Parallel, deterministic resolution.** Symbols are inserted into a concurrent open-addressing table keyed by interned name. Each slot stores the candidate definition with the *lowest* `(rank, inputPriority, symbolIndex)` tuple, where `rank` orders strong < weak < common < lazy. Updates use a CAS loop that only replaces a candidate with a strictly smaller tuple. The final result depends only on the input set, not on which thread arrives first (D6).
 
-## 4. Zero-Copy In-Memory Pipeline
+### 5.3 Typed symbol checks: `.ss_symtypes`
 
-When compiling a multi-file Swift module or C library:
-1. **No Intermediate Disk Files:** The backend keeps relocatable sections in memory buffers (`~Copyable` arenas).
-2. **Direct Buffer Handoff:** The linker accepts these memory slices directly without disk writes, serialization, or deserialization.
-3. **Foreign Object Support:** When linking external C/assembly libraries, the linker memory-maps foreign `.o` and `.a` archive files directly into virtual memory.
+Symbol names are ordinary. Swift symbols use Swift-Stack's mangling (prefix `_SS`, defined in [11](11-generics-and-runtime-metadata.md)), which already encodes the module and distinguishes overloads. C and assembly symbols use their plain names. Type checking is layered on top through a side section:
 
----
+```c
+// Normative layout; little-endian; section alignment 8.
+typedef struct ss_symtype {
+    uint32_t symbol_index;    // offset 0: index into the object's symbol table
+    uint8_t  kind;            // offset 4: 0 = function, 1 = object (data), 2 = TLS object
+    uint8_t  language;        // offset 5: 0 = C, 1 = Swift, 2 = asm-declared
+    uint16_t flags;           // offset 6: bit 0 = definition, bit 1 = has provider module
+    uint64_t signature_hash;  // offset 8: canonical type-signature hash (BLAKE3-64)
+    uint32_t provider_module; // offset 16: interned module name (string table offset), or 0
+    uint32_t reserved;        // offset 20
+} ss_symtype;                 // size 24
+```
 
-## 5. The Four Concurrent Linking Phases
+**Hash derivation.** The hash is computed over a *canonical structural encoding* of the declared type. It is never computed from a `TypeId`, because `TypeId`s are compilation-local.
 
-### Phase 1: Parallel Symbol Resolution
-- **Concurrent Hash Table:** Symbols are interned into a fixed-size, concurrent hash table using open addressing with Robin Hood or Hopscotch collision resolution.
-- **Lock-Free Deduplication:** Worker threads resolve undefined symbols concurrently using atomic CAS operations on symbol table slots.
-- **Strict Strong vs Weak Semantics:** Global strong symbols override weak symbols deterministically without thread stalls. Duplicate definitions of strong symbols trigger instant diagnostic messages pointing directly to the source locations.
+- **Swift:** the hash covers the lowered function signature (parameter and result types, ownership conventions, `throws`/`async`). The mangled name already separates overloads; the hash catches stale interface/implementation pairs.
+- **C:** the hash covers the function or object type after removing top-level parameter qualifiers and expanding typedefs. Struct and union types follow the C23 cross-translation-unit compatibility rules (C23 §6.2.7): a complete tagged type is encoded by its tag plus its member names and member types in order (recursively, with cycles broken by tag reference). An incomplete type is encoded by kind and tag only. Two types that the standard calls compatible MUST hash equal; a hash difference MAY still be a false negative for compatible-but-differently-spelled types, which is why the diagnostic is configurable.
+- `long` and `long long` remain distinct in the encoding even when they have the same size ([02](02-semantic-analysis.md)).
 
-### Phase 2: Section Layout & Memory Sizing
-- Section sizes and alignments from all input objects are aggregated using parallel prefix sums (scan).
-- **Target OS Layouts:**
-  - **Todhchai OS:** Static `ET_EXEC` mapped at base `0x1000000`, 4 KiB page alignment:
-    ```
-    Virtual Address Range           Segment Type   Flags   Alignment
-    0x1000000 - 0x1000000 + text    PT_LOAD        R-X     4096 (4 KiB)
-    ...       - ...         rodata  PT_LOAD        R--     4096 (4 KiB)
-    ...       - ...         data    PT_LOAD        RW-     4096 (4 KiB)
-    ...       - ...         tls     PT_TLS         R--     8 / 16 bytes
-    ```
-    Stack allocation: Enforces Todhchai's default 256 KiB stack allocation with non-executable stack flags (`PT_GNU_STACK` with `RW-` rights).
-  - **FreeBSD Host Target:** Standard FreeBSD ELF64 (`ELFOSABI_FREEBSD` in `EI_OSABI`), emits `.note.tag` (FreeBSD ABI version), dynamic interpreter `PT_INTERP` pointing to `/libexec/ld-elf.so.1`, or static image base at standard FreeBSD layout (`0x200000` or PIE).
-  - **Linux Host Target:** Standard System V / GNU ELF64 with dynamic interpreter `/lib64/ld-linux-x86-64.so.2` or static execution.
-  - **macOS Host Target:** Mach-O 64-bit (`MH_EXECUTE`), emitting `LC_SEGMENT_64` (`__TEXT`, `__DATA`, `__LINKEDIT`), `LC_LOAD_DYLINKER`, and code signature slices.
+**Check policy.**
 
-### Phase 3: Concurrent Relocation Processing
-Relocating machine code bytes is parallelized across CPU cores with zero lock contention:
-1. **Memory-Mapped Output:** The target executable is allocated or memory-mapped to its final size.
-2. **Chunk Partitioning:** Output sections (e.g. `.text`) are divided into 64 KiB work chunks.
-3. **Worker Processing:** Each thread claims a chunk from a work-stealing queue and applies relocations in-place:
-   - **x86-64 Relocations:**
-     - `R_X86_64_PC32` / `R_X86_64_PLT32`: `S + A - P`
-     - `R_X86_64_64`: `S + A`
-   - **AArch64 Relocations:**
-     - `R_AARCH64_ADR_PREL_PG_HI21`: Page-relative high 21-bit displacement
-     - `R_AARCH64_ADD_ABS_LO12_NC`: Low 12-bit immediate
-     - `R_AARCH64_CALL26` / `R_AARCH64_JUMP26`: 26-bit branch displacement
-   - **RISC-V Relocations:**
-     - `R_RISCV_CALL` / `R_RISCV_CALL_PLT`: `AUIPC` + `JALR` pair
-     - `R_RISCV_PCREL_HI20` / `R_RISCV_PCREL_LO12_I`
+- A check runs only when *both* the referencing object and the defining object carry a record for the symbol.
+- A mismatch is an error by default (`--ss-type-mismatch=error|warn|ignore`). The diagnostic prints both decoded signatures, which are recoverable from the SDI fragments.
+- Foreign objects without `.ss_symtypes` link normally. `--ss-warn-untyped` optionally reports references satisfied by untyped definitions.
 
-### Phase 4: Synthetic Sections & Fast Debug Info
+**Provider-module constraint.** A reference MAY carry a `provider_module`. In that case the linker accepts only a definition from that module and reports an error otherwise, which prevents an unrelated library from satisfying a system-API reference. This is an optional namespace qualifier on top of ELF semantics, not a replacement for them; references without it resolve normally.
 
-#### Exception Unwind Table (`.eh_frame_hdr`)
-- Extracts FDE (Frame Description Entry) records from `.eh_frame`.
-- Sorts FDE starting addresses in parallel.
-- Emits a compact, binary-searchable `.eh_frame_hdr` table, allowing Todhchai's zero-cost exception and stack unwinder (`libunwind`) to locate exception handlers in $O(\log N)$ time without traversing linked lists.
+### 5.4 Layout
 
-#### Direct Debug Emission: `.todh_debug` vs DWARF 5
-1. **Native Todhchai Format (`.todh_debug`):**
-   - Emits a single, unified flat index directly into the output binary:
-     - Table of Files: Contiguous string table of source paths.
-     - Line Program Table: Run-length-encoded `(Address, FileId, Line, Column)` tuples.
-     - Function & Global Variable Index: Flat array of `(SymbolId, Address, Size, TypeId)`.
-   - Result: Emitted in $< 5$ milliseconds with zero deduplication overhead. Debuggers open the executable and inspect variables instantly without parsing multi-megabyte DWARF trees.
-2. **Standard DWARF 5 Compatibility (POSIX Host Mode):**
-   - When targeting Linux or macOS with GDB/LLDB, emits standard `.debug_info`, `.debug_line`, and `.debug_str` sections, utilizing multi-threaded string interning.
+1. Input sections are grouped into output sections by kind and name, in a fixed order (text, rodata, eh_frame/eh_frame_hdr, data, tdata, tbss, bss, non-allocated). Within an output section, input order is `(inputPriority, sectionIndex)`, which is deterministic.
+2. Section sizes and offsets are computed with a parallel prefix sum. Alignment padding is part of the scan.
+3. Synthetic sections (GOT, PLT, `.eh_frame_hdr`, build-id note, `.ss_debug`) are sized after scanning relocations, which determines GOT/PLT entries, and are placed at fixed positions in the order above.
+
+### 5.5 Relocation processing
+
+Relocations are applied in parallel, **partitioned by input section** as in mold and lld, not by fixed-size chunks of the output. Each input section's relocations are contiguous in the `Object` model (CSR layout) and patch only that section's bytes, so workers never write to shared bytes. Large input sections MAY be split by relocation index range.
+
+Relocation coverage required in v1:
+
+| Class | x86-64 | AArch64 | RISC-V 64 |
+|---|---|---|---|
+| Absolute | `R_X86_64_64`, `_32`, `_32S` | `R_AARCH64_ABS64`, `ABS32` | `R_RISCV_64`, `R_RISCV_32` |
+| PC-relative / branch | `PC32`, `PLT32` | `CALL26`, `JUMP26`, `CONDBR19`, `TSTBR14`, `ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, `LDST{8,16,32,64,128}_ABS_LO12_NC` | `CALL`, `CALL_PLT`, `PCREL_HI20`, `PCREL_LO12_I/S`, `BRANCH`, `JAL`, `RVC_BRANCH`, `RVC_JUMP` |
+| GOT | `GOTPCREL`, `GOTPCRELX`, `REX_GOTPCRELX` | `ADR_GOT_PAGE`, `LD64_GOT_LO12_NC` | `GOT_HI20` |
+| TLS local-exec | `TPOFF32` | `TLSLE_ADD_TPREL_HI12`, `TLSLE_ADD_TPREL_LO12_NC` | `TPREL_HI20`, `TPREL_LO12_I/S`, `TPREL_ADD` |
+| TLS initial-exec | `GOTTPOFF` | `TLSIE_ADR_GOTTPREL_PAGE21`, `TLSIE_LD64_GOTTPREL_LO12_NC` | `TLS_GOT_HI20` |
+| Dynamic (output) | `RELATIVE`, `GLOB_DAT`, `JUMP_SLOT` | `RELATIVE`, `GLOB_DAT`, `JUMP_SLOT` | `RELATIVE`, `64`, `JUMP_SLOT` |
+
+GOT-indirect references to symbols that resolve locally in static images SHOULD be relaxed to direct forms where the ABI permits it (for example `GOTPCRELX` to `lea`). General-dynamic and local-dynamic TLS are not needed in v1 because v1 produces no shared libraries. They are required if foreign objects use them; such objects are diagnosed until support is added.
+
+**RISC-V specifics.**
+
+- `R_RISCV_PCREL_LO12_I/S` refers to the *label of the paired `auipc`*, not to the target symbol. The linker MUST locate the `PCREL_HI20` relocation at that address in the same section and compute the low part from that pair's target. The lookup uses a per-section index sorted by offset.
+- **RISC-V attributes.** Every input's `.riscv.attributes` section (`Tag_RISCV_arch` and related tags) is merged. Swift-Stack's own objects record the RVA23 profile ISA string. A foreign input whose ISA string needs an extension outside the output's target profile is a link error, unless `--allow-isa-superset` is given.
+- **Relaxation policy (depends on [04](04-backend.md)):** v1 does not perform linker relaxation. Swift-Stack's code generator and assembler MUST NOT emit `R_RISCV_RELAX` or `R_RISCV_ALIGN`. A foreign object containing `R_RISCV_RELAX` links correctly without relaxing, because the relaxation hint is optional. A foreign object containing `R_RISCV_ALIGN` requires NOP deletion to be correct. v1 handles it by deleting the excess padding NOPs only (the minimal form of relaxation), and rejects the object with a diagnostic if that is not possible.
+
+### 5.6 Unwind information
+
+- **Todhchai:** Compact Unwind Descriptors (CUD, [07](07-debugging-and-sdi.md) §5.5) are the canonical unwind format. The linker sorts CUD records by address into a binary-searchable table in `.ss_unwind`. Frame pointers are kept on all targets by default.
+- **Host targets, and foreign objects on any target:** `.eh_frame` sections are concatenated, CIEs are deduplicated, and `.eh_frame_hdr` is emitted (sorted FDE table, `PT_GNU_EH_FRAME`). On Todhchai, functions that come only with FDEs (foreign C or assembly) are covered through `.eh_frame_hdr`, and the unwinder consults CUD first and FDEs second.
+- Swift errors do not use unwinding (they use the `swifterror` register convention). Unwind tables exist for backtraces, debuggers, profilers, and foreign code.
+
+### 5.7 Debug information
+
+The linker does not deduplicate DIE trees. Each Swift-Stack module contributes one SDI fragment, produced at compile time and stored in the module artifact or in the object's `.ss_debug` section ([07](07-debugging-and-sdi.md) §5.6, [13](13-modules-and-incremental-builds.md)). The linker:
+
+1. Concatenates the fragments' tables, rebasing table indices by prefix sums.
+2. Merges type records by content hash. Records within a module are already unique, so cross-module duplicates (types from shared C headers) are dropped with a hash-table probe.
+3. Rewrites section-relative addresses to final virtual addresses and sorts the address map.
+
+For host debuggers, `--debug-format=dwarf` emits DWARF 5 instead of (or in addition to) SDI ([07](07-debugging-and-sdi.md) §5.9).
+
+### 5.8 Deterministic output (D6)
+
+- All ordering decisions use `(inputPriority, index)` tuples, never thread arrival order or hash-table iteration order.
+- String tables and symbol tables are emitted in a sorted order: locals by input order, then globals by name.
+- Timestamps are never embedded. The build-id is a BLAKE3 hash of the final image bytes with the build-id field zeroed, computed after layout and relocation.
+- Parallel phases write to disjoint, precomputed output ranges.
+- CI links with 1 and N threads and compares the outputs bytewise ([14](14-measurement-methodology.md)).
+
+### 5.9 Link-once sections and Swift runtime sections
+
+- **Link-once (COMDAT-like) sections.** Generic specializations ([11](11-generics-and-runtime-metadata.md)) and other compiler-synthesized definitions that several modules may emit are placed in link-once sections keyed by their `_SS` mangled name ([13](13-modules-and-incremental-builds.md)).
+  - The linker keeps the copy from the input with the lowest `(inputPriority, index)` and discards the rest, together with their relocations, unwind records and SDI fragments.
+  - On ELF this uses `SHT_GROUP`/`GRP_COMDAT`; on Mach-O, weak definitions with the same deterministic choice rule.
+  - If two copies have different `.ss_symtypes` hashes or different sizes, the link fails with a diagnostic. Under D6 identical inputs produce identical bodies, so a mismatch indicates a stale artifact.
+- **Runtime-discovered sections.** The Tier 1 runtime finds tables through linker-defined bounds rather than by registering them at startup ([08](08-runtime-and-stdlib.md)):
+  - conformance records in `ss_conformances` (ELF) and `__TEXT,__ss_conform` (Mach-O), from [11](11-generics-and-runtime-metadata.md) §5;
+  - nominal type descriptors for by-name lookup (e.g. `_typeByName`) in `ss_types`, using the same scheme. The name is reserved here; the record format is to be defined in [11](11-generics-and-runtime-metadata.md).
+
+  For ELF, section names without a leading dot let the linker synthesize `__start_<name>`/`__stop_<name>`. For Mach-O, the runtime uses `getsectiondata` on the loaded image. These sections are concatenated in deterministic input order and MUST NOT be garbage-collected while any input references the bounds symbols.
+
+## 6. In-memory pipeline
+
+When the driver compiles and links in one invocation ([15](15-driver-and-diagnostics.md)), Codegen and the assemblers hand `RelocatableObject` values to the linker without serializing them. Foreign `.o`/`.a` inputs are `mmap`ed. The output file is created at its final size and memory-mapped; workers write into it directly. Separate-compilation builds write objects to the artifact cache ([13](13-modules-and-incremental-builds.md)) and read them back through the same `Object` reader.
+
+## 7. Thread-local storage
+
+Only the local-exec and initial-exec models are produced in v1. The linker computes thread-pointer offsets as follows:
+
+- **x86-64 (variant II).** `%fs` points to the TCB, which follows the TLS block. A symbol's offset is `sym_offset_in_tls − align_up(tls_memsz, tls_align)`, which is negative. Todhchai uses this layout for its static TLS image.
+- **AArch64 (variant I).** `TPIDR_EL0` points to a 16-byte TCB, and the TLS block starts at `align_up(16, tls_align)`.
+- **RISC-V (variant I).** `tp` (`x4`) points directly at the start of the TLS block (TCB size 0 as seen from TLS offsets).
+
+`PT_TLS` is emitted with the `.tdata` image and the `.tbss` size.
+
+## 8. Targets (staged order)
+
+Targets are brought up in this order. Each stage is gated on the differential tests in [09](09-roadmap.md).
+
+1. **Todhchai static ELF64** (`ET_EXEC`). Fixed base `0x1000000`, 4 KiB pages, separate `PT_LOAD` segments `R-X` (text), `R--` (rodata, eh_frame_hdr), and `RW-` (data, bss). `PT_TLS`; `PT_GNU_STACK` (`RW-`); `PT_GNU_EH_FRAME`. The 256 KiB default stack is a loader contract; whether the linker should record a per-image stack size (for example in a `.note.todhchai.stack` note) is an open question (§10). No load-time relocations.
+2. **Linux ELF64.**
+   - Static: `ET_EXEC` or static-PIE.
+   - Dynamic: `ET_DYN` (PIE) with `PT_INTERP` (`/lib64/ld-linux-x86-64.so.2`, `/lib/ld-linux-aarch64.so.1`, `/lib/ld-linux-riscv64-lp64d.so.1`), `PT_DYNAMIC`, `DT_NEEDED`, `DT_RELA`/`DT_JMPREL`, `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT` relocations, `.dynsym`/`.dynstr`, `DT_GNU_HASH`, and a PLT/GOT.
+3. **FreeBSD ELF64.** As for Linux, plus `ELFOSABI_FREEBSD`, the `.note.tag` ABI note, and the interpreter `/libexec/ld-elf.so.1`. Static images use the platform's default base address.
+4. **macOS Mach-O 64.**
+   - Dynamic executables only; macOS does not support static executables.
+   - Required load commands: `MH_EXECUTE`, `LC_SEGMENT_64` (`__PAGEZERO`, `__TEXT`, `__DATA_CONST`, `__DATA`, `__LINKEDIT`), `LC_LOAD_DYLINKER` (`/usr/lib/dyld`), `LC_LOAD_DYLIB` (`/usr/lib/libSystem.B.dylib`), `LC_MAIN`, `LC_BUILD_VERSION`, `LC_DYLD_CHAINED_FIXUPS`, `LC_DYLD_EXPORTS_TRIE`, `LC_SYMTAB`/`LC_DYSYMTAB`, and `LC_UUID`.
+   - An ad-hoc `LC_CODE_SIGNATURE` is mandatory on arm64 and is always emitted.
+   - Requires a Mach-O object *reader* for foreign `.o`/`.a` inputs and, on the backend side, a Mach-O relocation mapping in `RelocKind`.
+   - Linking against `libSystem` needs its exported-symbol list. This is read from the SDK `.tbd` text stubs, so no binary dylib is needed at link time.
+
+## 9. Alternatives considered
+
+- **Replace ELF symbol semantics with module-scoped binding everywhere.** Rejected: it would break linking against foreign archives and system libraries. Module scoping is offered as an optional constraint (§5.3).
+- **Unmangled Swift symbol names, with type hashes for overload disambiguation.** Rejected: object formats require unique symbol names, so overloads need distinct names (D1).
+- **Fixed 64 KiB output chunks for relocation.** Rejected: a relocation's input section is the natural unit of work, and chunking by output address needs an extra mapping step and still touches every relocation.
+- **Using `TypeId` directly as the link-time type identity.** Rejected: `TypeId`s are not stable across compilations.
+
+## 10. Open questions
+
+1. **ASLR on Todhchai.** Fixed-address `ET_EXEC` at `0x1000000` means no address-space randomization for native executables. This is a deliberate trade-off (no load-time relocations, simpler loader) that weakens exploit mitigation. Should Todhchai move to static-PIE with a small `RELATIVE` table once the loader supports it?
+2. Where does the per-image stack size live: a note section, a loader default, or a program header?
+3. Should `--ss-type-mismatch` default to `warn` for C-only links until the hash canonicalization has been validated against a large C corpus?
+4. Minimal RISC-V `R_RISCV_ALIGN` handling versus rejecting such objects: what do the Todhchai foreign libraries actually contain?
+5. Should shared-library output be in scope for v2 (needed for Todhchai hot-reload of `CodeModule`s, [07](07-debugging-and-sdi.md) §5.10)?
+
+## 11. Performance targets
+
+These are hypotheses to be measured per [14](14-measurement-methodology.md); they are not claims.
+
+| Metric | Target | Notes |
+|---|---|---|
+| Link a Todhchai system service (static, in-memory inputs) | < 50 ms | 8 cores; compare against `ld.lld` and `mold` on identical inputs |
+| SDI merge for a 100K-LOC program | < 5 ms | fragments precomputed at compile time |
+| 1-thread vs. N-thread output | bitwise identical | CI gate, not a performance target |

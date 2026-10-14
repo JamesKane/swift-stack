@@ -1,145 +1,146 @@
-# Swift-Stack: High-Performance Data-Oriented Swift & C23 Toolchain
+# Swift-Stack: A Data-Oriented Swift & C23 Toolchain
 
-> **Mission:** A clean-room, full-specification implementation of the modern Swift (6.x+) and C23 language stacks—from frontend parsers to native assemblers, middle-end optimizers, code generators, and linkers—architected entirely on **Data-Oriented Design (DOD)** principles.
+> A clean-room implementation of Swift 6.x and ISO C23: frontends, semantic analysis, optimizer, code generators, assemblers, linker, debug-info format and runtimes. Every persistent compiler data structure is a flat, index-addressed table (Data-Oriented Design).
 
----
-
-## 1. Executive Summary
-
-Current production compiler stacks (LLVM, Clang, and `swiftc`) are dominated by deeply nested object graphs, pointer-chasing abstract syntax trees (ASTs), polymorphic node hierarchies, and heavy intermediate representations that thrash hardware CPU caches and incur massive compilation overhead.
-
-**Swift-Stack** discards the object-oriented compiler model in favor of flat arrays, struct-of-arrays (SoA) memory layouts, index handles (`TokenId`, `NodeId`, `TypeId`, `InstId`), contiguous arena allocators, and batch-processing dataflow pipelines.
-
-### Primary Objectives & Tradeoffs
-
-1. **Full Specification Compliance:**
-   - **Modern Swift (6.x+):** Embedded Swift (Tier 0) and Full Swift (Tier 1), covering value semantics, non-copyable types (`~Copyable`), ownership, generics, protocol witnesses, async/await concurrency, and Swift ABI calling conventions.
-   - **ISO/IEC 9899:2024 (C23):** Modern C23 features including `constexpr`, `typeof`, `nullptr`, attributes (`[[...]]`), `_BitInt(N)`, `#embed`, auto type inference, and preprocessor enhancements.
-   - **Native Standalone Assemblers:** Built-in assemblers for AMD64, ARM64, and RV64 to assemble OS entry stubs (`_start`), context switching routines, and vector kernels without GNU `as` or external tools.
-2. **Data-Oriented Architecture (DOD):**
-   - Zero per-node heap allocation. Zero reference-counted AST objects.
-   - Elimination of the **"Pointer Tax"** (3–5% compile-time penalty per layer of pointer indirection).
-   - Cache-conscious postorder parse arrays and dense linear SSA instruction tables.
-   - Highly parallel multi-core batch processing using work-stealing job schedulers.
-3. **The 80–90% Binary Parity Rule:**
-   - Achieving 80–90% of LLVM `-O2` runtime performance is accepted and prioritized whenever it yields 10x–50x faster compilation speeds and eliminates hundreds of thousands of lines of fragile optimization passes.
-4. **Target Platforms:**
-   - **Primary Native Target:** [Todhchai OS](file:///home/jkane/Projects/OS/todhchai) running on the [croi](file:///home/jkane/Projects/OS/croi) capability microkernel (x86_64, AArch64, RISC-V 64). Produces static ELF executables mapped at `0x1000000`, 256 KiB stack, `--eh-frame-hdr`, static TLS, and direct integration with croi port-driven concurrency.
-   - **Secondary Target & Hosts:** POSIX systems (**FreeBSD**, **Linux**, **macOS**) for hosted builds, cross-compilation, and developer workstations.
-5. **Radical Linker Modernization (Handmade Hero Insights):**
-   - Eliminates redundant work between the compiler, linker, and OS loader.
-   - Introduces **typed, module-scoped symbol binding** (`ModuleId, SymbolId, TypeSignatureHash`), permanently preventing silent symbol hijacking and link-time type mismatches.
-   - Single-emission debug info: types declared in headers are written once per module, eliminating the DWARF DIE deduplication tax.
-6. **First-Class Zero-Latency Debugging (RAD Debugger / RDI Insights):**
-   - Generates native **SDI (Swift-Stack Debug Info)** / `.todh_debug` directly from the linker in $< 5$ ms.
-   - Flat, memory-mappable binary layout with $O(\log N)$ address lookup in nanoseconds, compact zero-bytecode unwind descriptors (CUD), and microsecond expression evaluation.
+**Status:** design phase. The architecture documents are drafts. Only the source-buffer and token-buffer foundations exist in code.
 
 ---
 
-## 2. Architectural Blueprint
+## 1. Summary
+
+Production compilers such as `swiftc`, Clang and LLVM represent programs as graphs of heap-allocated, pointer-linked objects. Swift-Stack stores the same information in struct-of-arrays tables addressed by 32-bit handles (`TokenId`, `NodeId`, `TypeId`, `InstId`). The tables are arena-backed, and work is processed in batches across cores.
+
+The bet is that this layout, together with a deliberately small optimizer, gives an order-of-magnitude faster compile and acceptable runtime performance. Both halves of that bet are measured, not assumed ([14](docs/architecture/14-measurement-methodology.md)).
+
+### Goals
+1. **Languages.**
+   - Swift 6.x in two tiers: Tier 0, the Embedded subset; Tier 1, full Swift within the stated non-goals.
+   - Swift macros, through executable compiler plugins. Todhchai's IPC and audio SDK are the first-party users.
+   - Portable SIMD (`SIMDn<T>`, C vector extensions) lowered to native vector code on every target. Auto-vectorization is an optional add-on.
+   - ISO/IEC 9899:2024 (C23), plus the GNU/Clang extensions needed to parse system headers.
+2. **A self-contained toolchain.** Built-in assemblers (x86-64, AArch64, RV64) and linker. No LLVM, GNU `as` or external linker.
+3. **Compile-time throughput** and bounded memory: see the budgets below.
+4. **Runtime performance hypothesis.** Optimized code within 80–90% of LLVM `-O2`, from a small, well-chosen set of optimizations.
+5. **First-class debugging.** A memory-mappable debug format (SDI) and cheap frame-pointer-based unwinding.
+6. **Determinism.** Identical inputs give bitwise-identical outputs at any thread count.
+7. **Self-hosting.**
+
+### Targets
+- **Primary:** Todhchai OS on the croi capability microkernel (x86-64, AArch64, RV64). Static ELF images at `0x1000000`, port-driven Swift concurrency.
+- **Secondary / hosts:** Linux, FreeBSD, macOS.
+
+### Notable non-goals (v1)
+C++, Objective-C interop, Windows, binary compatibility with `swiftc`-built Swift libraries, in-process (library) macro plugins, C intrinsics headers. Auto-vectorization is optional rather than required. The full list and the decisions behind it are in [00 §4–5](docs/architecture/00-overview-and-principles.md).
+
+---
+
+## 2. Architecture
 
 ```
-+---------------------------------------------------------------------------------------------------+
-|                                          SOURCE INPUTS                                            |
-|   Swift Source (*.swift)      |       C23 Source (*.c, *.h)       |     Assembly Source (*.s, *.S)|
-+---------------------------------------------------------------------------------------------------+
-             │                                   │                                     │
-             ▼                                   ▼                                     ▼
-+-----------------------------------------------------------------+   +-----------------------------+
-|                         FRONTEND TIER                           |   |      NATIVE ASSEMBLERS      |
-|  - SourceManager: Contiguous buffers with 64 zero-sentinel bytes|   |  - AMD64 (Intel & AT&T)     |
-|  - TokenBuffer (SoA): 1-byte kind, 1-byte trivia, 4-byte offsets|   |  - ARM64 (Standard UAL)     |
-|  - ParseTree: Postorder Carbon-style flat array (kind, tok, sz) |   |  - RV64 (Base + 16-bit C)   |
-|  - C23 Preprocessor: Zero-alloc token stream & #embed slices    |   |  - Extensible Target Engine |
-+-----------------------------------------------------------------+   +-----------------------------+
-                                 │                                                     │
-                                 ▼                                                     │
-+-----------------------------------------------------------------+                    │
-|                 SEMANTIC ANALYSIS & TYPE POOL                   |                    │
-|  - InternPool: Dense string interning, atom tables              |                    │
-|  - TypePool: 32-bit TypeId handles into dense descriptor arenas |                    │
-|  - Swift Staged Type Checker: Bidirectional fast path + solver  |                    │
-|  - C23 Semantic Analyzer: ISO C23 rules, _BitInt, constexpr     |                    │
-|  - Zero-Cost C/Swift Bridge: Direct C symbol import (No Clang)  |                    │
-+-----------------------------------------------------------------+                    │
-                                 │                                                     │
-                                 ▼                                                     │
-+-----------------------------------------------------------------+                    │
-|           ARENA INTERMEDIATE REPRESENTATION (AIR / SSA)         |                    │
-|  - Flat instruction table: InstId, Opcode, ValueId, BlockId     |                    │
-|  - Swift Lowering: Ownership, borrowing, ARC, witness tables    |                    │
-|  - High-Efficiency Optimizer (80-90% Parity):                   |                    │
-|      * Mem2Reg / SSA Construction     * Constant Prop (SCCP)    |                    │
-|      * Global Value Numbering (GVN)   * ARC / Borrow Cancel     |                    │
-|      * ADCE & CFG Simplification      * Fast Inlining & Devirt  |                    │
-+-----------------------------------------------------------------+                    │
-                                 │                                                     │
-                                 ▼                                                     │
-+-----------------------------------------------------------------+                    │
-|                     BACKEND CODE GENERATION                     |                    │
-|  - LIR (Low-level Machine IR): Architecture register instrs     |                    │
-|  - Instruction Selection: Fast maximal-munch DAG/tree tiling    |                    │
-|  - Register Allocation: Linear Scan with loop interval splitting|                    │
-|  - Target Encoders: x86-64-v2, AArch64 (ARM64), RISC-V (RV64GC) │                    │
-|  - In-Memory Relocatable Sections (.text, .rodata, .rela.text)  |                    │
-+-----------------------------------------------------------------+                    │
-                                 │                                                     │
-                                 ▼ (Zero-Copy Buffer Handoff)                          │
-                                 └──────────────────────┬──────────────────────────────┘
-                                                        │
-                                                        ▼
-+---------------------------------------------------------------------------------------------------+
-|                                 DATA-ORIENTED NATIVE LINKER                                       |
-|  - Direct in-memory buffer consumption (zero intermediate disk .o files)                          |
-|  - Typed, module-scoped symbol binding (ModuleId, AtomId, TypeSignatureHash)                     |
-|  - Parallel section layout and concurrent relocation chunk processing                             |
-|  - Target Formats:                                                                                |
-|      * Todhchai Native: Static ELF64 (base 0x1000000, 256 KiB stack, PT_TLS)                      |
-|      * FreeBSD Host: FreeBSD ELF64 (ELFOSABI_FREEBSD, .note.tag, /libexec/ld-elf.so.1)            |
-|      * Linux Host: Standard ELF64 (/lib64/ld-linux-x86-64.so.2)                                  |
-|      * macOS Host: Mach-O 64-bit                                                                  |
-+---------------------------------------------------------------------------------------------------+
-                                 │                                       │
-                                 ▼                                       ▼
-+---------------------------------------------------+ +---------------------------------------------+
-|               EXECUTABLE & RUNTIMES               | |       FIRST-CLASS DEBUGGING (SDI)           |
-|  - Tier 0 Embedded Swift: 0 heap overhead, libsys | |  - SDI (.todh_debug): Memory-mapped layout  |
-|  - Tier 1 Full Swift: Port TaskExecutor          | |  - Zero DWARF merging tax; < 5 ms emission  |
-|    (croi td_executor_port / kqueue / epoll)       | |  - Compact Unwind Descriptors (CUD): < 2 us |
-|  - C23 Libc & System Floor startup (_start)       | |  - Microsecond live expression evaluator    |
-+---------------------------------------------------+ +---------------------------------------------+
+  Swift (*.swift)            C23 (*.c, *.h)                 Assembly (*.s, *.S)
+        │                          │                                  │
+        ▼                          ▼                                  ▼
+┌──────────────────────────────────────────────────┐   ┌──────────────────────────┐
+│ FRONTEND                                    01   │   │ ASSEMBLERS           05  │
+│ SourceManager (sentinel-padded buffers)          │   │ x86-64: AT&T, Intel later│
+│ SoA TokenBuffer · C23 preprocessor (#embed)      │   │ AArch64 · RV64 (RVA23)   │
+│ Postorder SoA ParseTree                          │   │ .S via C23 preprocessor  │
+└──────────────────────────────────────────────────┘   └──────────────────────────┘
+        │                                                             │
+        ▼                                                             │
+┌──────────────────────────────────────────────────┐                  │
+│ SEMANTIC ANALYSIS                       02 · 10  │                  │
+│ Name resolution · TypePool (32-bit TypeId)       │                  │
+│ Swift staged type checker (swiftc-equivalent)    │                  │
+│ C23 semantics · Clang-free C import into Swift   │                  │
+│ Macro expansion via plugin processes (16)        │                  │
+│ Typed SemIR                                      │                  │
+└──────────────────────────────────────────────────┘                  │
+        │                                                             │
+        ▼                                                             │
+┌──────────────────────────────────────────────────┐                  │
+│ AIR — flat SSA IR + OPTIMIZER           03 · 11  │                  │
+│ Ownership/borrow checking · ARC · generics       │                  │
+│ Core: Mem2Reg, SROA, SCCP, GVN, inlining, LICM   │                  │
+│ Swift: specialization, ARC opt, check elim.      │                  │
+│ SIMD vector ops · optional loop vectorizer (17)  │                  │
+└──────────────────────────────────────────────────┘                  │
+        │                                                             │
+        ▼                                                             │
+┌──────────────────────────────────────────────────┐                  │
+│ BACKEND                                     04   │                  │
+│ LIR · tiling isel · SSA linear-scan regalloc     │                  │
+│ Encode: shared encoders (also used by Asm)       │                  │
+└──────────────────────────────────────────────────┘                  │
+        │  in-memory RelocatableObject (Object module)                │
+        └────────────────────────────┬────────────────────────────────┘
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ LINKER                                                                       06 │
+│ In-memory objects + foreign .o/.a · optional link-time type checks              │
+│ Parallel per-input-section relocation · deterministic layout                    │
+│ Todhchai static ELF · Linux/FreeBSD ELF · macOS Mach-O                          │
+└─────────────────────────────────────────────────────────────────────────────────┘
+        │                                               │
+        ▼                                               ▼
+┌──────────────────────────────────────┐   ┌──────────────────────────────────────┐
+│ RUNTIMES & STDLIB            08 · 12 │   │ DEBUGGING                         07 │
+│ Tier 0 (Embedded) · Tier 1 (Full)    │   │ SDI (.todh_debug), mmap-able         │
+│ Upstream stdlib sources as input     │   │ Compact unwind descriptors (CUD)     │
+│ Executor: croi port/kqueue/epoll     │   │ DWARF for host debuggers             │
+└──────────────────────────────────────┘   └──────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Detailed Architecture Specifications
+## 3. Architecture Documents
 
-The complete architectural design is documented across 10 cohesive chapters in [`docs/architecture/`](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/):
+All chapters are in [`docs/architecture/`](docs/architecture/). Each one has a Status, Goals, Non-goals, Design, Alternatives considered, and Open questions.
 
-1. [**00. Overview, Philosophy & DOD Principles**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/00-overview-and-principles.md): Core tenets, memory layout invariants, the "Pointer Tax" elimination, 80–90% binary parity rule, and target platforms (Todhchai OS, FreeBSD, Linux, macOS).
-2. [**01. Frontend: Source, Lexing, and Parsing**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/01-frontend.md): Sentinel-padded source buffers, SWAR lexing, 10-byte SoA `TokenBuffer`, postorder 9-byte `ParseTree`, and C23 preprocessor with zero-copy `#embed`.
-3. [**02. Semantic Analysis, Type Systems & Interop**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/02-semantic-analysis.md): Canonical `TypeId` and dense `TypePool`, staged bidirectional type checking, complete C23 semantics (`_BitInt`, `constexpr`), ownership verification (`~Copyable`), and Clang-free C/Swift bridging.
-4. [**03. Middle-End IR & High-Throughput Optimizer**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/03-intermediate-representation.md): Flat SSA instruction table (`AIR`), native Swift ARC and borrowing semantics, and the 7 core optimization passes for 80–90% parity.
-5. [**04. Machine Codegen & Target Backends**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/04-backend.md): Tiling instruction selection, linear-scan register allocation with loop interval splitting, and native machine encoders for AMD64, ARM64, and RV64.
-6. [**05. Native Assembler Architecture**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/05-assembler.md): Built-in assemblers for AMD64 (Intel & AT&T), ARM64 (UAL), and RV64 (with compressed 16-bit C extension) with an extensible target framework.
-7. [**06. Data-Oriented Native Linker**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/06-linker.md): Radical elimination of linker redundancies (Handmade insights), typed module-scoped symbol binding, single-emission debug info, concurrent relocations, and zero-copy in-memory object handoff.
-8. [**07. First-Class Debugging & SDI Architecture**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/07-debugging-and-sdi.md): Memory-mapped SDI format (RAD Debugger inspired), direct linker emission in $< 5$ ms, compact zero-bytecode unwind descriptors (CUD), and microsecond expression evaluation.
-9. [**08. Runtime Systems & Todhchai OS Integration**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/08-runtime-and-stdlib.md): Tier 0 Embedded runtime (0 heap allocations), Tier 1 port-driven concurrency executor (croi `td_executor_port`, FreeBSD/macOS `kqueue`, Linux `epoll`), and the system floor startup contract.
-10. [**09. Project Roadmap, Milestones & Testing**](file:///home/jkane/Projects/lang/swift-stack/docs/architecture/09-roadmap.md): Staged milestones from M0 (foundation) to M5 (self-hosting), differential testing against `swiftc`/`clang`, and performance benchmarks.
-
----
-
-## 4. Key Performance Budgets
-
-Following Todhchai's principle 28 ("Slower is a claim to measure, not assume") and principle 4 ("Memory is the app's to arrange"):
-
-| Metric | Target Budget | Reference Comparison |
+| # | Chapter | Covers |
 |---|---|---|
-| **Lexing Throughput** | > 600 MB/s per core (> 5 GB/s on 8 cores) | `swiftc`: ~40 MB/s |
-| **Parsing Throughput** | > 300 MB/s per core (> 2.5 GB/s on 8 cores) | `swiftc`: ~35 MB/s |
-| **End-to-End Build Speed** | > 100,000 lines/sec per core | `swiftc` + `clang`: ~2,000–5,000 lines/sec |
-| **Link Time (Todhchai Image)** | < 50 ms for full kernel/system service | `ld.lld`: ~200–500 ms |
-| **Debug Info Emission** | < 5 ms for 100K LOC (SDI / `.todh_debug`) | `ld.lld` (DWARF 5): ~250–600 ms |
-| **Stack Unwind Latency** | < 2 microseconds for 100 frames (CUD) | DWARF CFI / LLDB: ~500–2,000 us |
-| **Peak Resident Memory** | < 256 MB for 100K LOC build | `swiftc` + LLVM: 1.5–4.0 GB |
-| **Runtime Binary Parity** | 80% to 90% of LLVM `-O2` speed | 100% of LLVM `-O2` (baseline) |
+| 00 | [Overview, Principles, and Key Decisions](docs/architecture/00-overview-and-principles.md) | Goals, non-goals, decision log D1–D9, DOD principles, `Column` storage, targets, execution model |
+| 01 | [Frontend](docs/architecture/01-frontend.md) | Source buffers, SWAR lexing, SoA tokens, C23 preprocessor and `#embed`, postorder parse tree |
+| 02 | [Semantic Analysis](docs/architecture/02-semantic-analysis.md) | TypePool, C23 semantics, Swift staged type checking, strict concurrency, C/Swift interop |
+| 03 | [AIR and Optimizer](docs/architecture/03-intermediate-representation.md) | Flat SSA IR, mandatory lowering, ownership checking, optimization pipeline |
+| 04 | [Backend](docs/architecture/04-backend.md) | LIR, instruction selection, register allocation, calling conventions, encoders |
+| 05 | [Assemblers](docs/architecture/05-assembler.md) | x86-64, AArch64, RV64 assemblers; directives, macros, relaxation |
+| 06 | [Linker](docs/architecture/06-linker.md) | Object model, symbol resolution and type checks, layout, relocation, output formats |
+| 07 | [Debugging and SDI](docs/architecture/07-debugging-and-sdi.md) | SDI format, location lists, CUD unwinding, debugger tooling |
+| 08 | [Runtime](docs/architecture/08-runtime-and-stdlib.md) | Tier 0/1 runtimes, executors, process startup, TLS |
+| 09 | [Roadmap and Verification](docs/architecture/09-roadmap.md) | Module graph, milestones M0–M8, differential testing, fuzzing |
+| 10 | [Semantic IR and Name Resolution](docs/architecture/10-semantic-ir-and-name-resolution.md) | Typed SemIR, scopes and lookup, operator folding, deterministic IDs |
+| 11 | [Generics and Runtime Metadata](docs/architecture/11-generics-and-runtime-metadata.md) | Monomorphization vs metadata passing, witness tables, existentials, mangling, Swift CC |
+| 12 | [Standard Library Strategy](docs/architecture/12-standard-library-strategy.md) | Using upstream stdlib sources, compiler-known entities, Embedded subset |
+| 13 | [Modules and Incremental Builds](docs/architecture/13-modules-and-incremental-builds.md) | `.ssmodule` format, separate compilation, dependency tracking, caching |
+| 14 | [Measurement Methodology](docs/architecture/14-measurement-methodology.md) | Budgets, metric definitions, corpora, CI gates |
+| 15 | [Driver and Diagnostics](docs/architecture/15-driver-and-diagnostics.md) | Personalities, job scheduling, plugin host, diagnostics engine, build-system integration |
+| 16 | [Swift Macros](docs/architecture/16-macros.md) | Plugin protocol, expansion buffers, lookup ordering, caching, Todhchai use cases |
+| 17 | [SIMD and Vectorization](docs/architecture/17-simd-and-vectorization.md) | Portable SIMD lowering, legalization tables, loop idioms, optional auto-vectorizer |
+
+---
+
+## 4. Performance Budgets
+
+All values are **targets** and none has been measured yet. Baselines for `swiftc`, Clang and lld will be measured on the project's reference machines. Definitions and protocol are in [14](docs/architecture/14-measurement-methodology.md).
+
+| Metric | Target |
+|---|---|
+| Lexing throughput (single core) | ≥ 600 MB/s |
+| Lex + parse throughput (single core) | ≥ 300 MB/s |
+| End-to-end debug build (single core) | ≥ 100,000 lines/s |
+| Link time, Todhchai system-service image | < 50 ms |
+| SDI emission, 100K-line program | < 5 ms |
+| Stack unwind, 100 frames (frame-pointer path) | < 2 µs |
+| Peak RSS, 100K-line build | < 256 MB |
+| Optimized runtime performance | 80–90% of LLVM `-O2`, per category (hypothesis) |
+
+---
+
+## 5. Building
+
+Requires a Swift 6.2+ toolchain.
+
+```sh
+swift build
+```

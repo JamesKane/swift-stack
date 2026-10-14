@@ -1,173 +1,295 @@
-# 03. Arena Intermediate Representation (AIR) & High-Throughput Optimizer
+# 03. Arena Intermediate Representation (AIR) & Optimizer
 
-## 1. Overview
+| | |
+|---|---|
+| **Status** | Draft |
+| **Depends on** | [00](00-overview-and-principles.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [04](04-backend.md), [08](08-runtime-and-stdlib.md), [14](14-measurement-methodology.md) |
 
-In traditional compilers, the Intermediate Representation (IR) is a major architectural liability:
-- **LLVM IR:** Built from thousands of heap-allocated, doubly-linked C++ `llvm::Instruction` objects with polymorphic `Use` tracking. Traversal triggers unpredictable memory jumps and massive allocation overhead.
-- **Swift Intermediate Language (SIL):** An expressive high-level IR, but tightly coupled to LLVM C++ structures and deeply recursive object trees that dominate frontend compile times.
+## 1. Summary
 
-Swift-Stack designs **AIR (Arena Intermediate Representation)**: a dense, flat-array SSA representation that models both modern C23 and high-level Swift semantics (ARC, ownership, generics, and async/await). Its companion **High-Throughput Optimizer** focuses strictly on the 7 high-leverage transformations that yield **80–90% binary performance parity** with LLVM `-O2` at 20x the compilation speed.
+AIR (Arena Intermediate Representation) is the single middle-end IR for both C23 and Swift. It is an SSA form stored as columns of fixed-width integers (`Column<T>`, see [00 §Memory](00-overview-and-principles.md)), allocated from a per-function arena. AIR keeps Swift-level semantics — ownership, ARC, witness dispatch, async — long enough for the optimizer to reason about them, then lowers them to plain loads, stores, and runtime calls before instruction selection ([04](04-backend.md)).
+
+The optimizer is deliberately small: a fixed pipeline of well-understood passes chosen to capture most of the runtime performance available from a conventional optimizing compiler. The working hypothesis is that this reaches 80–90% of LLVM `-O2` runtime performance on non-vectorizable workloads; that number is a target to be measured ([14](14-measurement-methodology.md)), not a property of the design.
 
 ```
-SemIR / Lowering
+SemIR (doc 10)
        │
        ▼
  ┌─────────────────────────────────────────────────────────────┐
- │                AIR: Flat Array SSA Storage                  │
- │  - Instructions: [InstId -> {Opcode, TypeId, Operands}]     │
- │  - BasicBlocks:  [BlockId -> {Head, Count, Succs, Preds}]   │
+ │                AIR: columnar SSA storage                    │
+ │  - Instructions: InstId -> {opcode, type, op0, op1, aux}    │
+ │  - Blocks:       BlockId -> {inst range, CSR preds/succs}   │
  └─────────────────────────────────────────────────────────────┘
        │
-       ▼  (Phase 1: Mandatory Swift & C Lowering)
-  - Ownership & Borrow Verification
-  - Closure Flattening & Box Allocation
-  - Async State Machine Lowering (Coroutines)
+       ▼  Mandatory lowering (runs at every -O level)
+  - Definite initialization
+  - Ownership & borrow verification (~Copyable, consume/borrow)
+  - Static exclusivity diagnostics
+  - Closure lowering (contexts, boxes)
+  - Async coroutine split
+  - Ownership lowering (copy/destroy -> retain/release)
        │
-       ▼  (Phase 2: The Core 7 High-Throughput Optimizations)
-  1. Mem2Reg (SSA Construction)
-  2. SCCP (Sparse Conditional Constant Propagation)
-  3. GVN / CSE (Global Value Numbering)
-  4. Swift ARC & Borrow Cancellation
-  5. Fast Inlining & Devirtualization
-  6. LICM & Simple Loop Unrolling
-  7. ADCE & Control Flow Simplification
+       ▼  Optimization (-O only)
+  Interprocedural, bottom-up over call-graph SCCs:
+    generic specialization, inlining & devirtualization,
+    then the per-function simplification pipeline
+  Late, function-parallel:
+    ARC optimization, stack promotion, check elimination,
+    LICM & unrolling, cleanup
        │
        ▼
- Low-Level Machine IR (LIR) / Code Generation
+ LIR / instruction selection (doc 04)
 ```
 
----
+## 2. Goals
 
-## 2. AIR Data-Oriented Memory Layout
+- One IR for C23 and Swift so that C `static inline` functions can be inlined into Swift callers and vice versa.
+- Columnar storage: no per-instruction heap objects, no pointers in persistent data, linear scans for most passes.
+- Swift semantics (ownership, ARC, generics, async) represented explicitly until the passes that need them have run.
+- Deterministic output (D6): the result of optimization MUST NOT depend on thread count or scheduling.
+- An OS-agnostic IR: nothing in AIR names croi, kqueue, or epoll. Platform behaviour lives in the runtime ([08](08-runtime-and-stdlib.md)).
 
-AIR completely avoids heap-allocated instruction objects and pointer graphs. An entire function's body is stored in parallel flat arrays allocated from a function-local arena:
+## 3. Non-goals
+
+- Auto-vectorization (loop or SLP) as a v1 *requirement*. It is an optional track built on AIR's vector operations (D9, [17](17-simd-and-vectorization.md) §5.6). Portable SIMD lowering and loop idiom recognition *are* required.
+- Polyhedral loop optimization, profile-guided optimization, whole-program LTO beyond what the in-process pipeline naturally sees.
+- A general peephole-combining library on the scale of LLVM InstCombine. Algebraic simplification is limited to what SCCP and GVN fold, plus a small table of identities.
+- Bit-identical output with `swiftc` or `clang`. Only observable program behaviour must match ([09 §Verification](09-roadmap.md)).
+
+## 4. Design
+
+### 4.1 Function storage
+
+An AIR function is a set of columns sharing an index space. All columns are arena-backed `Column<T>` values (D8); `Opcode` is a `UInt8`-backed enum, all handle types are `UInt32`.
 
 ```swift
-public struct AIRFunction {
+public struct AIRFunction: ~Copyable {
     public var id: FunctionId
-    public var returnType: TypeId
-    public var parameterTypes: [TypeId]
+    public var signature: TypeId              // canonical function type
 
-    // Dense instruction array:
-    public var opcodes: [Opcode]              // 1 byte: add, sub, load, store, phi, retain...
-    public var types: [TypeId]                // 4 bytes: Result TypeId
-    public var operandsA: [ValueId]           // 4 bytes: First operand (InstId, ParamId, ConstId)
-    public var operandsB: [ValueId]           // 4 bytes: Second operand
-    public var operandsC: [ValueId]           // 4 bytes: Third operand / Target BlockId
-    public var extraOperandsOffset: [UInt32]  // 4 bytes: Index into overflow array for calls/phis
+    // Instruction columns, indexed by InstId (append-only storage).
+    public var opcode: Column<Opcode>         // 1 byte
+    public var type:   Column<TypeId>         // 4 bytes: result type (or .void)
+    public var op0:    Column<ValueId>        // 4 bytes
+    public var op1:    Column<ValueId>        // 4 bytes
+    public var aux:    Column<UInt32>         // 4 bytes: 3rd operand, BlockId, immediate,
+                                              //          or offset into `extra`
+    public var extra:  Column<ValueId>        // overflow operands (calls, phis, switches)
 
-    // Dense basic block array:
-    public var blockStarts: [InstId]          // 4 bytes: Start instruction index
-    public var blockCounts: [UInt32]          // 4 bytes: Instruction count in block
-    public var blockPredecessors: [[BlockId]] // Successor and predecessor indices
-    public var blockSuccessors: [[BlockId]]
+    // Block columns, indexed by BlockId.
+    public var blockOrder:   Column<InstId>   // CSR: instructions of block b are
+    public var blockStart:   Column<UInt32>   //   blockOrder[blockStart[b] ..< blockStart[b+1]]
+    public var succStart:    Column<UInt32>   // CSR successor lists
+    public var succEdges:    Column<BlockId>
+    public var predStart:    Column<UInt32>   // CSR predecessor lists
+    public var predEdges:    Column<BlockId>
 }
 ```
 
-### Key Structural Properties
+**Size.** Because each column is a separate contiguous array, there is no per-row padding. The fixed cost is 1 + 4 + 4 + 4 + 4 = **17 bytes per instruction**, plus 4 bytes in `blockOrder`, plus 4 bytes per operand beyond the third in `extra`. (An array-of-structs with the same fields would have a 20-byte stride.) LLVM, by contrast, allocates each `llvm::Instruction` individually and links it into intrusive instruction and use lists, costing several machine words of overhead per instruction; we make no stronger quantitative claim than that.
 
-1. **21 Bytes per Instruction:** Compare this with LLVM's `llvm::Instruction`, which typically consumes 120–256 bytes per instance including alignment, vtable, and doubly-linked `Use` chains.
-2. **Sequential Streaming:** Iterating over instructions in a basic block is a contiguous memory scan. Hardware prefetchers read instructions into L1/L2 cache ahead of execution.
-3. **Handle References:** A value is represented by a 32-bit `ValueId` (encoding whether it is an instruction result, function argument, or constant pool entry).
+**Edges as CSR.** Successor and predecessor lists are stored in compressed-sparse-row form (an offset column plus a flat edge column) rather than as `[[BlockId]]`, which would allocate one heap array per block. CFG edits mark the CSR as stale; it is rebuilt in one linear pass at the next pass boundary that needs it.
 
----
+**Insertion and deletion.** Instruction storage is append-only. Order within a block is given by `blockOrder`, so inserting an instruction appends it to storage and splices its `InstId` into the order column; deleting it removes it from the order column and sets its opcode to `.dead`. At pass-group boundaries a compaction step renumbers live instructions in block order. Renumbering is deterministic and restores locality for the next linear scan.
 
-## 3. First-Class Swift Semantics in AIR
+**Values.** A `ValueId` is a tagged 32-bit handle. The top 2 bits select instruction result, function parameter, constant-pool entry, or global; the remaining 30 bits are the index. Instructions with multiple results (for example, a call returning a tuple) produce one aggregate value, and `air.extract` projections select from it.
 
-Rather than forcing Swift into a generic low-level C-style IR prematurely, AIR natively represents high-level Swift semantics:
+**Use lists** are not maintained incrementally. Passes that need def-use information build a CSR use index (`useStart`, `useInsts`) in one linear pass into the scratch arena, and discard it when they finish.
 
-### Automatic Reference Counting (ARC)
-- `air.strong_retain %val` / `air.strong_release %val`
-- `air.alloc_box %type` / `air.project_box %box` (heap-allocated escape boxes for closures)
-- Preserving ARC semantics in AIR allows the optimizer to reason about object lifetimes before lowering to raw runtime calls (`swift_retain`/`swift_release`).
+### 4.2 Swift semantics in AIR
 
-### Borrowing & Ownership
-- `air.borrow_enter %val` / `air.borrow_exit %token`
-- Delineates lexical borrow scopes for non-copyable types (`~Copyable`) and `borrowing` parameters, ensuring mutations cannot occur concurrently with active borrows.
+**Ownership.** Before ownership lowering, every SSA value has an ownership kind: `owned`, `guaranteed` (borrowed), `none` (trivial), or `unowned`. Ownership is managed by these instructions:
 
-### Generics & Witness Table Dispatch
-- `air.witness_method %val, #Protocol.requirement`
-- Extracts a function pointer from a witness table. If the optimizer resolves the concrete conforming type via devirtualization, this instruction is rewritten directly to a static direct call (`air.call @ConcreteFunction`).
+- `air.copy_value` / `air.destroy_value`
+- `air.begin_borrow` / `air.end_borrow`
+- `air.move_value`
+- `air.mark_unresolved_noncopyable` (an input to the move checker)
 
-### Async / Await Coroutines
-- `air.async_suspend %task, %continuation`
-- Swift concurrency tasks are lowered to a coroutine state machine. The frame is stored in an async context, and suspension points directly integrate with Todhchai's croi port wakeups (`td_port_waiter`).
+This form is what the mandatory ownership checks (§4.3) verify.
 
----
+**ARC.** After ownership lowering, copies and destroys of reference-counted values become `air.strong_retain` / `air.strong_release`. Escaping mutable captures use `air.alloc_box` and `air.project_box`. ARC stays explicit until the backend lowers it to runtime calls ([08](08-runtime-and-stdlib.md)), so the ARC optimizer (§4.5) can reason about pairs.
 
-## 4. The 80–90% Parity Optimization Suite
+**Access markers.** `air.begin_access [read|modify] [static|dynamic]` and `air.end_access` delimit formal accesses for exclusivity enforcement. Dynamic markers lower to runtime calls; the optimizer removes them where it can prove they are unneeded (§4.5).
 
-LLVM spends 90% of its execution time running complex, deeply interactive passes: polyhedral loop transformations, interprocedural alias analyses, and over 1,000 instruction-combining patterns. These complex passes yield only the final 10–15% of runtime binary performance.
+**Volatile memory.** `air.load` and `air.store` carry a `volatile` flag. It is set by C `volatile` accesses and by the `_Volatile` module's builtins (`VolatileMappedRegister`, used for Todhchai MMIO). Optimizations MUST NOT delete, duplicate, merge, widen, narrow or split a volatile access, and MUST NOT reorder two volatile accesses relative to each other. ADCE treats them as roots, and the vectorizer and loop-idiom pass skip loops that contain them.
 
-Swift-Stack implements **the 7 core passes** that produce 80–90% of peak binary performance in a fraction of the time:
+**Generics.** `air.witness_method %wt, #Protocol.requirement` loads a requirement from a witness table. `air.metadata` produces a type-metadata reference. In unspecialized (Tier 1) code, values of unknown size are address-only and are handled through value-witness calls. The representation is defined in [11](11-generics-and-runtime-metadata.md).
+
+**Async.** `air.await` marks a suspension point in an `async` function. The coroutine split (§4.3) turns each async function into a sequence of partial functions whose state lives in a heap-allocated async frame. A suspension becomes a tail call into the executor runtime interface ([08 §5](08-runtime-and-stdlib.md)), for example the `swift_task_switch` or `swift_task_enqueue` families ([12 §6](12-standard-library-strategy.md); emitted symbols use the `_SS` scheme). AIR never refers to a specific OS event mechanism. How the executor sleeps (a croi port, kqueue, or epoll) is purely a runtime concern.
+
+**Semantics attributes.** The upstream stdlib annotates functions with `@_semantics("...")` (for example `array.check_subscript` and `array.get_count`) and `@_effects(...)` (D2, [12](12-standard-library-strategy.md)). Lowering records these annotations in a per-function attribute column. The ARC optimizer and the bounds-check eliminator match on them; they do not pattern-match on function names.
+
+### 4.3 Mandatory lowering
+
+These steps run at every optimization level, including `-Onone`, because they produce diagnostics or establish invariants that later code relies on. Their diagnostics MUST be deterministic and MUST NOT depend on the optimization level.
+
+1. **Definite initialization.** Every variable is initialized before use, `let` constants are initialized exactly once, and `self` is fully initialized before use inside initializers.
+2. **Ownership and borrow verification.** This moves here from Sem, because it needs the control-flow graph.
+   - Forward dataflow over **variable-length bitsets** (one bit per tracked variable or field path; no fixed 64-variable limit) checks that a consumed value is not used afterwards on any path.
+   - It also checks that a borrowed value is not consumed while the borrow is active, and that `inout` access is exclusive.
+   - Partial consumption of a `~Copyable` aggregate is tracked per field.
+3. **Lifetime-dependence checking** (`~Escapable`, `@_lifetime`). Every non-escapable value (a `Span`, `MutableSpan`, or a user `~Escapable` type) is checked against its source:
+   - it MUST NOT be used after its source's lifetime ends;
+   - it MUST NOT escape through returns, stores, or captures, except into a result whose `@_lifetime` annotation declares the dependence.
+
+   `copy x` dependencies inherit the source's own dependencies, and `borrow x` dependencies end when the borrow ends. This runs on the same dataflow framework as step 2.
+4. **Static exclusivity diagnostics.** Accesses that conflict when both are visible in one function are compile-time errors.
+5. **Deinit insertion.** For each `~Copyable` value whose lifetime ends without being consumed, the step inserts the destroy (which runs `deinit`) at the end of its lexical lifetime.
+6. **Closure lowering.**
+   - Captures become explicit context arguments.
+   - Escaping mutable captures are boxed.
+   - Non-escaping closures receive a context that may be stack-allocated.
+7. **Async coroutine split** (see §4.2).
+8. **Ownership lowering.** Ownership instructions are rewritten to explicit retain/release and plain loads and stores, and ownership kinds are dropped.
+9. **Performance-annotation checking.** This applies to `@_noAllocation` and `@_noLocks` functions, and runs after ownership lowering, because it has to see the explicit retains and releases.
+   - **What the checker walks.** Starting from each annotated function, it walks the **call tree** under that function. Generic callees are specialized for the concrete types reaching them; this is a dedicated, diagnostic-only specialization, independent of the optimization level, so the result is the same at `-Onone` and `-O`.
+   - **What it rejects.** Heap allocation (`alloc_ref`, `alloc_box`, escaping closure contexts, growing collections), retain and release, metadata instantiation, existential boxing, lock and runtime calls not marked safe, and calls to functions whose bodies are unavailable and that carry no matching annotation.
+   - `@_noLocks` rejects locks and blocking runtime calls but permits allocation that the runtime documents as lock-free. `@_noAllocation` implies `@_noLocks`.
+   - **Diagnostics** name the offending instruction and the call path from the annotated root.
+   - Todhchai's `@AudioRenderer` macro ([16](16-macros.md)) attaches `@_noAllocation` to real-time `render` methods. The check is the point of that macro, so it is mandatory and never weakened to a warning. Which constructs `swiftc` accepts here must be matched (D5) and is differential-tested.
+10. **Mandatory inlining.** `@_transparent` functions are always inlined, at every optimization level, and the inlined generic bodies are specialized for the concrete types at the call site. Swift semantics require this, and so does performance: the stdlib's `SIMDn<T>` operations and integer operators reach `Builtin` operations only through `@_transparent` code. Without it, `-Onone` SIMD code would run through generic witness calls ([17](17-simd-and-vectorization.md) §5.1). This step's position relative to steps 1–5 MUST match `swiftc`, because inlining affects which diagnostics fire (D5); the exact order is to be verified.
+
+### 4.4 Optimization pipeline and scheduling
+
+The optimizer has three groups of passes. The first two run per function in the order listed. Where a pass sits in the schedule matters as much as which passes exist.
+
+**Core passes (C and Swift):**
+
+| Pass | Purpose |
+|---|---|
+| Mem2Reg | Promote non-escaping `air.alloca` slots to SSA values. Phis are placed by iterated dominance frontiers. |
+| SROA | Split aggregates (structs, tuples, enum payloads) into scalar slots so Mem2Reg can promote them. This is essential for Swift, where most values are structs. |
+| SCCP | Sparse conditional constant propagation: a combined value and reachability lattice that folds constants and removes unreachable blocks. |
+| GVN / CSE + alias analysis | Value numbering over `(opcode, type, operand VNs)`, plus redundant-load elimination using the alias analysis in §4.6. |
+| LICM + simple unrolling | Hoist loop-invariant computations and loads. Fully unroll loops with a constant trip count ≤ 8 and a small body. |
+| ADCE & CFG simplification | Mark live code from its roots and sweep the rest; merge blocks, thread trivial branches, and remove empty blocks. |
+| Switch lowering hints | Classify each `switch` as a jump table, a binary search tree, or a bit test, by density and range. The backend implements the choice. |
+| Loop idiom recognition | Rewrite fill, copy and move loops into `memset`/`memcpy`/`memmove` calls ([17](17-simd-and-vectorization.md) §5.5). |
+| *Loop vectorization (optional, `-vectorize`)* | *Vectorize countable inner loops using AIR vector operations ([17](17-simd-and-vectorization.md) §5.6). Not part of the default pipeline until it meets its budgets.* |
+
+**Interprocedural passes (scheduled bottom-up):**
+
+| Pass | Purpose |
+|---|---|
+| Generic specialization | Clone generic functions for concrete type arguments that are known at a call site ([11 §Specialization](11-generics-and-runtime-metadata.md)). In Tier 0 this is total and mandatory; in Tier 1 it is budget-driven. |
+| Inlining & devirtualization | Inline small or single-call-site callees. Rewrite `witness_method` and class-method calls to direct calls when the concrete type is known, then inline. |
+
+**Swift-specific passes:**
+
+| Pass | Purpose |
+|---|---|
+| ARC optimization | Pair and remove retain/release; move retains later and releases earlier across blocks to expose more pairs (§4.5). |
+| Stack promotion | Allocate non-escaping class instances and closure contexts on the stack. |
+| Bounds-check & exclusivity-check elimination | Remove array bounds checks and dynamic `begin_access` checks that are proven redundant. |
+
+**Schedule at `-O`:**
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                   THE 7 HIGH-THROUGHPUT OPTIMIZATION PASSES            │
-├────┬─────────────────────────────┬────────────────────────────────────┤
-│ #  │ Optimization Pass           │ Binary Performance Impact          │
-├────┼─────────────────────────────┼────────────────────────────────────┤
-│ 1  │ Mem2Reg (SSA Construction)  │ Eliminates 70–80% of stack spills  │
-│ 2  │ SCCP (Constant Propagation) │ Folds constants & prunes dead branches│
-│ 3  │ GVN / CSE (Value Numbering) │ Eliminates redundant calculations  │
-│ 4  │ Swift ARC & Borrow Cancel   │ Cuts 15–30% of Swift runtime calls │
-│ 5  │ Fast Inlining & Devirtualize│ Removes generic & accessor overhead│
-│ 6  │ LICM & Simple Loop Unrolling│ Maximizes loop kernel throughput   │
-│ 7  │ ADCE & CFG Simplification   │ Removes dead code & branch blocks  │
-└────┴─────────────────────────────┴────────────────────────────────────┘
+1. Mandatory lowering                                   (function-parallel)
+2. Build the call graph; compute SCCs with Tarjan's algorithm;
+   order the SCCs bottom-up (callees before callers)
+3. For each SCC, once all callee SCCs are finished:     (SCC-parallel)
+     specialize → inline/devirtualize → Mem2Reg → SROA → SCCP
+     → GVN → ARC opt → ADCE/CFG
+     → compute this function's effect summary (§4.6)
+4. Late pipeline                                         (function-parallel)
+     stack promotion → check elimination → LICM/unroll → loop idioms
+     → [vectorize, if enabled] → GVN → ARC opt → ADCE/CFG → switch hints
+     → compaction
 ```
 
-### 1. Mem2Reg (SSA Construction)
-- Variables declared with `var` or C local variables begin as stack slots (`air.alloca`).
-- Mem2Reg identifies alloca slots whose addresses do not escape, computes the iterated dominance frontier, and inserts $\phi$-nodes (`air.phi`).
-- Stack loads and stores are replaced with direct SSA value references, eliminating nearly all local memory traffic.
+**`-Onone`** runs step 1 only, plus a trivial ADCE that preserves debug values.
 
-### 2. Sparse Conditional Constant Propagation (SCCP)
-- Executes a combined lattice analysis over values and control-flow branches.
-- Simultaneously propagates known constant integers/floats through arithmetic operations while identifying conditionally unreachable basic blocks (e.g., `if (sizeof(T) == 8)`).
-- Dead branches are removed before subsequent passes run, drastically reducing IR size.
+**`-Osize`** runs the `-O` schedule with these changes: inlining budgets cut to callees that shrink or keep the caller's size; no unrolling; loop idioms enabled (they shrink code); vectorization off. Todhchai's Embedded build uses `-Osize` for some targets.
 
-### 3. Global Value Numbering (GVN) & CSE
-- Assigns a deterministic 32-bit value number to every expression based on `(Opcode, TypeId, OperandValueNumbers)`.
-- Replaces duplicate arithmetic, bitwise shifts, and address calculations dominated by an earlier computation with the existing value handle.
-- Performs basic redundant load elimination across basic blocks where no intervening store can alias the memory location.
+**Related flags:**
+- `-no-allocations` applies the performance-annotation checker (§4.3 step 9) to every function in the module, as if each were `@_noAllocation`.
+- `-enforce-exclusivity=unchecked` lowers dynamic `begin_access` markers to nothing. Static exclusivity diagnostics (§4.3 step 4) still run.
 
-### 4. Swift ARC & Borrow Cancellation
-- Redundant retain/release pairs are the largest source of runtime overhead in idiomatic Swift.
-- The ARC pass traces retain instructions forward along control flow paths. If a matching `strong_release` is encountered and no escaping function call or deinit barrier intervenes, both instructions are deleted:
-  ```
-  // Before:
-  air.strong_retain %obj
-  %res = air.call @pureMethod(%obj)
-  air.strong_release %obj
+**Parallelism.** Intraprocedural passes run function-parallel over a work queue. Interprocedural work in step 3 is parallel across independent SCCs in the bottom-up DAG. Because a function's callees have all finished before it starts, the inliner always sees optimized callee bodies and final effect summaries. Functions in the same SCC (mutual recursion) are not inlined into one another.
 
-  // After:
-  %res = air.call @pureMethod(%obj)
-  ```
+**Determinism (D6).** Every function's output depends only on its own input and the final state of its callees. In particular:
 
-### 5. Fast Inlining & Devirtualization
-- Inlining focuses strictly on high-leverage candidates:
-  - Trivial property getters and setters (1–5 instructions).
-  - Small closures passed to standard algorithms (`map`, `filter`).
-  - Monomorphized generic wrappers.
-- Enforces a strict budget (e.g., functions under 25 AIR instructions, caller growth capped at 2x).
-- Devirtualization replaces witness table loads with direct calls when the receiver's concrete type is statically determined.
+- **Specialization identity.** A specialization is identified by its mangled name ([11 §Mangling](11-generics-and-runtime-metadata.md)). Concurrent requests for the same specialization are deduplicated by that name, and the clones are identical by construction.
+- **Function numbering.** New `FunctionId`s are assigned at a barrier after step 3, by sorting mangled names. They are never assigned in the order threads happen to finish.
+- **Inliner budgets** are computed from instruction counts. Timing never enters them.
 
-### 6. Loop-Invariant Code Motion (LICM) & Simple Unrolling
-- Identifies natural loops using Tarjan's or Kosaraju's loop detection algorithm on the flat basic block array.
-- Hoists instructions whose operands are invariant outside the loop pre-header.
-- Small loops with fixed trip counts ($\le 8$ iterations) are fully unrolled, enabling GVN and constant folding across iteration boundaries.
+### 4.5 ARC optimization
 
-### 7. Aggressive Dead Code Elimination (ADCE) & CFG Simplification
-- Mark-sweep liveness analysis starting from critical roots (system calls, volatile memory stores, function returns, escaping calls).
-- Sweeps dead instructions in a single contiguous memory pass.
-- Merges adjacent basic blocks where a predecessor has an unconditional branch to a single-predecessor successor.
+Retain and release pairs are the main source of overhead specific to Swift.
 
----
+**Basic rule.** A `strong_retain %x` and a later `strong_release %x` on the same path can both be removed if no instruction between them may decrement the reference count of `%x`, or of any value that may alias it, to zero. Equivalently, every instruction between them must be known **not to release** a reference to the object. A call meets this requirement only if the callee's effect summary (§4.6) says it does not release, or if the caller holds another strong reference that it provably keeps alive across the call, such as a guaranteed parameter.
 
-## 5. Execution Performance Budget
+```
+// Before:
+air.strong_retain %obj
+%r = air.call @f(%obj)        // @f is known not to release (from its effect summary)
+air.strong_release %obj
 
-By executing these 7 passes over flat arrays using indexed bitsets and cache-aligned scratch buffers:
-- **Optimization Throughput:** Over **250,000 AIR instructions per second per core**.
-- **Memory Overhead:** Less than **1.5 MB of RAM** for a 10,000-line module.
-- **Binary Parity:** Reaches **80% to 90% of LLVM `-O2` benchmark performance** on standard compute, string, and collection benchmarks.
+// After:
+%r = air.call @f(%obj)
+```
+
+**Escape does not affect this rule.** If `@f` stores `%obj` somewhere, then under the guaranteed-argument convention `@f` performs its own retain for that store.
+
+**Lifetimes and deinit barriers.** ARC optimization MUST respect Swift's lexical lifetime rules. It may not move a release, and with it a possible `deinit`, earlier across a deinit barrier: a call with unknown side effects, a synchronization point, or an access to memory that the deinit could observe. Variables that the user marked with `withExtendedLifetime` or `_fixLifetime` keep their full lifetime.
+
+**Code motion.** Retains are moved later and releases earlier with a bidirectional dataflow over the CFG, which exposes pairs that span blocks. Code motion stops at deinit barriers and at loop boundaries; loop-carried pairs are handled by LICM-style hoisting only when the trip count is known to be nonzero.
+
+### 4.6 Supporting analyses
+
+- **Dominators.** The iterative Cooper–Harvey–Kennedy algorithm over a reverse postorder of the CSR CFG. Post-dominators are computed the same way on the reversed CFG.
+- **Loops.** Natural loops are found from **back edges**: edges `t → h` where `h` dominates `t`. The body of each loop is collected by walking predecessors backward from `t` to `h`, and the loops are then arranged into a nesting forest. Tarjan's and Kosaraju's SCC algorithms are not used to find loops: they find cycles, but they do not identify headers or nesting. They are used only for call-graph SCCs (§4.4).
+- **Irreducible control flow.** C `goto` can create a cycle with no dominating header; Swift cannot. Such cycles are detected (a retreating DFS edge that is not a back edge) and marked. Loop passes skip irreducible regions; v1 does no node splitting.
+- **Alias analysis.** Basic, but adequate for GVN load elimination and LICM:
+  - *Allocation-site:* distinct `alloca`s and fresh allocations do not alias each other. A non-escaping `alloca` is not touched by calls.
+  - *Field-sensitive projection paths:* `s.a` and `s.b` do not alias.
+  - *Type-based:*
+    - In Swift, values of unrelated nominal types never alias, except through raw pointers.
+    - In C, the effective-type (strict aliasing) rules of C23 §6.5 apply, with `char`-type access as the universal exception. The rule is disabled by `-fno-strict-aliasing`.
+- **Effect summaries.** Computed bottom-up in step 3 of the schedule. For each function, a small record says whether it may read, write, or release memory, whether it may cause a parameter to escape, and whether it may throw. External functions without a summary are treated as having all effects. Stdlib functions annotated with `@_effects` take their summary from the annotation.
+- **Escape analysis** for stack promotion. A value escapes if it is stored to non-local memory, passed to a callee whose summary marks that parameter as escaping, captured by an escaping closure, or returned.
+- **Induction variables.** The canonical induction variables of each natural loop and their value ranges. These feed bounds-check elimination, which can remove a check or hoist it to a single range check before the loop.
+
+### 4.7 Lowering to LIR
+
+After the late pipeline, the remaining Swift operations are lowered to plain AIR:
+
+- `strong_retain` and `strong_release` become calls to the runtime's `swift_retain` and `swift_release` entry points (spelled as in [12 §6](12-standard-library-strategy.md); emitted under `_SS` names) (or inline fast paths; see [08](08-runtime-and-stdlib.md)).
+- Dynamic access markers become calls to the `swift_beginAccess` / `swift_endAccess` runtime entry points ([12 §6](12-standard-library-strategy.md)).
+- `witness_method` becomes a load at a fixed offset into the witness table.
+
+AIR then goes to instruction selection ([04](04-backend.md)). Switch hints, the `@_semantics`-derived cold-path annotations, and loop-nesting depth are passed along for block layout and for register allocation's splitting heuristics.
+
+## 5. Performance targets
+
+All of the following are **targets**, measured as described in [14](14-measurement-methodology.md):
+
+- **Optimizer time.** At `-O`, the optimizer SHOULD take ≤ 25% of total compile time on the reference corpora.
+- **Memory.** Peak optimizer memory SHOULD be proportional to the largest single function, plus module-level effect summaries and the call graph. Per-function scratch arenas are reset between functions.
+- **Runtime performance (hypothesis).** On the non-vectorizable benchmark set, generated code reaches 80–90% of LLVM `-O2` (C) or `swiftc -O` (Swift), as a geometric mean.
+
+**Known risks to the parity hypothesis:**
+
+- **No auto-vectorization by default.** Plain scalar C numeric kernels, string scanning, and memory-bound loops may fall well below 80% unless they are written with portable SIMD types, hit a loop idiom, or are built with `-vectorize` ([17](17-simd-and-vectorization.md)). These benchmarks are reported separately, with and without `-vectorize`, and are not averaged away.
+- **Swift abstraction removal is broader than this pipeline.** `swiftc -O` also performs closure specialization, CoW and array-semantics optimizations, function signature optimization, and more aggressive ARC code motion. Code that is heavy on generics or collections may land below target until some of these are added.
+- **Alias analysis is basic.** Pointer-heavy C code gets less load elimination and less LICM than it would under LLVM.
+- **No instruction scheduling.** This matters little on out-of-order x86-64 and AArch64 cores, but may matter on in-order RISC-V implementations.
+
+**On LLVM, for comparison.** LLVM's `-O2` pipeline runs on the order of a hundred pass instances, including InstCombine, loop and SLP vectorization, and memory optimizations driven by alias analysis. Polly is not part of the default pipeline. How LLVM's optimizer time is split varies by workload, and this document assumes no particular split.
+
+## 6. Alternatives considered
+
+- **Pointer-linked SSA (LLVM / MLIR style).** Rejected for the storage reasons in [00](00-overview-and-principles.md). The cost is harder instruction insertion, which §4.1 handles with an order column and periodic compaction.
+- **Sea of nodes (V8 TurboFan, HotSpot C2).** Rejected. Floating nodes simplify GVN and code motion, but scheduling becomes a separate hard problem, and the debug-info mapping gets worse.
+- **Block arguments instead of phi.** A reasonable alternative, and it maps well onto CSR edges. Phis were kept because Mem2Reg and SCCP are written against them in the literature; this remains an open question.
+- **Keeping ownership (OSSA) through optimization,** as `swiftc` is moving towards. Deferred. It gives better ARC optimization, but every pass would have to preserve ownership invariants.
+- **A separate Swift-level IR (like SIL) above a C-level IR.** Rejected. Having one IR keeps C/Swift cross-inlining trivial, at the cost of a richer opcode set.
+
+## 7. Open questions
+
+1. ~~Should loop idiom recognition be added to v1?~~ Resolved: yes ([17](17-simd-and-vectorization.md) §5.5).
+2. Phis or block arguments (§6)?
+3. Should Tier 1 ever emit an unspecialized copy of a function that is used only in specialized form within the image, or can unspecialized copies be dropped when no metadata-passing caller exists?
+4. When does the extra ARC optimization that ownership (OSSA) enables pay back the cost of every pass preserving ownership invariants? This should be measured once the M5 corpus exists.
+5. How should the inliner budget be set (instruction-count threshold, caller growth cap)? The starting values are 25 AIR instructions and 2× caller growth; they are to be tuned against [14](14-measurement-methodology.md) data.

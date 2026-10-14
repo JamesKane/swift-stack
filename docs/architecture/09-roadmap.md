@@ -1,162 +1,242 @@
-# 09. Project Roadmap, Milestones, and Verification Strategy
+# 09. Roadmap, Milestones, and Verification Strategy
 
-## 1. Directory Structure
+| | |
+|---|---|
+| **Status** | Draft |
+| **Depends on** | [00](00-overview-and-principles.md), [14](14-measurement-methodology.md) |
 
-Swift-Stack is organized as a unified, modular Swift package adhering to strict data-oriented layer separation:
+## 1. Summary
+
+This chapter defines the module layout, the milestone sequence, and how correctness is verified. Two principles shape the sequence:
+
+1. **C before Swift.** C exercises the whole backend (IR, register allocation, encoders, linker, debug info) with a far smaller frontend and no runtime. Bringing C up end-to-end first de-risks everything Swift depends on.
+2. **Measure first.** Baselines and the benchmark harness ([14](14-measurement-methodology.md)) are milestone-0 deliverables, so every later claim has something to be measured against.
+
+An earlier draft scheduled everything through self-hosting in 25 weeks. That schedule has been withdrawn. It did not account for the standard library, generics, runtime metadata, or module serialization ([11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [13](13-modules-and-incremental-builds.md)). Milestones are now sized one at a time, using what was measured in the previous milestone. M4 (Tier 0 Swift) and M6 (Tier 1) are expected to be the largest by a wide margin.
+
+## 2. Goals
+
+- Every milestone ends in something that runs and is tested end-to-end.
+- Each milestone has objective exit criteria.
+- Target platforms come up in a fixed order: Todhchai static ELF → Linux → FreeBSD → macOS.
+
+## 3. Non-goals
+
+- Calendar commitments before M0 baselines exist.
+
+## 4. Module Graph and Repository Layout
+
+### 4.1 Swift package modules
+
+```
+Source ─► Lex ─► Parse ─► Sem ─► AIR ─► Opt ─► LIR ─► Codegen ──┐
+             └─────────────────────────► Asm ───────────────────┤
+                                         Encode  (shared: Codegen, Asm; instruction tables,
+                                                  encoders, disassembler)
+                                         Object  (shared: Codegen, Asm, Linker; relocatable
+                                                  object model, ELF/Mach-O readers & writers)
+                                                         Linker ◄┘
+Driver ─► everything
+```
+
+- `Encode` and `Object` are leaf libraries with no dependency on the compiler. That keeps the assembler and linker usable on their own ([04](04-backend.md), [05](05-assembler.md), [06](06-linker.md)).
+- `Asm` depends on `Lex` (shared lexer infrastructure), `Encode` and `Object`, and not on `Codegen`.
+- Targets are added to `Package.swift` only when their source directories exist, so the manifest always builds.
+
+### 4.2 Repository layout
 
 ```
 swift-stack/
 ├── Package.swift
 ├── README.md
-├── docs/
-│   └── architecture/
-│       ├── 00-overview-and-principles.md       # DOD philosophy, pointer tax, 80-90% parity rule
-│       ├── 01-frontend.md                      # SourceManager, SWAR lexer, SoA TokenBuffer, ParseTree
-│       ├── 02-semantic-analysis.md             # TypePool, canonical TypeId, C23 semantics, staged checker
-│       ├── 03-intermediate-representation.md   # AIR flat SSA, Swift semantics, 7 core optimizer passes
-│       ├── 04-backend.md                       # LIR, maximal munch tiling, linear scan regalloc, encoders
-│       ├── 05-assembler.md                     # Native assemblers (AMD64, ARM64, RV64) & extensible targets
-│       ├── 06-linker.md                        # Modern linker, typed symbols, redundancy elimination
-│       ├── 07-debugging-and-sdi.md             # SDI format (RDI inspired), CUD unwinding, expression eval
-│       ├── 08-runtime-and-stdlib.md            # Tier 0/1 runtimes, port concurrency, system floor
-│       └── 09-roadmap.md                       # Milestones M0-M5, verification & testing strategy
+├── docs/architecture/            # This document set (00–17)
 ├── Sources/
-│   ├── Driver/               # CLI driver, target triple dispatch, multi-core worker coordinator
-│   ├── Source/               # SourceManager, sentinel padding, 32-bit SourceLocations
-│   ├── Lex/                  # SWAR token scanner, TokenBuffer (SoA), C23 preprocessor & #embed
-│   ├── Parse/                # Carbon-style postorder ParseTree, Pratt expression parser
-│   ├── Sem/                  # Symbol tables, TypePool, TypeId handles, staged constraint solver
-│   ├── AIR/                  # Arena IR instruction arrays, basic blocks, SSA value handles
-│   ├── Opt/                  # 7 high-throughput passes (Mem2Reg, SCCP, GVN, ARC, Inliner, LICM, ADCE)
-│   ├── LIR/                  # Low-Level Machine IR, virtual registers, live intervals
-│   ├── Codegen/              # Instruction selection, linear scan regalloc, encoders (AMD64, ARM64, RV64)
-│   ├── Asm/                  # Native assemblers (AMD64, ARM64, RV64) & extensible target framework
-│   ├── Linker/               # Data-oriented linker, typed symbols, chunk relocations, SDI emission
+│   ├── Source/  Lex/  Parse/  Sem/  AIR/  Opt/  LIR/  Codegen/
+│   ├── Encode/  Object/  Asm/  Linker/  Driver/
 │   └── Runtime/
-│       ├── Tier0/            # Freestanding Embedded Swift runtime shims (0 heap allocation)
-│       └── Tier1/            # Concurrency TaskExecutor (croi port / kqueue / epoll), witness tables
-└── Tests/
-    ├── Unit/                 # Subsystem unit tests (Lexer, Parser, TypePool, RegAlloc, Linker)
-    ├── Differential/         # Automated differential testing against swiftc & clang
-    ├── Corpora/              # Benchmark sources (Todhchai OS, ISO C23 test suite, assembly stubs)
-    └── Bench/                # Performance parity & compilation throughput benchmarking harnesses
+│       ├── Tier0/                # Freestanding runtime (Swift + C23)
+│       └── Tier1/                # Full runtime: refcounting, metadata, casts, concurrency
+├── Tests/
+│   ├── <Module>Tests/            # SwiftPM unit test targets, one per module
+│   ├── Golden/                   # --dump=<stage> golden files (FileCheck-style)
+│   └── Differential/             # Harness for swiftc / clang / GNU as / lld oracles
+├── Benchmarks/                   # Harnesses and machine descriptions (see 14)
+└── External/                     # Pinned, fetched-not-committed inputs: upstream stdlib,
+                                  # FoundationEssentials, corpora, third-party test suites
 ```
 
----
+`External/` holds content-hash-pinned inputs fetched by a script. Third-party test suites with incompatible licenses (e.g. the GPL GCC torture tests) are fetched and run as data. They are never committed or linked.
 
-## 2. Phased Implementation Milestones
+## 5. Milestones
+
+Each milestone lists its deliverables and its **exit criteria**. A milestone is done only when its exit criteria are met, and the D6 determinism check ([14](14-measurement-methodology.md) §9) passes for everything it produces.
+
+### M0 — Foundation and measurement
+- **Deliverables:**
+  - `Column`/arena infrastructure ([00](00-overview-and-principles.md));
+  - `SourceManager`;
+  - Swift and C lexers;
+  - benchmark harness and reference-machine setup ([14](14-measurement-methodology.md));
+  - baseline numbers for `swiftc`, Clang and lld on the corpora;
+  - `--dump`, `--stats` and `--time-phases` plumbing ([15](15-driver-and-diagnostics.md)).
+- **Exit:**
+  - B1 measured for both languages, with the target met or the gap documented;
+  - baselines recorded;
+  - CI instruction-count gating live.
+
+### M1 — C23 frontend
+- **Deliverables:**
+  - C23 preprocessor, including `#embed` and the host-header profile (D7);
+  - C parser into the postorder ParseTree;
+  - C semantic analysis and SemIR ([02](02-semantic-analysis.md), [10](10-semantic-ir-and-name-resolution.md));
+  - diagnostics engine.
+- **Exit:**
+  - SQLite, Lua and Todhchai C sources parse and type-check;
+  - glibc and FreeBSD libc headers parse;
+  - the c-testsuite accept/reject set matches Clang.
+
+### M2 — Encoders, object model, assemblers
+- **Deliverables:**
+  - `Encode` for x86-64, then AArch64, then RV64, with a disassembler;
+  - `Object` with ELF relocatable read/write;
+  - AT&T-syntax x86-64 assembler, AArch64 and RV64 assemblers, `.S` preprocessing ([05](05-assembler.md)).
+- **Exit:**
+  - the Todhchai assembly stubs assemble byte-identically to GNU `as` (modulo documented, intentional encoding choices);
+  - encoder/disassembler round-trip is exhaustive over the instruction tables.
+
+### M3 — C end-to-end at `-O0` (x86-64)
+- **Deliverables:**
+  - C lowering to AIR ([03](03-intermediate-representation.md));
+  - LIR, SSA linear-scan register allocation, x86-64 code generation ([04](04-backend.md));
+  - linker for Todhchai static ELF and Linux static/dynamic ELF ([06](06-linker.md));
+  - CUD and `.eh_frame`;
+  - minimal SDI plus an `ssdb` symbolizer ([07](07-debugging-and-sdi.md)).
+- **Exit:**
+  - c-testsuite and SQLite's test suite pass on Linux x86-64 via differential execution against Clang;
+  - a C program built by Swift-Stack runs on Todhchai;
+  - `ssdb` symbolizes a crash backtrace.
+
+### M4 — Tier 0 Swift
+- **Deliverables:**
+  - Swift parser;
+  - name resolution and operator folding ([10](10-semantic-ir-and-name-resolution.md));
+  - type checker with D5 parity on the Tier 0 subset;
+  - Swift macros: the plugin host, all attached roles Todhchai uses (`member` with `names: arbitrary`, `peer`, `memberAttribute`, `extension`), freestanding expression macros, and built-in macros ([16](16-macros.md)). Plugins are built by the host `swiftc`;
+  - ownership and borrow checking in AIR, and `@_noAllocation`/`@_noLocks` checking ([03](03-intermediate-representation.md) §4.3);
+  - the Todhchai feature profile ([02](02-semantic-analysis.md) §4.3.5):
+    - `@c`/`@c(name)` and `@_extern(c)`;
+    - strict memory safety, with diagnostic groups;
+    - `~Escapable`, `@_lifetime` and lifetime-dependence checking;
+    - value generics (`InlineArray`), `Span`/`MutableSpan`;
+    - `_Volatile`;
+    - `-no-allocations`, `-Osize`;
+  - full monomorphization ([11](11-generics-and-runtime-metadata.md));
+  - Embedded stdlib compiled from upstream sources ([12](12-standard-library-strategy.md));
+  - Tier 0 runtime ([08](08-runtime-and-stdlib.md)).
+- **Exit:**
+  - Todhchai's Tier 0 components (`userboot`, `devmgr`, `fs`) behave identically to builds made with `swiftc -enable-experimental-feature Embedded`;
+  - the type-checker accept/reject differential suite matches `swiftc` on the Tier 0 corpus;
+  - every `@IPCLibrary` and `@AudioRenderer` expansion in the Todhchai corpus is textually identical to `swiftc`'s, using the same plugins;
+  - a deliberately allocating `@AudioRenderer` `render` method is rejected, as with `swiftc`;
+  - Todhchai's Tier 0 targets build with their exact CMake flag set (`-enable-experimental-feature Embedded`/`Lifetimes`/`Extern`/`Volatile`, `-strict-memory-safety`, `-Werror StrictMemorySafety`, `-no-allocations`, `-Osize`, `-wmo`, `-parse-as-library`), using Swift-Stack's `swiftc` personality ([15](15-driver-and-diagnostics.md));
+  - Todhchai's Swift libc (`@c(memcpy)` and friends) does not compile into self-calls ([17](17-simd-and-vectorization.md) §5.5).
+
+### M5 — Optimizer and remaining backends
+- **Deliverables:**
+  - the core and Swift-specific optimization passes, including loop idiom recognition ([03](03-intermediate-representation.md));
+  - AArch64 and RV64 code generation;
+  - portable SIMD (D9): AIR vector operations, per-target legalization tables, vector register classes, VEX SSE4.2/AVX, NEON and RVV encodings at the D9 baselines ([17](17-simd-and-vectorization.md));
+  - Linux AArch64 and RV64 targets.
+- **Exit:**
+  - B9 measured per category on x86-64 and AArch64 ([14](14-measurement-methodology.md) §7), including the portable-SIMD category;
+  - Todhchai's `SIMDn` codec kernels (inflate, Adler-32, JPEG, PNG, color conversion) produce identical output on all three architectures, and also with their `arch` guards removed;
+  - the parity hypothesis confirmed, or the gap documented per category with a decision recorded in [00](00-overview-and-principles.md).
+
+### M6 — Tier 1 Swift
+- **Deliverables:**
+  - runtime metadata, witness tables, existentials, dynamic casts ([11](11-generics-and-runtime-metadata.md));
+  - Tier 1 runtime;
+  - full upstream stdlib and FoundationEssentials, including the `FoundationMacros` plugin and the stdlib's own macro plugins ([12](12-standard-library-strategy.md) §8);
+  - swift-testing (library as an input, `TestingMacros` plugin, runtime test discovery), so that Todhchai's test suites build;
+  - Swift-Stack able to build swift-syntax-based plugin executables itself;
+  - `.ssmodule` files and incremental builds ([13](13-modules-and-incremental-builds.md));
+  - FreeBSD target.
+- **Exit:**
+  - the upstream stdlib's executable tests pass;
+  - Todhchai's swift-testing suites build and pass;
+  - B10 measured;
+  - separate compilation across modules works through `.ssmodule`.
+
+### M7 — Concurrency and macOS
+- **Deliverables:**
+  - async lowering;
+  - executor backends (croi port, `kqueue`, `epoll`) ([08](08-runtime-and-stdlib.md));
+  - Swift 6 strict-concurrency checking ([02](02-semantic-analysis.md));
+  - the macOS target (Mach-O, chained fixups, ad-hoc signing).
+- **Exit:**
+  - concurrency differential tests pass on all hosts;
+  - Todhchai shell components (Tracker, Deskbar, Terminal) build and run.
+
+### M8 — Self-hosting
+- **Deliverables:** Swift-Stack builds itself.
+- **Exit:**
+  - Stage 2 (built by the Swift-Stack-built compiler) and stage 3 are bitwise identical (D6);
+  - the stage 2 compiler passes the full test suite.
+
+### Optional track V — Auto-vectorization
+
+This track is not on the critical path and has no milestone dependency after M5 (D9).
+
+- **Deliverables:**
+  - the loop vectorizer behind `-vectorize`, with dependence analysis, runtime alias checks, reductions, simple if-conversion and RVV strip-mining ([17](17-simd-and-vectorization.md) §5.6);
+  - `-Rvectorize` remarks.
+- **Exit:**
+  - Csmith and YARPGen loop corpora give identical results with `-vectorize` on and off;
+  - B13 compile-time cost is measured and the B9 benefit is reported per category;
+  - a recorded decision on whether `-vectorize` becomes default at `-O`.
+
+SLP vectorization is a later follow-on on the same track.
+
+## 6. Verification Strategy
+
+### 6.1 Differential testing
 
 ```
-M0: In-Memory Foundation & SWAR Lexer (Weeks 1–3)
-  ├── Sentinel SourceManager & SWAR Lexer (> 600 MB/s per core)
-  └── Postorder Carbon-style ParseTree (> 300 MB/s per core)
-           │
-           ▼
-M1: C23 Preprocessor & Native Assemblers (Weeks 4–7)
-  ├── Full ISO C23 preprocessor with zero-copy #embed binary slices
-  ├── Standalone Native Assemblers: AMD64, ARM64, RV64
-  └── Pluggable AssemblerTarget framework for future architectures
-           │
-           ▼
-M2: Modern Linker & SDI Debug Format (Weeks 8–11)
-  ├── Typed, module-scoped symbol resolution (ModuleId, AtomId, TypeSignatureHash)
-  ├── Single-emission debug info (.todh_debug / SDI) & Compact Unwind Descriptors (CUD)
-  └── Target layouts: Todhchai (0x1000000 static ELF), FreeBSD, Linux, macOS
-           │
-           ▼
-M3: Tier 0 Embedded Swift Pipeline (Weeks 12–15)
-  ├── Swift grammar in postorder ParseTree & Staged Bidirectional Type Checker
-  ├── Non-copyable types (~Copyable), ownership (consume/borrow), and deinit barriers
-  └── Compile Todhchai kernel-adjacent services (userboot, devmgr, fs)
-           │
-           ▼
-M4: 80–90% Optimizer & Multi-Target Codegen (Weeks 16–19)
-  ├── The 7 core optimization passes (Mem2Reg, SCCP, GVN, ARC cancel, Inliner, LICM, ADCE)
-  ├── Linear scan regalloc with interval splitting; AMD64, ARM64, RV64 encoders
-  └── Benchmark binary runtime performance parity against LLVM -O2
-           │
-           ▼
-M5: Tier 1 Full Swift, Port Concurrency & Self-Hosting (Weeks 20–25)
-  ├── Port-driven TaskExecutor: croi port (td_executor_port), FreeBSD kqueue, Linux epoll
-  ├── Metatype tables, standard collections, FoundationEssentials
-  └── Full Self-Hosting: Swift-Stack compiles Swift-Stack!
+Source ──┬──► oracle (swiftc / clang / GNU as / ld.lld) ──► artifact A ──► run ──► result A
+         │                                                                          │ compare
+         └──► swift-stack ───────────────────────────────► artifact B ──► run ──► result B
 ```
 
-### Detailed Milestone Objectives
+| Component | Oracle | What is compared |
+|---|---|---|
+| Swift type checker | `swiftc -typecheck` | Accept/reject, diagnostic locations (D5) |
+| Swift macros | `swiftc` with the same plugin executables | Expanded source text per site; accept/reject of name lookup involving macro-introduced names ([16](16-macros.md) §5.9) |
+| Swift execution | `swiftc` | stdout, exit code. Sources: the executable subset of the upstream Swift test suite (`test/Interpreter` and similar; most of `test/` checks compiler output and is not usable directly) plus project tests |
+| C frontend and execution | Clang | Accept/reject; stdout and exit code for c-testsuite, GCC torture `execute` tests (fetched, GPL, run as data), SQLite tests |
+| C random programs | Clang, GCC | Csmith and YARPGen generated programs: checksum output. Run continuously, not per commit. |
+| Assembler | GNU `as` / `llvm-mc` | Section bytes and relocations |
+| Linker | `ld.lld` | Program behavior. `readelf`/`llvm-readobj` structural validation. Bytes are not compared, since layout legitimately differs. |
+| Debug info | DWARF from Clang where applicable | Line tables and variable locations at sampled PCs |
 
-#### Milestone 0: In-Memory Foundation & SWAR Lexer
-- **Deliverables:**
-  - `SourceManager` with 64-byte sentinel zero-padding.
-  - SoA `TokenBuffer` (10 bytes/token) with SWAR scanner.
-  - Carbon-style `ParseTree` (9 bytes/node) with postorder array construction.
-- **Success Criteria:** Lexing throughput $\ge 600$ MB/s per core; parsing throughput $\ge 300$ MB/s per core; zero heap allocations per token/node.
+Floating-point differences are triaged under the policy in [14](14-measurement-methodology.md) §7: FMA contraction is off for differential runs, so remaining differences are defects.
 
-#### Milestone 1: C23 Preprocessor & Native Assemblers
-- **Deliverables:**
-  - Complete ISO/IEC 9899:2024 C23 preprocessor with zero-copy `#embed`.
-  - C23 type analysis in `TypePool` (`_BitInt`, `constexpr`, `nullptr`, attributes).
-  - Standalone assemblers for **AMD64** (Intel/AT&T), **ARM64** (UAL), and **RV64** (with compressed C extension).
-  - Pluggable `AssemblerTarget` protocol for future architecture expansion.
-- **Success Criteria:** Assembles OS entry stubs (`system/sys/floor/start.S`), context switches, and vector routines into relocatable sections without external assemblers.
+### 6.2 Internal verification
 
-#### Milestone 2: Modern Linker & SDI Debug Format
-- **Deliverables:**
-  - In-process, multi-threaded native linker (`swift-ld` / `todh-ld`).
-  - Typed, module-scoped symbol resolution (`ModuleId, AtomId, TypeSignatureHash`) preventing silent aliasing.
-  - Direct emission of memory-mappable SDI (`.todh_debug`) in $< 5$ ms.
-  - Compact Unwind Descriptors (CUD) providing microsecond stack unwinding.
-  - Verified static ELF emission for Todhchai (base `0x1000000`, 256 KiB stack, PT_TLS) and hosted linking on FreeBSD, Linux, and macOS.
-- **Success Criteria:** Links full system binaries in $< 50$ ms; zero DWARF duplication tax.
+- **IR verifiers** for SemIR, AIR and LIR run after every pass in debug builds (`--verify-each`).
+- **Golden tests** use the `--dump` output ([15](15-driver-and-diagnostics.md)).
+- **Exhaustive tests** of the encoder/disassembler round-trip.
 
-#### Milestone 3: Tier 0 Embedded Swift Pipeline
-- **Deliverables:**
-  - Swift grammar support in postorder `ParseTree`.
-  - Staged bidirectional type checker (Stage 1 fast path).
-  - Non-copyable types (`~Copyable`), `consuming`/`borrowing` parameter validation.
-  - Static `.rodata` metadata emission (zero dynamic metadata).
-- **Success Criteria:** Successfully compiles Todhchai's Tier 0 Embedded Swift components (`userboot`, `devmgr`, `fs`) producing identical execution behavior to `swiftc -enable-experimental-feature Embedded`.
+### 6.3 Robustness
 
-#### Milestone 4: 80–90% Optimizer & Multi-Target Codegen
-- **Deliverables:**
-  - Implement the 7 core optimization passes in `Opt/`: Mem2Reg, SCCP, GVN, ARC cancellation, Inlining, LICM, ADCE.
-  - Linear scan register allocator with loop boundary interval splitting.
-  - Machine encoders for AMD64 (x86-64-v2), ARM64 (AArch64), and RV64 (RV64GC with 16-bit compressed instructions).
-- **Success Criteria:** Binary benchmark execution speed reaches **80% to 90% of LLVM `-O2`** across compute and string benchmarks, while compile throughput exceeds **100,000 lines/sec per core**.
+- **Coverage-guided fuzzing** of the lexers, preprocessor, parsers, assembler parser, and the ELF/Mach-O object readers. The compiler MUST NOT crash or hang on any input.
+- Fuzzing runs continuously. Crashes found by fuzzing become regression tests.
 
-#### Milestone 5: Tier 1 Full Swift, Port Concurrency & Self-Hosting
-- **Deliverables:**
-  - Full Swift runtime integration: generics, protocol witness tables, and standard collections.
-  - Port-driven `TaskExecutor` sleeping on `td_executor_port` (croi), `kqueue` (FreeBSD/macOS), and `epoll` (Linux).
-  - Compile Todhchai's desktop shell (Tracker, Deskbar, Terminal).
-  - **Self-Hosting Verification:** Swift-Stack compiles its own complete codebase; the resulting self-hosted binary builds the compiler suite with bitwise-identical output.
+### 6.4 Performance gates
 
----
+See [14](14-measurement-methodology.md) §9.
 
-## 3. Verification & Testing Strategy
+## 7. Open Questions
 
-### 1. Differential Testing Oracle
-
-Following Todhchai Principle 29, host `swiftc` and `clang` serve as differential testing oracles:
-- **Test Runner:** An automated harness takes thousands of test cases from:
-  - The official Swift test suite (`test/`).
-  - The GCC / Clang C23 conformance test suite.
-  - Todhchai OS native source tree and standalone assembly stubs.
-- **Differential Execution:**
-  ```
-  Source ──┬──► swiftc / clang  ──► Binary A ──► Execute ──► stdout / exit code A
-           │                                                        ▲
-           │                                                        │ Assert Equal
-           └──► swift-stack     ──► Binary B ──► Execute ──► stdout / exit code B
-  ```
-- Any discrepancy in exit codes, stdout, or floating-point precision is flagged immediately as a defect.
-
-### 2. Compilation Throughput & Memory Budgets
-
-Every commit is benchmarked in continuous integration against fixed performance budgets:
-- **Zero Regression Rule:** If a commit decreases lexing/parsing throughput or increases peak resident memory (RSS) by more than 2%, CI fails.
-- **Artifact Metrics Tracked:**
-  - Lexing MB/s
-  - Parsing MB/s
-  - Peak RSS during 100K LOC build
-  - Link time in milliseconds
-  - Final executable binary size and runtime benchmark score.
+1. Should the macOS target move earlier, since it's a common developer host? Swift-Stack can run on macOS (built by `swiftc`) long before it can *target* macOS.
+2. Is Linux the right first host target, or should FreeBSD come first to match Todhchai's developer environment?
+3. Which Todhchai components define the M4 corpus beyond `userboot`, `devmgr` and `fs`?
