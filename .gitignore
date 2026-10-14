@@ -1,6 +1,7 @@
 .build/
 .swiftpm/
 .claude/
+.idea/
 Package.resolved
 *.xcodeproj
 .DS_Store
