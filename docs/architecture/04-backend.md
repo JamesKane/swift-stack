@@ -3,11 +3,11 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [03](03-intermediate-representation.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [11](11-generics-and-runtime-metadata.md), [14](14-measurement-methodology.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [03](03-intermediate-representation.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [05](05-assembler.md), [11](11-generics-and-runtime-metadata.md), [14](14-measurement-methodology.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
-The backend lowers optimized AIR ([03](03-intermediate-representation.md)) to machine code for AMD64 (2013 Mac Pro-class floor: `x86-64-v2` + AVX, F16C, AES-NI, PCLMULQDQ, RDRAND, FSGSBASE), AArch64 (`armv8-a`), and RV64 (the RVA23 profile) ([17](17-simd-and-vectorization.md) §5.4), and produces an in-memory `Object.RelocatableObject` that the linker ([06](06-linker.md)) consumes directly. It consists of:
+The backend lowers optimized AIR ([03](03-intermediate-representation.md)) to machine code for x86-64 (2013 Mac Pro-class floor: `x86-64-v2` + AVX, F16C, AES-NI, PCLMULQDQ, RDRAND, FSGSBASE), AArch64 (`armv8-a`), and RV64 (the RVA23 profile) ([17](17-simd-and-vectorization.md) §5.4), and produces an in-memory `Object.RelocatableObject` that the linker ([06](06-linker.md)) consumes directly. It consists of:
 
 1. **LIR** — a target-specific, flat, column-oriented machine IR over 32-bit virtual registers.
 2. **Instruction selection** — linear-time greedy tiling of each basic block's SSA DAG.
@@ -23,9 +23,9 @@ The backend lowers optimized AIR ([03](03-intermediate-representation.md)) to ma
 - Keep frame pointers by default so that Compact Unwind Descriptors ([07](07-debugging-and-sdi.md)) describe nearly all functions.
 - Share one instruction-description source of truth between the compiler, assembler, and disassembler.
 
-## 3. Non-goals (v1)
+## 3. Non-goals
 
-- Auto-vectorization as a requirement. It is an optional AIR-level track (D9, [17](17-simd-and-vectorization.md) §5.6); the backend needs nothing extra for it beyond vector support (§4.4).
+- Auto-vectorization as a requirement. It is an optional AIR-level track (D9, [17](17-simd-and-vectorization.md) §5.6); the backend needs nothing extra for it beyond vector support (§4.4.1).
 - Global instruction scheduling, software pipelining, PGO-driven layout.
 - AVX-512 and SVE code generation. AVX (VEX) is in the x86-64 baseline; AVX2, FMA and BMI1/BMI2 are opt-in ([17](17-simd-and-vectorization.md) §5.4).
 - 32-bit targets, Windows x64 ABI, PE/COFF.
@@ -133,8 +133,8 @@ A value with several uses is materialized once into a virtual register and every
 AIR vector types and operations ([17](17-simd-and-vectorization.md) §5.1) are first-class in the backend, because Swift `SIMDn<T>` code and C vector-extension code depend on them (D9).
 
 - **Legalization** runs before tiling. A per-target, data-driven table maps each (operation, vector type) pair to `legal`, `split`, `widen`, `expand` or `scalarize` ([17](17-simd-and-vectorization.md) §5.2). Tiling only ever sees legal vector operations.
-- **Vector tiles** fold loads into memory operands where the encoding allows it (SSE needs aligned memory operands for most instructions, so unaligned loads stay separate), and they fold splats of constants into constant-pool loads.
-- **Register class.** LIR has a vector register class per target: `XMM0–15`/`YMM0–15` (AVX baseline: 256-bit FP vectors; 256-bit integer vectors only with AVX2), AArch64 `V0–V31`, RVV `v0–v31`. On AArch64 it shares physical registers with the FP class, so aliasing is modeled.
+- **Vector tiles** fold loads into memory operands where the encoding allows it. All x86-64 vector code is VEX-encoded (AVX baseline), and VEX memory operands do not require alignment, so unaligned single-use loads fold too. Splats of constants fold into constant-pool loads.
+- **Register class.** LIR has a vector register class per target: `XMM0–15`/`YMM0–15` (AVX baseline: 256-bit FP vectors; 256-bit integer vectors only with AVX2), AArch64 `V0–V31`, RVV `v0–v31`. On x86-64 and AArch64 it shares physical registers with the scalar FP class, so aliasing is modeled; RVV registers are separate.
   - Callee-saved sets follow the C ABI: none on SysV x86-64 or RISC-V; the low 64 bits of `V8–V15` on AAPCS64.
 - **RVV state.** A forward pass tracks `vtype`/`vl` per block and removes redundant `vsetvli`/`vsetivli` instructions.
 - **Below baseline.** On a sub-baseline target (`-march=rv64gc`, not a release target), every vector operation is scalarized during legalization. The code is correct, though slower.
@@ -192,7 +192,7 @@ For each interval taken from `unhandled` in start order:
 
 ### 4.6 Frame layout and frame-pointer policy
 
-- **Frame pointers MUST be kept by default on all targets** (`RBP`, `X29`, `s0`/`fp`), with the standard frame record (saved FP and return address adjacent at the FP). This lets CUD ([07](07-debugging-and-sdi.md)) unwind most frames with one load each, and lets external profilers walk stacks. A later flag MAY allow leaf functions to omit the frame; CUD encodes such frames as "no frame pointer, fixed stack size".
+- **Frame pointers MUST be kept by default on all targets** (`RBP`, `X29`, `s0`/`fp`), with the standard frame record (saved FP and return address adjacent at the FP). This lets CUD ([07](07-debugging-and-sdi.md)) unwind most frames with one load each, and lets external profilers walk stacks. A later flag MAY allow leaf functions to omit the frame; CUD describes such frames with its frameless mode ([07](07-debugging-and-sdi.md) §5.5).
 - **Stack alignment:** 16 bytes at every call boundary on all three architectures.
 - **Red zone:** v1 does not use a red zone on any target. Tier 0 and kernel-adjacent code on Todhchai cannot rely on one. Using SysV's 128-byte red zone for hosted Linux and FreeBSD leaf functions is a later optimization.
 - **Layout (growing down):** return address → saved FP → callee-saved register area → spill slots → locals and allocas → outgoing argument area. On AArch64, `STP`/`LDP` pairs save and restore registers. On RV64, the C extension's `c.sdsp`/`c.ldsp` are used when encodable.
@@ -247,8 +247,8 @@ The full Swift calling convention and the type-lowering rules that decide which 
 | `swiftself` (context / self) | `R13` | `X20` | open question (§6) |
 | `swifterror` | `R12` | `X21` | open question (§6) |
 | `swiftasync` (async context) | `R14` | `X22` | open question (§6) |
-| Direct return registers (up to 4) | `RAX, RDX, RCX, R8` / `XMM0–XMM3` | `X0–X3` / `V0–V3` | `a0–a3` / `fa0–fa3` |
-| Vector (`SIMDn`) arguments/results ≤ 16 bytes | `XMM0–XMM7` | `V0–V7` | `v8–v15` (RVV) |
+| Direct return registers (up to 4) | `RAX, RDX, RCX, R8` / `XMM0–XMM3` | `X0–X3` / `V0–V3` | `a0–a3` / `fa0–fa3` (proposed) |
+| Vector (`SIMDn`) arguments/results ≤ 16 bytes | `XMM0–XMM7` | `V0–V7` | `v8–v15` (RVV; proposed) |
 | Callee-saved | as C ABI | as C ABI | as C ABI |
 
 - `swifterror` is treated specially: the callee may write it and the caller reads it after the call, even though the register is callee-saved in the C ABI.
@@ -302,11 +302,12 @@ Branches to symbols outside the function always use the long form plus a relocat
 
 | Target | Canonical unwind info | Also emitted |
 |---|---|---|
-| Todhchai (all architectures) | **CUD** records in `.todh_debug`/SDI ([07](07-debugging-and-sdi.md)) | `.eh_frame` only for functions CUD cannot describe (e.g. hand-written assembly with non-standard frames) |
+| Todhchai (all architectures) | **CUD** records, sorted by the linker into `.ss_unwind` ([06](06-linker.md) §5.6), with a copy in SDI (`.ss_debug`, [07](07-debugging-and-sdi.md)) | `.eh_frame` only for functions CUD cannot describe (e.g. hand-written assembly with non-standard frames) |
 | Linux, FreeBSD | **`.eh_frame`** (system unwinders, gdb, perf need it), plus `.eh_frame_hdr` built by the linker | CUD in SDI for Swift-Stack tools |
 | macOS | **Apple compact unwind** (`__LD,__compact_unwind` input → linker-built `__TEXT,__unwind_info`) with `__eh_frame` fallback | CUD in SDI |
 
 - Because frame pointers are kept (§4.6), each function's CUD record is computed directly from the final frame layout. CFI on host targets is generated from the same layout, so the two cannot disagree.
+- The CUD encoding (modes, the 24-bit callee-saved mask, the escape table) is owned by [07](07-debugging-and-sdi.md) §5.5. The code generator MUST emit only the canonical prologue and epilogue shapes that CUD modes `00`/`01` assume, record epilogue offsets for the `ss_unwind_epilogues` table, and fall back to the escape mode for any other frame shape.
 - **Debug outputs:** line-table rows map code offsets to `SourceLocation`. Variable locations are emitted as **ranges keyed by PC** (register or frame slot per live range), taken from the allocator's final intervals. This is how [07](07-debugging-and-sdi.md) represents optimized code.
 
 ### 4.12 RISC-V relaxation policy (v1)
@@ -331,5 +332,5 @@ Branches to symbols outside the function always use the long form plus a relocat
 3. **`_BitInt(N)` ABI:** follow each psABI's `_BitInt` rules (x86-64 has them; AArch64 and RISC-V rules are newer). Confirm per target before implementing N > 64 parameter passing.
 4. **Immediate side table:** should `imm` move to a sparse side column? This depends on the measured fraction of LIR instructions that carry immediates.
 5. **Switch density threshold and minimum case count:** to be tuned on the [14](14-measurement-methodology.md) corpus.
-6. **AVX2/FMA/BMI opt-in:** when is it worth enabling these by default for specific builds? This is tied to the multiversioning question in [17](17-simd-and-vectorization.md) §7. FMA contraction affects the differential-testing floating-point policy in [09](09-roadmap.md).
+6. **AVX2/FMA/BMI opt-in:** when is it worth enabling these by default for specific builds? This is tied to the multiversioning question in [17](17-simd-and-vectorization.md) §8. FMA contraction affects the differential-testing floating-point policy in [09](09-roadmap.md).
 7. **Leaf frame-pointer omission:** is it worth having? Measure code size and speed against the unwinding cost.

@@ -1,13 +1,13 @@
-# 05. Native Assemblers: AMD64, ARM64, RV64
+# 05. Native Assemblers: x86-64, AArch64, RV64
 
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [01](01-frontend.md), [04](04-backend.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [14](14-measurement-methodology.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [01](01-frontend.md), [04](04-backend.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [14](14-measurement-methodology.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
-Systems code needs hand-written assembly: process entry stubs (`system/sys/floor/start.S`), trap and interrupt entry, context switching, control-register setup, and hand-tuned memory and crypto kernels. Swift-Stack includes built-in assemblers for AMD64, ARM64 and RV64, so building Todhchai needs no external `as`.
+Systems code needs hand-written assembly: process entry stubs (`system/sys/floor/start.S`), trap and interrupt entry, context switching, control-register setup, and hand-tuned memory and crypto kernels. Swift-Stack includes built-in assemblers for x86-64, AArch64 and RV64, so building Todhchai needs no external `as`.
 
 The assembler:
 
@@ -25,7 +25,7 @@ The assembler:
 - Produce `.eh_frame` from CFI directives, and produce or verify CUD records ([07](07-debugging-and-sdi.md)) from the same information.
 - Report errors with precise source locations, including locations inside macro expansions.
 
-## 3. Non-goals (v1)
+## 3. Non-goals
 
 - Intel syntax for x86 (planned after AT&T; see §4.6).
 - EVEX encodings (AVX-512) and SVE, until there is a concrete user. VEX (AVX, in the x86-64 baseline; AVX2, opt-in) and all RVA23 extensions (including RVV 1.0, Zba/Zbb/Zbs, Zicond, Zfa, Zcb) are supported, because the backend uses them and they come from the shared `Encode` tables ([04](04-backend.md) §4.9, [17](17-simd-and-vectorization.md)). That keeps hand-written kernels possible on every architecture.
@@ -152,18 +152,18 @@ Fragments **never shrink**, even if another fragment's growth reduces some paddi
 
 Branches to symbols that are undefined, external, or in another section are encoded in their long form immediately and get a relocation. They never take part in relaxation.
 
-### 4.6 AMD64 (x86-64)
+### 4.6 x86-64
 
 - **Syntax:** AT&T syntax (`movq %rax, (%rdi)`) is implemented first. *Assumption to verify before M1:* Todhchai's existing x86-64 `.S` files use GNU AT&T syntax. Intel syntax (`.intel_syntax noprefix`) is a later item, added when a corpus file needs it.
-- **Operands:** registers (`%rax`… `%r15`, sub-registers, `%xmm0`–`%xmm15`, segment and control registers), immediates (`$expr`), memory operands `disp(base, index, scale)` including RIP-relative `sym(%rip)`, and operand-size suffixes (`b/w/l/q`), inferred from registers when omitted.
-- **Encoding:** through `Encode` tables (legacy prefixes, REX, ModR/M, SIB, maps `0F`/`0F38`/`0F3A`). The displacement size (none, 8-bit, or 32-bit) is chosen at encode time when the value is known; symbolic displacements are always 32-bit with a relocation.
+- **Operands:** registers (`%rax`… `%r15`, sub-registers, `%xmm0`–`%xmm15`, `%ymm0`–`%ymm15`, segment and control registers), immediates (`$expr`), memory operands `disp(base, index, scale)` including RIP-relative `sym(%rip)`, and operand-size suffixes (`b/w/l/q`), inferred from registers when omitted.
+- **Encoding:** through `Encode` tables (legacy prefixes, REX, two- and three-byte VEX, ModR/M, SIB, maps `0F`/`0F38`/`0F3A`). Both legacy SSE and VEX (`v`-prefixed) mnemonics are accepted; AVX is in the baseline and AVX2 is accepted when enabled ([17](17-simd-and-vectorization.md) §5.4). The displacement size (none, 8-bit, or 32-bit) is chosen at encode time when the value is known; symbolic displacements are always 32-bit with a relocation.
 - **Relaxable:** `JMP` and `Jcc` (rel8 → rel32).
 - **Relocations:**
   - ELF: `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_GOTPCREL(X)`, `R_X86_64_64`, `R_X86_64_32S`, TLS (`R_X86_64_TPOFF32`, `R_X86_64_GOTTPOFF`).
   - Mach-O: `X86_64_RELOC_*` equivalents.
 - **Privileged instructions** needed by kernel and stub code: `syscall`/`sysret`, `iretq`, `swapgs`, `lgdt`/`lidt`, `mov %crN`, `rdmsr`/`wrmsr`, `xsave`/`xrstor`, `cpuid`, `rdtsc`, `pause`, `hlt`, `invlpg`.
 
-### 4.7 ARM64 (AArch64)
+### 4.7 AArch64
 
 - **Syntax:** GNU AArch64 syntax (the A64 forms of Arm's unified assembler language).
 - **Registers:**
@@ -176,7 +176,8 @@ Branches to symbols that are undefined, external, or in another section are enco
   - bitfield instructions (`UBFM`, `SBFM`, `BFM`, `EXTR` and their aliases);
   - logical immediates (bitmask encoding);
   - `MOVZ`/`MOVK`/`MOVN`, the `mov` alias, and `MSR`/`MRS`;
-  - barriers (`DMB`, `DSB`, `ISB`), `ERET`, `SVC`/`HVC`/`SMC`.
+  - barriers (`DMB`, `DSB`, `ISB`), `ERET`, `SVC`/`HVC`/`SMC`;
+  - Advanced SIMD (NEON) instructions with arrangement specifiers.
 - **Relaxable:**
   - `B.cond`/`CBZ`/`CBNZ` (±1 MiB) and `TBZ`/`TBNZ` (±32 KiB) relax to an inverted branch over `B`;
   - `ldr xN, =imm` literal loads use a literal pool flushed at `.ltorg` or at the end of the section.
@@ -187,13 +188,14 @@ Branches to symbols that are undefined, external, or in another section are enco
   - ELF: `R_AARCH64_ADR_PREL_PG_HI21`, `R_AARCH64_ADD_ABS_LO12_NC`, `R_AARCH64_LDST{8,16,32,64,128}_ABS_LO12_NC`, `R_AARCH64_CALL26`, `R_AARCH64_JUMP26`, `R_AARCH64_CONDBR19`, `R_AARCH64_TSTBR14`, `R_AARCH64_ADR_GOT_PAGE`, `R_AARCH64_LD64_GOT_LO12_NC`, `R_AARCH64_ABS64`, `R_AARCH64_PREL32`, and the TLS LE relocations.
   - Mach-O: the `ARM64_RELOC_*` equivalents.
 
-### 4.8 RV64 (RISC-V 64GC)
+### 4.8 RV64 (RVA23)
 
-- **Registers:** ABI and numeric names: `zero`, `ra`, `sp`, `gp`, `tp`, `t0`–`t6`, `s0`/`fp`–`s11`, `a0`–`a7`, `x0`–`x31`; `ft0`–`ft11`, `fs0`–`fs11`, `fa0`–`fa7`, `f0`–`f31`. CSRs by name (`mstatus`, `sstatus`, `satp`, `sie`, `sip`, `stvec`, `sepc`, `scause`, `stval`, `sscratch`, `time`, `cycle`) or by number.
+- **Registers:** ABI and numeric names: `zero`, `ra`, `sp`, `gp`, `tp`, `t0`–`t6`, `s0`/`fp`–`s11`, `a0`–`a7`, `x0`–`x31`; `ft0`–`ft11`, `fs0`–`fs11`, `fa0`–`fa7`, `f0`–`f31`; vector registers `v0`–`v31`. CSRs by name (`mstatus`, `sstatus`, `satp`, `sie`, `sip`, `stvec`, `sepc`, `scause`, `stval`, `sscratch`, `time`, `cycle`) or by number.
 - **Pseudoinstructions:**
   - `li rd, imm`: materializes any 64-bit constant in **up to 8 instructions** (`lui`/`addi(w)` followed by `slli`/`addi` pairs). It searches for shorter forms using trailing-zero shifts and sign-extended 32-bit values, and uses compressed forms (`c.li`, `c.lui`, `c.slli`, `c.addi`) where possible.
   - `la rd, sym`: `auipc` + `addi` with `%pcrel_hi`/`%pcrel_lo` when the symbol is local. In PIC mode for preemptible symbols, it becomes `auipc` + `ld` through the GOT (`%got_pcrel_hi`).
   - `lla`; `call sym` / `tail sym` (`auipc` + `jalr`, `R_RISCV_CALL_PLT`); `ret`; `nop` (`c.nop` when C is enabled); `mv`, `not`, `neg`, `seqz`, `snez`, `beqz`, `bnez`, `bgt`, `ble`, `j`, `jr`, `csrr`, `csrw`, `csrs`, `csrc`, `fence`, `fmv`.
+- **Extensions:** every RVA23 mandatory extension, including RVV 1.0 (`vsetvli`/`vsetivli`, vector loads, stores and arithmetic with `vtype` operands), Zba/Zbb/Zbs, Zicond, Zfa and Zcb ([17](17-simd-and-vectorization.md) §5.4).
 - **Compressed instructions:** when `.option rvc` is in effect (the default; C and Zcb are part of RVA23), each instruction is emitted in its 16-bit C form if registers and immediates fit (`c.li`, `c.mv`, `c.add`, `c.addi`, `c.addi16sp`, `c.addi4spn`, `c.ld`, `c.sd`, `c.ldsp`, `c.sdsp`, `c.j`, `c.beqz`, `c.bnez`, `c.jr`, `c.jalr`). `.option norvc` disables this. `.option push`/`.option pop` are supported.
 - **Relaxation (v1):** `.option relax` is accepted, but the assembler behaves as `norelax` per [04 §4.12](04-backend.md):
   - it never emits `R_RISCV_RELAX` or `R_RISCV_ALIGN`;
@@ -238,6 +240,6 @@ Functions with no CFI region (common in entry stubs and context switches) get no
 
 1. **Corpus syntax audit:** confirm that all Todhchai x86-64 `.S` files use AT&T syntax, and list exactly which directives the corpus uses, to fix the v1 directive set.
 2. **Custom unwind directive:** should Swift-Stack add one (e.g. `.ss_unwind none|terminal`) for cases CFI expresses badly, or rely only on standard CFI?
-3. **Foreign RISC-V objects with `R_RISCV_ALIGN`:** the linker ([06](06-linker.md)) must handle these even though the assembler never emits them. The minimum correct behavior needs to be decided.
+3. ~~Foreign RISC-V objects with `R_RISCV_ALIGN`?~~ Resolved in [06](06-linker.md) §5.5: the linker deletes excess padding NOPs only, and rejects the object with a diagnostic if that is not possible.
 4. **Mach-O assembler dialect differences** (Apple `as` uses `sym@PAGE`, different section directives such as `.section __TEXT,__text`, and `.subsections_via_symbols`): how much is needed for macOS host builds?
 5. **Inline assembly (D7):** the C frontend's basic `asm("...")` statements should be parsed and encoded by this assembler. Extended asm with operand constraints needs an interface with register allocation ([04](04-backend.md)), and its v1 scope is not yet decided.

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [03](03-intermediate-representation.md), [04](04-backend.md), [06](06-linker.md), [08](08-runtime-and-stdlib.md), [10](10-semantic-ir-and-name-resolution.md), [12](12-standard-library-strategy.md), [13](13-modules-and-incremental-builds.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [03](03-intermediate-representation.md), [04](04-backend.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [08](08-runtime-and-stdlib.md), [10](10-semantic-ir-and-name-resolution.md), [12](12-standard-library-strategy.md), [13](13-modules-and-incremental-builds.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
@@ -281,7 +281,7 @@ Swift functions use swiftcc register assignments so that existing knowledge and 
 | Role | x86-64 | AArch64 | RV64 |
 |---|---|---|---|
 | Integer / pointer arguments | RDI, RSI, RDX, RCX, R8, R9 | X0–X7 | a0–a7 |
-| FP / vector arguments | XMM0–XMM7 | V0–V7 | fa0–fa7 |
+| FP arguments | XMM0–XMM7 | V0–V7 | fa0–fa7 |
 | Integer results (direct) | RAX, RDX, RCX, R8 | X0–X3 | a0–a3 *(proposed)* |
 | FP results (direct) | XMM0–XMM3 | V0–V3 | fa0–fa3 *(proposed)* |
 | Vector (`SIMDn`, `Builtin.Vec*`) args/results ≤ 16 bytes | XMM0–XMM7 | V0–V7 | v8–v15 (RVV, part of the RVA23 baseline) *(proposed)* |
@@ -323,7 +323,7 @@ The scope of this list is why D1 excludes compatibility from v1.
 ## 11. Open questions
 
 1. Is the per-target spare-bit mask for Todhchai pointers stable? It depends on the croi address-space layout.
-2. What are the RV64 `swiftself`/`swifterror`/`swiftasync` registers? They must be confirmed against LLVM `RISCVCallingConv`.
+2. What are the RV64 `swiftself`/`swifterror`/`swiftasync` registers? They must be confirmed against LLVM `RISCVCallingConv` (also [04](04-backend.md) §6, question 1).
 3. On x86-64, should the indirect result pointer be a hidden first argument (RDI, as in C) or a dedicated register (as on AArch64 with X8)?
 4. ~~Should `~Escapable` / lifetime dependencies be in v1?~~ Resolved: yes, in both tiers. Todhchai's Tier 0 code uses `Span`, `MutableSpan` and `@_lifetime` throughout ([02](02-semantic-analysis.md) §4.3.5). `~Escapable` values need no runtime metadata beyond that of their `Escapable` counterparts.
 5. Does FoundationEssentials need key paths before Tier 1 is complete (§5.10)?

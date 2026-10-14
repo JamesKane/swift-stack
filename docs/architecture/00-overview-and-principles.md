@@ -13,7 +13,7 @@ The primary target is **Todhchai OS** on the **croi** capability microkernel. Fr
 
 This chapter records the project-wide goals, non-goals, decisions and principles that every other chapter assumes. Where a later chapter disagrees with this one, this one wins until it is amended.
 
-## 2. Problem Statement
+## 2. Problem statement
 
 Production compilers for Swift and C (`swiftc`, Clang, LLVM) are built around heap-allocated, pointer-linked object hierarchies:
 
@@ -42,7 +42,7 @@ None of these costs is quantified here; each is a hypothesis to be measured agai
 - **G1 — Language coverage.** Swift 6.x in two tiers (Tier 0: Embedded Swift subset; Tier 1: full Swift as scoped by the non-goals below), **including Swift macros** (D4, [16](16-macros.md)), and ISO/IEC 9899:2024 (C23), plus the host-header extension profile (D7).
 - **G2 — Native toolchain.** No external assembler, linker or LLVM at build time on any supported target.
 - **G3 — Compile-time throughput** an order of magnitude above `swiftc`+LLVM for debug and optimized builds, with bounded peak memory. Concrete budgets are in [14](14-measurement-methodology.md) and are targets, not claims.
-- **G4 — Acceptable runtime performance.** Optimized code within 80–90% of LLVM `-O2` on the project benchmark suite (hypothesis; see Principle 4).
+- **G4 — Acceptable runtime performance.** Optimized code within 80–90% of LLVM `-O2` (C) and `swiftc -O` (Swift) on the project benchmark suite, per category (hypothesis; see Principle 4).
 - **G5 — First-class debugging** through a memory-mappable debug format (SDI, [07](07-debugging-and-sdi.md)) and cheap unwinding.
 - **G6 — Determinism** (D6).
 - **G7 — Self-hosting.** Swift-Stack eventually compiles itself.
@@ -61,9 +61,10 @@ These are out of scope for v1. Listing them is a decision, not an omission; each
 | Auto-vectorization *as a requirement* | It is an optional track, not a v1 exit criterion (D9). Portable SIMD lowering and loop idioms are required. |
 | C intrinsics headers (`<immintrin.h>`, `<arm_neon.h>`, `<riscv_vector.h>`) | Portable SIMD types cover the first-party need ([17](17-simd-and-vectorization.md)). |
 | Full GNU C dialect, Blocks, C optional features (VLAs, `_Decimal*`) | See D7 and [01](01-frontend.md). |
+| AVX-512 and SVE code generation | Wider vector features above the ISA floors are opt-in only up to AVX2 ([17](17-simd-and-vectorization.md)). |
 | ASLR on the Todhchai fixed-address image format | Recorded as a security trade-off in [06](06-linker.md); open question. |
 
-## 5. Key Decisions
+## 5. Key decisions
 
 Each decision has an ID that other chapters cite. Status is **Proposed** until the project owner accepts it.
 
@@ -75,11 +76,11 @@ Each decision has an ID that other chapters cite. Status is **Proposed** until t
 | **D4** | **Swift macros are a goal**, supported through the out-of-process compiler-plugin protocol (executable plugins, `-load-plugin-executable`). The compiler implements the protocol as an interface and never links swift-syntax. Plugins are separate programs, built by the host `swiftc` until Swift-Stack can build them itself from swift-syntax sources treated as inputs (as in D2). Built-in macros (`#file`, `#line`, …) are native. In-process library plugins are a non-goal. ([16](16-macros.md)) | Todhchai is the first-party user: its IPC layer (`@IPCLibrary`) and audio SDK (`@AudioRenderer`) are macros, compiled as Tier 0. The process boundary keeps plugin ABI out of scope (D1). | Proposed |
 | **D5** | **Type-checking semantics.** For every supported feature, the set of accepted programs and the chosen overloads MUST match `swiftc`. Any divergence is a bug. Staged solving ([02](02-semantic-analysis.md)) is an optimization only. | Otherwise Swift-Stack implements a dialect, and differential testing ([09](09-roadmap.md)) loses its oracle. | Proposed |
 | **D6** | **Determinism.** Identical inputs and flags produce bitwise-identical outputs regardless of thread count or scheduling. | Required for self-hosting verification, caching ([13](13-modules-and-incremental-builds.md)), and reproducible builds. | Proposed |
-| **D7** | **C dialect.** ISO C23 plus a documented "host-header profile" of GNU/Clang extensions (attributes, `__builtin_*`, asm labels, `_Nullable`, `__has_feature`, basic inline asm) sufficient to parse glibc, FreeBSD libc and macOS SDK headers. | Without it, C interop on POSIX hosts is impossible; full GNU C is unbounded. | Proposed |
+| **D7** | **C dialect.** ISO C23 plus a documented "host-header profile" of GNU/Clang extensions (attributes, `__builtin_*`, asm labels, `_Nullable`, `__has_feature`, inline asm, vector types) sufficient to parse glibc, FreeBSD libc and macOS SDK headers. | Without it, C interop on POSIX hosts is impossible; full GNU C is unbounded. | Proposed |
 | **D8** | **Storage.** Persistent compiler tables use `Column<Element>` (§6, Principle 2), not Swift `Array`. Transient scratch code may use `Array`. | Keeps ARC and copy-on-write out of hot tables. Gives stable addresses and O(1) reset. | Proposed |
 | **D9** | **SIMD and vectorization.** Portable SIMD is required: Swift `SIMDn<T>` and C `vector_size`/`ext_vector_type` lower to native vector code at each ISA baseline, at every optimization level. The baselines are: x86-64 at the 2013 Mac Pro-class floor (`x86-64-v2` + AVX, F16C, AES-NI, PCLMULQDQ, RDRAND, FSGSBASE; AVX2/FMA/BMI opt-in); AArch64 `armv8-a` with NEON; RV64 **RVA23** (RVV 1.0, Zba/Zbb/Zbs, Zicond, …). Loop idiom recognition is required at `-O`. Auto-vectorization of inner loops is an **optional** track (`-vectorize`), built on the same AIR vector operations and legalization tables, and becomes default only when it meets its compile-time budget. ([17](17-simd-and-vectorization.md)) | Hand-written per-architecture SIMD is tedious. Todhchai already writes its codec kernels with `SIMDn` types and guards out RV64. Making portable SIMD good everywhere removes the per-architecture work for experts. Auto-vectorization helps ordinary code, but it is the most complex pass in a conventional optimizer, so it is not a spec requirement. | Proposed |
 
-## 6. Core Principles
+## 6. Core principles
 
 ### Principle 1: Arrays over objects
 
@@ -127,13 +128,13 @@ public struct Column<Id: TypedId, Element: BitwiseCopyable>: ~Copyable {
 - Other chapters write `Column<Element>` as shorthand when the handle type is clear from context.
 - `~Copyable` makes ownership explicit and prevents accidental deep copies.
 - `BitwiseCopyable` rows mean no ARC traffic when reading or writing.
-- Reserve-then-commit gives stable addresses, which is what makes lock-free concurrent append feasible ([10](10-semantic-ir-and-name-resolution.md)). On hosts without overcommit-friendly reservation, the fallback is chunked storage with an extra index indirection.
+- Reserve-then-commit gives stable addresses, so references into a column stay valid while it grows. Parallel phases intern into worker-local overlays that are merged at barriers ([10](10-semantic-ir-and-name-resolution.md) §4.6). On hosts without overcommit-friendly reservation, the fallback is chunked storage with an extra index indirection.
 
 ### Principle 3: Clean-room implementation, scoped
 
 The compiler, assemblers, linker, debug format and runtime are written from public specifications: The Swift Programming Language reference, Swift Evolution proposals, ISO/IEC 9899:2024, the ELF, Mach-O and DWARF specifications, and the platform C ABI documents. No LLVM, Clang, swift-syntax or lld code is linked or copied.
 
-Two clarifications:
+Three clarifications:
 
 - **The Swift standard library is an input, not part of the compiler** (D2). It is Swift source defining library semantics, compiled like any user module.
 - **Macro plugins and swift-syntax are inputs too** (D4). They run in separate processes behind the plugin protocol, which Swift-Stack implements as an interface, the same way it implements ELF ([16](16-macros.md)).
@@ -145,7 +146,7 @@ Two clarifications:
 
 The hypothesis rests on the observation that a small set of transformations delivers most of the runtime benefit. For Swift-Stack that set is ([03](03-intermediate-representation.md)):
 
-- **Core:** Mem2Reg, SROA, SCCP, GVN/CSE with basic alias analysis, LICM with simple unrolling, ADCE and CFG simplification, and switch-lowering hints (jump tables).
+- **Core:** Mem2Reg, SROA, SCCP, GVN/CSE with basic alias analysis, LICM with simple unrolling, ADCE and CFG simplification, switch-lowering hints (jump tables), and loop idiom recognition.
 - **Interprocedural:** generic specialization, then inlining and devirtualization. These run bottom-up over call-graph SCCs.
 - **Swift-specific:** ARC optimization (pairing and code motion across blocks), stack promotion of non-escaping objects and closures, bounds-check and exclusivity-check elimination.
 - **Backend:** SSA linear-scan register allocation with interval splitting ([04](04-backend.md)).
@@ -173,7 +174,7 @@ Parallelism is only allowed where it cannot change the output (D6). In practice:
 - **Image format:** static `ET_EXEC` ELF64 images at fixed base `0x1000000`, 4 KiB pages, separate R-X / R / RW segments, `PT_TLS`, 256 KiB default main-thread stack. ([06](06-linker.md))
 - **Runtime tiers:** Tier 0 (Embedded) and Tier 1 (Full). ([08](08-runtime-and-stdlib.md))
 - **Concurrency:** the Swift concurrency executor sleeps on a croi port (`td_executor_port`). ([08](08-runtime-and-stdlib.md))
-- **Debug info:** native SDI in a `.todh_debug` section. ([07](07-debugging-and-sdi.md))
+- **Debug info:** native SDI in an `.ss_debug` section (CUD unwind table in `.ss_unwind`). ([07](07-debugging-and-sdi.md))
 
 ### Secondary: POSIX hosts
 
@@ -185,7 +186,7 @@ Parallelism is only allowed where it cannot change the output (D6). In practice:
 
 **ISA baselines** are deliberate floors, chosen for the hardware Todhchai will ship on, and apply to every OS on that architecture:
 
-- **x86-64:** 2013 Mac Pro-class (Ivy Bridge feature set: `x86-64-v2` + AVX, F16C, AES-NI, PCLMULQDQ, RDRAND, FSGSBASE).
+- **x86-64:** 2013 Mac Pro-class (Ivy Bridge feature set: `x86-64-v2` + AVX, F16C, AES-NI, PCLMULQDQ, RDRAND, XSAVE/XSAVEOPT, FSGSBASE).
 - **AArch64:** `armv8-a`.
 - **RV64:** RVA23.
 
@@ -193,17 +194,19 @@ Older CPUs are not supported. The details and the opt-in features above each flo
 
 Targets are brought up in order: **Todhchai static ELF → Linux → FreeBSD → macOS** ([09](09-roadmap.md)). The driver supports cross-compilation from the start ([15](15-driver-and-diagnostics.md)). Selecting a triple selects the encoder, ABI rules, object format and sysroot.
 
-## 8. Execution Model
+## 8. Execution model
 
 ```
 Phase 1  Lex + parse + declaration collection         parallel per file
            │  per-file ParseTrees, provisional handles
            ▼
-Phase 2  Name binding, conformance tables,            parallel per declaration,
-         type checking of signatures                   with dependency waits
+Phase 2  Name binding, extensions, operators,         sequential in v1
+         eager macro expansion, signatures,            (memoized requests)
+         conformances
            │  canonical renumbering (D6)               serial barrier
            ▼
 Phase 3  Body type checking → SemIR → AIR             parallel per function
+         (incl. mandatory lowering)
            │
            ▼
 Phase 4  Interprocedural optimization                 parallel per call-graph SCC,
@@ -216,15 +219,15 @@ Phase 5  Intraprocedural optimization → LIR →         parallel per function
 Phase 6  Link: resolve, lay out, relocate, emit       parallel per input section
 ```
 
-Scaling is bounded by the serial barriers and by the dependency structure of Phases 2 and 4 (Amdahl). Speed-up curves by core count are part of the benchmark suite. "Linear scaling" is not assumed.
+Scaling is bounded by the serial barriers, by Phase 2 (sequential in v1, to be parallelized only if measurement shows it matters), and by the dependency structure of Phase 4 (Amdahl). The detailed semantic-phase breakdown is in [10](10-semantic-ir-and-name-resolution.md) §4.6. Speed-up curves by core count are part of the benchmark suite. "Linear scaling" is not assumed.
 
-## 9. Alternatives Considered
+## 9. Alternatives considered
 
 - **Reuse LLVM as the backend.** This would give mature codegen and close the 10–20% gap immediately. Rejected: it contradicts G2/G3 and reintroduces the IR and compile-time costs the project exists to avoid. It could serve as a temporary oracle for codegen correctness.
 - **Apple Swift ABI compatibility from day one.** This would allow linking existing Swift binaries. Deferred (D1): it multiplies scope (mangling, metadata, runtime) before the compiler works at all.
 - **Array-of-structs tables with Swift `Array`.** Simpler code. Rejected for persistent tables (D8) because of copy-on-write and ARC overhead and the lack of stable addresses. Still fine for scratch data.
 
-## 10. Open Questions
+## 10. Open questions
 
 1. Is ASLR required for Todhchai user processes, which would mean PIE images instead of fixed `0x1000000`? ([06](06-linker.md))
 2. Should Tier 1 eventually pursue Apple Swift ABI compatibility on macOS, or remain self-contained?

@@ -2,7 +2,7 @@
 import PackageDescription
 
 // Targets are added here as their Sources/<Name> directories come into existence.
-// The planned module graph (see docs/architecture/09-roadmap.md §Module graph) is:
+// The planned module graph (see docs/architecture/09-roadmap.md §4.1) is:
 //
 //   Source ─► Lex ─► Parse ─► Sem ─► AIR ─► Opt ─► LIR ─► Codegen ─┐
 //                 └────────────────► Asm ──────────────────────────┤

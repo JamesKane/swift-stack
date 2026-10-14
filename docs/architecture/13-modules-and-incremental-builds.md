@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [14](14-measurement-methodology.md), [15](15-driver-and-diagnostics.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [03](03-intermediate-representation.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [08](08-runtime-and-stdlib.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [14](14-measurement-methodology.md), [15](15-driver-and-diagnostics.md), [16](16-macros.md) |
 
 ## 1. Summary
 
@@ -28,7 +28,7 @@ The driver ([15](15-driver-and-diagnostics.md)) schedules modules as a DAG. Rebu
 - **A stable module format across compiler versions in v1.** Module files are build artifacts keyed by the compiler's build id; they are not a distribution format.
 - **Compatibility with swiftc `.swiftmodule` or `.swiftinterface` files (D1).**
 - **Binary library evolution (resilience) as a distribution mechanism in v1.** Resilient type layout is still supported where the language requires it ([11](11-generics-and-runtime-metadata.md)).
-- **Clang modules and module maps.** C headers are handled as described in §5.5.
+- **Clang modules and module maps.** C headers are handled as described in §5.4.
 
 ## 4. Artifacts and identity
 
@@ -88,7 +88,7 @@ The driver compiles a module in three steps:
 2. **Body phase.** Type-check and lower function bodies, optimize, generate code, and produce objects and the SDI fragment.
 3. **Link.** The executable is linked once all objects are available ([06](06-linker.md)).
 
-In Tier 0, generic code is monomorphized in the module that uses it, from the generic bodies in the interface ([11](11-generics-and-runtime-metadata.md)). Specializations get deterministic, mangled names and are emitted as COMDAT-like link-once sections, so that identical specializations from different modules are deduplicated by the linker.
+In Tier 0, generic code is monomorphized in the module that uses it, from the generic bodies in the interface ([11](11-generics-and-runtime-metadata.md)). Specializations get deterministic, mangled names and are emitted as COMDAT-like link-once sections, so that identical specializations from different modules are deduplicated by the linker ([06](06-linker.md) §5.9).
 
 ### 5.3 Link-time type hashes and SDI fragments
 
@@ -135,7 +135,7 @@ Function-level caching: within a file that must be rebuilt, the code for each fu
 - **Values.** Module interfaces, macro expansion results, per-file SemIR summaries, per-function code and SDI records, objects, header-parse results, and dependency records.
 - **Location.** A per-user cache (for example `$XDG_CACHE_HOME/swift-stack`) plus an optional per-project cache. Eviction is least-recently-used with a size cap.
 - **Integrity.** Each value records its key and a content hash and is verified when read; a corrupt entry is discarded and rebuilt.
-- **Sharing.** Because of D6 and path remapping, cache entries may be shared between machines with the same compiler build. A remote cache is an open question (§7).
+- **Sharing.** Because of D6 and path remapping, cache entries may be shared between machines with the same compiler build. A remote cache is an open question (§8, question 5).
 
 ### 5.7 Driver build graph
 
@@ -155,7 +155,7 @@ The old claim of "near-instant incremental builds" is replaced by scenarios that
 | Scenario | Target (edit → linked executable) |
 |---|---|
 | Null build | < 50 ms |
-| Body-only edit in one Swift function (non-inlinable) | < 200 ms |
+| Body-only edit in one Swift function (non-inlinable) | < 200 ms ([14](14-measurement-methodology.md) B10) |
 | Body-only edit in an `@inlinable` function used by 10 files | < 500 ms |
 | Add a public declaration to a mid-graph module | < 1 s |
 | Touch a widely included C header (comment-only change) | < 1 s; may become a null build, see §8 question 1 |

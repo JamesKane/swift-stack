@@ -3,9 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [08](08-runtime-and-stdlib.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md) |
-
----
+| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [03](03-intermediate-representation.md), [08](08-runtime-and-stdlib.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
@@ -33,9 +31,7 @@ A Swift compiler is therefore incomplete without a stdlib that it can compile.
 - Objective-C bridging (`_ObjectiveCBridgeable`, `NSString`-backed strings). These code paths are compiled out (§5.4).
 - Full Foundation (`Foundation`, `FoundationInternationalization`, `FoundationNetworking`) in v1. Only `FoundationEssentials` is in scope.
 
----
-
-## 4. Licensing and the Clean-Room Principle
+## 4. Licensing and the clean-room principle
 
 ### 4.1 Licence
 
@@ -49,7 +45,7 @@ The upstream stdlib and swift-foundation are licensed under Apache-2.0 with the 
 
 Principle 3 ([00](00-overview-and-principles.md)) is restated more precisely:
 
-- **Clean-room scope:** the compiler, assembler, linker, debugger, and runtime are written from specifications. No LLVM, Clang, swift-syntax, lld, upstream Swift compiler code, or upstream C++ runtime code is copied or linked.
+- **Clean-room scope:** the compiler, assembler, linker, debugger, and runtime are written from specifications. No LLVM, Clang, swift-syntax, lld, upstream Swift compiler code, or upstream C++ runtime code is copied or linked. Macro plugins, which do use swift-syntax, run as separate processes behind the plugin protocol (D4, [16](16-macros.md)).
 - **Library inputs:** the stdlib and FoundationEssentials are Swift-language libraries. The language's own definition depends on them. Compiling them is the same activity as compiling any user package. Their source is not a reference for implementing the compiler.
 
 The upstream *compiler* remains off-limits as an implementation reference. Its observable behaviour is used only as a differential oracle ([09](09-roadmap.md)). Where the stdlib requires a compiler-known entity (§5), its required behaviour is derived from:
@@ -58,9 +54,7 @@ The upstream *compiler* remains off-limits as an implementation reference. Its o
 2. How the stdlib source uses the entity.
 3. Observed swiftc behaviour on test programs.
 
----
-
-## 5. Compiler-Known Entities
+## 5. Compiler-known entities
 
 The upstream stdlib is not ordinary Swift. It relies on compiler features that user code generally cannot or should not use. Swift-Stack MUST implement each entity in this section, scoped to what the pinned sources actually use. An automated audit lists every use: it runs over the Embedded subset as the first task of milestone M4, and over the full stdlib and FoundationEssentials as the first task of M6 ([09](09-roadmap.md)). The inventory below is the expected shape and is to be verified by that audit.
 
@@ -83,13 +77,13 @@ The upstream stdlib is not ordinary Swift. It relies on compiler features that u
 
 | Attribute | Required behaviour |
 |---|---|
-| `@_transparent` | The function MUST be inlined at every call site, before diagnostics that depend on the inlined body (for example overflow of constants). It is also treated as `@inlinable`. |
+| `@_transparent` | The function MUST be inlined at every call site and optimization level, before diagnostics that depend on the inlined body (for example overflow of constants) ([03](03-intermediate-representation.md) §4.3, mandatory inlining). It is also treated as `@inlinable`. |
 | `@inlinable`, `@usableFromInline` | The function body is serialized into the module interface ([13](13-modules-and-incremental-builds.md)) and is available for inlining and specialization in client modules. `@usableFromInline` internal declarations get public symbols. |
 | `@_alwaysEmitIntoClient` | The body is emitted into each client and never exported as a symbol from the defining module. |
 | `@frozen` | The layout is fixed and visible to clients. With D1 and whole-stdlib compilation, every stdlib type is effectively non-resilient in v1. The attribute is recorded but not needed for correctness (see open question 2). |
 | `@_semantics("...")` | Opaque string tags read by the optimizer (for example `array.get_count`, `optimize.sil.specialize.generic.never`). Swift-Stack MUST accept every tag. It MAY act on a documented subset ([03](03-intermediate-representation.md)), and unknown tags are ignored. |
 | `@_effects(readonly / readnone / releasenone …)` | Trusted effect annotations feeding ARC optimization and GVN. Swift-Stack MUST accept them and SHOULD use `readonly` and `readnone`. |
-| `@_silgen_name("sym")` | Binds a declaration to a fixed symbol name, used for runtime entry points and C shims. Swift-Stack maps each name through a table to its `_SS` runtime symbol or C symbol ([11](11-generics-and-runtime-metadata.md)). A name missing from the table is a compile error, never a silent fallback. |
+| `@_silgen_name("sym")` | Binds a declaration to a fixed symbol name, used for runtime entry points and C shims. Swift-Stack maps each name through a table to its `_SS` runtime symbol or C symbol ([11](11-generics-and-runtime-metadata.md) §7). A name missing from the table is a compile error, never a silent fallback. |
 | `@_specialize`, `@_optimize`, `@_nonoverride`, `@_borrowed`, `@_disfavoredOverload`, `@_implements`, `@_spi` … | Each is classified during the audit as *semantic* (must implement: `@_disfavoredOverload` affects overload ranking, D5; `@_implements` affects witness matching) or *advisory* (accepted, MAY be ignored). |
 
 ### 5.3 Compiler-known protocols and types
@@ -133,9 +127,7 @@ Some stdlib files are generated from `.gyb` templates by a Python tool in the up
 - Are expanded **at sync time** using the gyb tool from the same pinned upstream tag. The expanded `.swift` files are recorded with their hashes.
 - Make gyb a build-time tool for producing stdlib inputs. It is not a compiler dependency, and Python is not needed to build the compiler or user code.
 
----
-
-## 6. Runtime Entry Points
+## 6. Runtime entry points
 
 The stdlib calls the runtime through `@_silgen_name` declarations and through calls the compiler emits implicitly. Every such entry point maps to a symbol in Swift-Stack's runtime ([08](08-runtime-and-stdlib.md)). Main families (names follow upstream spelling for traceability; emitted symbols use the `_SS` scheme):
 
@@ -155,9 +147,7 @@ The stdlib calls the runtime through `@_silgen_name` declarations and through ca
 
 Upstream's `stdlib/public/stubs` and `stdlib/public/runtime` are C++, and are not compiled (no C++ frontend; C++ is a non-goal). Every function they provide that the core sources reach is reimplemented in [08](08-runtime-and-stdlib.md). The audit produces the authoritative list. A link failure caused by a missing runtime symbol is treated as a tracked defect.
 
----
-
-## 7. Tier 0 and Tier 1 Builds
+## 7. Tier 0 and Tier 1 builds
 
 Both tiers are built from the same pinned sources:
 
@@ -177,7 +167,7 @@ These are compiled from the same pinned sources. They are listed because each on
 - **`_Volatile`** (`VolatileMappedRegister`) is a separate upstream module, built when the `Volatile` feature is enabled. Its `Builtin` volatile load and store map to AIR volatile accesses ([03](03-intermediate-representation.md) §4.2).
 - **`SIMDn<T>`** needs `Builtin.Vec*` and mandatory inlining ([17](17-simd-and-vectorization.md) §5.1).
 
-## 8. FoundationEssentials and Macros (D4)
+## 8. FoundationEssentials and macros (D4)
 
 FoundationEssentials provides `Data`, `Date`, `UUID`, `URL`, `JSONEncoder`/`JSONDecoder`, `AttributedString`, `Predicate`, `FormatStyle` scaffolding, and more. Its dependencies are **to be audited** for the pinned release. Expected items:
 
@@ -193,8 +183,6 @@ FoundationEssentials provides `Data`, `Date`, `UUID`, `URL`, `JSONEncoder`/`JSON
 
 Package dependencies such as swift-collections are compiled from pinned sources under the same policy as §4.
 
----
-
 ## 9. Testing
 
 - **Upstream stdlib tests.** Upstream's `test/stdlib` and `validation-test/stdlib` contain both executable tests (`StdlibUnittest`-based) and FileCheck-style compiler-output tests. Only the executable tests are used. They are compiled by Swift-Stack, run, and their pass/fail is compared against the same tests built with swiftc at the pinned tag. `StdlibUnittest` itself is compiled as an input under §4.
@@ -202,9 +190,9 @@ Package dependencies such as swift-collections are compiled from pinned sources 
 - **Differential behaviour.** `String` normalization, grapheme breaking, `Hasher` (with a fixed seed), float printing, and sorting stability are checked against swiftc output on generated inputs.
 - **Audit gate.** CI fails if the pinned sources use a `Builtin`, attribute, `@_semantics` tag, or `@_silgen_name` that is not in the classification tables (§5). Upgrading the pin therefore surfaces new requirements explicitly.
 
-## 10. Version Pinning and Patch Policy
+## 10. Version pinning and patch policy
 
-- Track **one** upstream Swift 6.x release tag for the stdlib, and a matching swift-foundation tag. The initial pin is **Swift 6.4**, the compiler and swift-syntax (`604.x`) release that Todhchai builds against. The pin moves when Todhchai moves. Both are recorded in a single pin file with commit hashes.
+- Track **one** upstream Swift release tag for the stdlib, and a matching swift-foundation tag. The initial pin is **Swift 6.4**, the compiler and swift-syntax (`604.x`) release that Todhchai builds against. The pin moves when Todhchai moves. Both are recorded in a single pin file with commit hashes.
 - Move the pin deliberately, at most once per upstream minor release. Each move is a separate change with the audit diff attached.
 - **Patch queue.** If the pinned sources depend on a feature Swift-Stack does not yet support, the preferred order is:
   1. Implement the feature.
@@ -227,4 +215,4 @@ Package dependencies such as swift-collections are compiled from pinned sources 
 2. Should Tier 1 stdlib clients be able to rely on non-frozen stdlib layouts (whole-world compilation), or should Swift-Stack implement library evolution (resilience) for the stdlib from the start?
 3. Does FoundationEssentials internally require any macro expansion, and does it hard-depend on swift-collections? (Audit item.)
 4. How does swift-testing discover tests at runtime (a section-based record or conformance scanning) on Linux and Todhchai, and which runtime support does that require ([16](16-macros.md) open question 4)?
-5. Pin cadence: follow every Swift 6.x minor, or only even minors?
+5. ~~Pin cadence?~~ Resolved: the pin follows the Swift release Todhchai builds against (§10).

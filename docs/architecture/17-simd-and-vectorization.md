@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md) (D9), [03](03-intermediate-representation.md), [04](04-backend.md), [12](12-standard-library-strategy.md), [14](14-measurement-methodology.md) |
+| **Depends on** | [00](00-overview-and-principles.md) (D9), [02](02-semantic-analysis.md), [03](03-intermediate-representation.md), [04](04-backend.md), [05](05-assembler.md), [06](06-linker.md), [08](08-runtime-and-stdlib.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [14](14-measurement-methodology.md), [15](15-driver-and-diagnostics.md) |
 
 ## 1. Summary
 
@@ -11,7 +11,7 @@ Writing vector code by hand for x86-64, AArch64 and RV64 separately is tedious a
 
 | Layer | What the programmer writes | What the compiler does | Status |
 |---|---|---|---|
-| **A. Portable SIMD** | Swift `SIMDn<T>` types; C `vector_size` / `ext_vector_type` types | Lowers each operation to native vector instructions on every target, or to correct scalar code where the target has no vector unit | **Required** (v1) |
+| **A. Portable SIMD** | Swift `SIMDn<T>` types; C `vector_size` / `ext_vector_type` types | Lowers each operation to native vector instructions at every target's ISA baseline (scalar code only on explicitly requested sub-baseline targets) | **Required** (v1) |
 | **B. Loop idioms** | Ordinary loops that fill, copy or compare memory | Rewrites them to calls to tuned `memset`/`memcpy`/`memmove`/`memcmp` | **Required** (v1, cheap) |
 | **C. Auto-vectorization** | Ordinary scalar loops | Vectorizes countable inner loops when it is legal and profitable | **Optional.** Designed into the IR now; delivered on its own track after M5 |
 
@@ -21,7 +21,7 @@ Writing code once as Layer A gives experts multi-architecture SIMD without per-a
 
 Todhchai already writes its hot codec kernels with Swift's portable SIMD types: inflate, Adler-32, JPEG IDCT and output, color conversion, and PNG row filters. The common types are `SIMD8<UInt8>`, `SIMD16<UInt8>`, `SIMD8<Int16>` and `SIMD8<Int32>`, using reductions such as `wrappedSum()` and unaligned loads.
 
-Those kernels are guarded by `#if arch(x86_64) || arch(arm64)` or `#if !arch(riscv64)`. RV64GC has no vector unit, so the portable code would be scalarized there, and the authors keep a separate scalar path instead. Two consequences follow:
+Those kernels are guarded by `#if arch(x86_64) || arch(arm64)` or `#if !arch(riscv64)`. Today's RV64 target for `swiftc` is `rv64gc`, which has no vector unit, so the portable code would be scalarized there, and the authors keep a separate scalar path instead. Two consequences follow:
 
 1. Layer A must produce good code on x86-64 and AArch64. An earlier draft of [04](04-backend.md) excluded SIMD instruction selection, which would have scalarized these kernels everywhere.
 2. On RV64, the baseline is the **RVA23** profile, which includes RVV 1.0 (§5.4). Layer A therefore always has a vector unit on RV64, and the architecture guards can be removed.
@@ -36,7 +36,7 @@ Todhchai uses no C intrinsics headers and no hand-written vector assembly today.
   - RV64: RVV 1.0 (RVA23).
 
   Scalar fallback exists only for explicitly requested sub-baseline targets.
-- Code quality for Layer A at `-O` within the [14](14-measurement-methodology.md) B9 "Swift SIMD" category target relative to `swiftc -O`.
+- Code quality for Layer A at `-O` within the [14](14-measurement-methodology.md) B9 "Swift portable SIMD" category target relative to `swiftc -O`.
 - **Usable at `-Onone`.** SIMD operations are inlined and lowered to vector instructions even in debug builds, because codec developers debug these kernels.
 - Loop idiom recognition at `-O` (Layer B).
 - An IR and backend design in which Layer C needs no new vector machinery: the vectorizer emits the same AIR vector operations that Layer A uses.
@@ -73,12 +73,12 @@ Each target has a **legalization table**, keyed by (operation, vector type). Eac
 | Action | Meaning | Example |
 |---|---|---|
 | `legal` | One native instruction or a short fixed sequence | `add Vec<16×i8>` → `PADDB` / `ADD v.16b` |
-| `split` | The type is wider than a register; operate on halves | `Vec<16×i16>` on SSE/NEON → two 128-bit operations |
+| `split` | The type is wider than a register; operate on halves | `Vec<16×i16>` on x86-64 without AVX2, or on NEON → two 128-bit operations |
 | `widen` | The type is narrower than a register; pad, operate, ignore extra lanes | `Vec<4×i8>` → low lanes of a 128-bit register |
-| `expand` | A fixed multi-instruction recipe | x86 8-bit multiply via `PMULLW` + pack; `min` on `Vec<2×i64>` via compare and blend without SSE4.2 |
+| `expand` | A fixed multi-instruction recipe | x86 8-bit multiply via `PMULLW` + pack; `min` on `Vec<2×i64>` via `PCMPGTQ` + blend (no 64-bit vector `min` before AVX-512) |
 | `scalarize` | Per-lane scalar code | Operations with no vector form on the target (e.g. 64-bit integer multiply before AVX-512); any vector operation on a sub-baseline target such as `rv64gc` |
 
-- **The table is data, beside the `Encode` instruction tables** ([04](04-backend.md)). Adding a target feature (AVX2, RVV) means adding entries, not code paths.
+- **The table is data, beside the `Encode` instruction tables** ([04](04-backend.md)). Adding a target feature (AVX2, or later SVE) means adding entries, not code paths.
 - **Legalization runs once, before instruction selection**, as an AIR→LIR lowering step. That keeps tiling unchanged: it sees only legal vector operations.
 - **Reductions** lower to shuffle-and-add trees on SSE, to `ADDV`/`UADDLV` on AArch64, and to `vredsum` on RVV.
 
@@ -89,7 +89,7 @@ Each target has a **legalization table**, keyed by (operation, vector type). Eac
   - AAPCS64: the low 64 bits of `V8–V15` are callee-saved;
   - RISC-V: no callee-saved vector registers.
 - **Swift calling convention** (D1 lets Swift-Stack choose): `Vec` values up to 16 bytes are passed and returned in vector registers. Larger ones are split across up to four vector registers, then fall back to indirect passing. This is recorded in [11](11-generics-and-runtime-metadata.md) §8.
-- **C calling convention:** vector types follow each psABI (`__m128`-class on SysV, short vectors in `V` registers on AAPCS64, the RISC-V vector calling convention when V is enabled).
+- **C calling convention:** vector types follow each psABI (`__m128`-class on SysV, short vectors in `V` registers on AAPCS64, the RISC-V vector calling convention, since V is in the RVA23 baseline).
 - **RVV state.** RVV is vector-length-agnostic: `vsetvli` sets the element width and active length.
   - Fixed-width `SIMDn` operations use `vsetivli` with the constant lane count. They rely on `VLEN ≥ 128`, which the RVA23 baseline guarantees, so any `SIMDn` of 128 bits or less fits in one vector register with LMUL=1.
   - The backend tracks the current `vtype`/`vl` per block and removes redundant `vsetvli` instructions (a forward dataflow pass).
@@ -130,7 +130,7 @@ These baselines are deliberate floors. Code generated without extra flags MAY us
   - the RISC-V attributes section records the profile ([06](06-linker.md)).
 - **Sub-baseline target:** `-march=rv64gc` is available for older Linux boards. Every vector operation is then scalarized. It is not the default, and it is not a release target.
 
-**Per-function features and multiversioning.** `@_target(...)`-style per-function feature selection with load-time dispatch would let one binary ship both AVX and AVX2 paths. It remains an open question (§7). Until it is resolved, wider features are chosen per build.
+**Per-function features and multiversioning.** `@_target(...)`-style per-function feature selection with load-time dispatch would let one binary ship both AVX and AVX2 paths. It remains an open question (§8). Until it is resolved, wider features are chosen per build.
 
 `#if targetFeature(...)` would let source opt into wider paths. It is not standard Swift (D5), so it is an open question.
 
@@ -193,10 +193,20 @@ The host-header profile (D7, [02](02-semantic-analysis.md)) includes GCC `__attr
   - a corpus that must not vectorize (aliasing, overflow traps).
 - **Todhchai codecs** with the architecture guards removed: same output on all three architectures, and performance per B9.
 
-## 7. Open questions
+## 7. Alternatives considered
+
+| Alternative | Why not |
+|---|---|
+| Require auto-vectorization in v1 (as LLVM does by default) | It is the most complex pass in a conventional optimizer, and its benefit is unreliable without strong alias analysis. Portable SIMD gives experts predictable results now (D9). |
+| Expose target intrinsics (`<immintrin.h>`, `<arm_neon.h>`) as the SIMD story | Per-architecture code is exactly the tedium this chapter removes, and the headers are thousands of builtins. They stay a non-goal. |
+| Target `x86-64-v3` (Haswell) as the x86 floor | Excludes the 2013 Mac Pro-class machines Todhchai intends to support. AVX2 remains opt-in. |
+| Make `rv64gc` the RV64 floor | Leaves RV64 without vectors and keeps the `#if !arch(riscv64)` guards. RVA23 will be the shipping floor. |
+| Vector-length-agnostic `SIMDn` lowering on RVV | Unnecessary: `SIMDn` types have fixed widths, and RVA23 guarantees `VLEN ≥ 128`. Strip-mining is used only by the loop vectorizer. |
+
+## 8. Open questions
 
 1. ~~Todhchai RV64 baseline?~~ Resolved: RVA23 (§5.4). Todhchai's `#if !arch(riscv64)` codec guards can be removed once Swift-Stack, or `swiftc` with an RVA23 target, builds them.
-2. **Function multiversioning** (SSE and AVX2 paths in one binary, chosen at load time): worth it in v1, or is a per-target build enough for Todhchai?
+2. **Function multiversioning** (AVX and AVX2 paths in one binary, chosen at load time): worth it in v1, or is a per-target build enough for Todhchai?
 3. **`#if targetFeature(...)`:** should Swift-Stack offer it as an extension, given D5?
 4. Should Layer C eventually be the default at `-O`? This is decided by B13 and B9 measurements, not in advance.
 5. Is a subset of `<arm_neon.h>`/`<immintrin.h>` worth providing for porting existing C code bases, even though Todhchai doesn't need it?

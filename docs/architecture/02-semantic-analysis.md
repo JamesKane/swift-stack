@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [01](01-frontend.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [01](01-frontend.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
 | **Consumed by** | [03](03-intermediate-representation.md), [07](07-debugging-and-sdi.md), [13](13-modules-and-incremental-builds.md) |
 
 ## 1. Summary
@@ -79,6 +79,8 @@ The reserved slots are **compiler-builtin** types, not Swift standard-library ty
 | 16–40 | C types, all distinct: `_Bool`, `char`, `signed char`, `unsigned char`, `short`, `unsigned short`, `int`, `unsigned`, `long`, `unsigned long`, `long long`, `unsigned long long`, `float`, `double`, `long double`, `nullptr_t`, `void` (C) |
 | 41–63 | reserved |
 
+Builtin vector types `Vec<N × E>` (behind `Builtin.Vec*`, Swift `SIMDn<T>`, and C `vector_size`/`ext_vector_type`) are parametric, so they are not reserved slots. They are interned structurally with kind `vector` ([17](17-simd-and-vectorization.md) §5.1).
+
 - **Distinct C integer types.** Every C integer type is distinct, even when its representation coincides with another's: `long` and `long long` are both 64-bit on LP64, and `char` matches either `signed char` or `unsigned char`. Each records its *representation* Builtin type in a column. This is required by `_Generic`, by pointer compatibility (`long *` is not compatible with `long long *`), and by diagnostics.
 - **C character typedefs.** `char8_t`, `char16_t`, and `char32_t` are typedefs in C23 (sugar over `unsigned char`, `uint_least16_t`, and `uint_least32_t`).
 - **Target dependence.** The `char` signedness and the sizes of `long` and `long double` are target-dependent. The pool is built for one target triple per compilation.
@@ -88,7 +90,7 @@ The reserved slots are **compiler-builtin** types, not Swift standard-library ty
 ```swift
 public struct TypePool: ~Copyable {
     public var kinds:      Column<TypeKind>  // 1 byte: builtin, cInt, pointer, struct, enum, class,
-                                             //         tuple, function, generic param, atomic, bitInt, …
+                                             //         tuple, function, generic param, atomic, bitInt, vector, …
     public var flags:      Column<UInt16>    // 2 bytes: isTrivial, isCopyable, isEscapable, isSendable(cached),
                                              //          hasGenericParams, isSugar, isC, …
     public var canonical:  Column<TypeId>    // 4 bytes: self if canonical
@@ -234,13 +236,13 @@ Todhchai, the first-party user, builds against the **Swift 6.4** compiler, and i
 |---|---|---|---|
 | `@c` / `@c(name)` (C-compatible functions) | ~600: Todhchai's Swift-implemented libc (`@c(getenv)`, `@c(exit)`), the `libtodhchai.so` C ABI, the Vulkan ICD | Check that the signature is C-representable. Emit an unmangled C symbol with the C calling convention. Callable from C through the shared TypePool. | here; symbols in [11](11-generics-and-runtime-metadata.md) §7 |
 | `@_extern(c, "sym")` (`Extern` feature) | 7: libc entry points on hosted builds | Declare an external C function by Swift signature, without a header | here; [11](11-generics-and-runtime-metadata.md) §7 |
-| `@_silgen_name` | 3 | As for the stdlib ([12](12-standard-library-strategy.md) §5) | [12](12-standard-library-strategy.md) |
+| `@_silgen_name` | 3 | As for the stdlib ([12](12-standard-library-strategy.md) §5.2) | [12](12-standard-library-strategy.md) |
 | Strict memory safety (SE-0458): `unsafe` expressions, `@unsafe`, `@safe`, `-strict-memory-safety` | ~9,600 `unsafe` expressions; all Tier 0 code built with `-Werror StrictMemorySafety` | Classify every declaration and expression as safe or unsafe, following `swiftc`'s rules, and diagnose under the `StrictMemorySafety` diagnostic group. Warnings are promotable to errors by group ([15](15-driver-and-diagnostics.md) §4.5). | here |
 | Lifetime dependence (`Lifetimes` feature): `~Escapable`, `@_lifetime(...)` | `@_lifetime(self: copy self)`, `@_lifetime(copy a, copy b)`; ~330 uses of `Span`/`MutableSpan`/`RawSpan`/`MutableRawSpan` | Parse and check annotations here. Dependence enforcement is a mandatory AIR pass ([03](03-intermediate-representation.md) §4.3). | here + [03](03-intermediate-representation.md) |
 | Value generics (SE-0452): `InlineArray<let count: Int, Element>` | ~100 uses of `InlineArray` | Integer generic parameters in the TypePool, generic signatures, specialization and mangling | here + [11](11-generics-and-runtime-metadata.md) |
 | `_Volatile` module (`Volatile` feature): `VolatileMappedRegister` | 24 uses in drivers (MMIO) | Volatile load and store builtins lowering to AIR volatile memory operations ([03](03-intermediate-representation.md) §4.2) | [12](12-standard-library-strategy.md) |
-| `@_noAllocation`, `-no-allocations` | `@AudioRenderer` ([16](16-macros.md)); Embedded builds | Performance-annotation checking, per function or for a whole module | [03](03-intermediate-representation.md) §4.3 |
-| `-enforce-exclusivity=unchecked` | One host-side target | Omit dynamic exclusivity checks. Static exclusivity diagnostics still apply. | [03](03-intermediate-representation.md) |
+| `@_noAllocation`, `-no-allocations` | `@AudioRenderer` ([16](16-macros.md)); Embedded builds | Performance-annotation checking, per function or for a whole module | [03](03-intermediate-representation.md) §4.3–4.4 |
+| `-enforce-exclusivity=unchecked` | One host-side target | Omit dynamic exclusivity checks. Static exclusivity diagnostics still apply. | [03](03-intermediate-representation.md) §4.4 |
 
 New features that Todhchai adopts are added to this table as they appear. The [09](09-roadmap.md) differential corpus is the source tree itself, so additions are detected by the build failing.
 
@@ -273,7 +275,7 @@ Sem handles the declarative side of ownership:
 - `deinit` on noncopyable types;
 - lifetime-dependence annotations, which the upstream stdlib uses for `Span` and friends ([12](12-standard-library-strategy.md)).
 
-Checking that a consumed value is not used again, inserting `deinit` calls, and enforcing exclusivity are flow-sensitive. They run in AIR ([03](03-intermediate-representation.md) §Mandatory passes) and are not described here.
+Checking that a consumed value is not used again, inserting `deinit` calls, and enforcing exclusivity are flow-sensitive. They run in AIR ([03](03-intermediate-representation.md) §4.3) and are not described here.
 
 ### 4.6 C ↔ Swift interop (no ClangImporter)
 

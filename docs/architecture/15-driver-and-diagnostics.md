@@ -3,13 +3,13 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [10](10-semantic-ir-and-name-resolution.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md), [16](16-macros.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [01](01-frontend.md), [02](02-semantic-analysis.md), [10](10-semantic-ir-and-name-resolution.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
 The driver is the single `swift-stack` executable. It parses command-line options and selects a target. It builds an in-process job graph over the compiler, assembler and linker stages, and runs that graph on a work-stealing thread pool. It owns the diagnostic engine shared by every stage.
 
-There are no subprocesses on the normal path: compiling, assembling and linking all happen in one address space, with objects handed over in memory.
+Compiling, assembling and linking all happen in one address space, with objects handed over in memory. The only subprocesses are Swift macro plugins, which run out of process by design (§4.4, [16](16-macros.md)).
 
 ## 2. Goals
 
@@ -46,7 +46,8 @@ Native mode takes a whole build description (modules, sources, dependencies) and
 
 - the instruction encoder ([04](04-backend.md));
 - ABI rules, object and executable format ([06](06-linker.md));
-- runtime tier and default sysroot ([08](08-runtime-and-stdlib.md)).
+- runtime tier and default sysroot ([08](08-runtime-and-stdlib.md));
+- the ISA baseline, and any opt-in features given with `-target-feature` ([17](17-simd-and-vectorization.md) §5.4).
 
 The table is data, not code. Adding a new OS on an existing architecture is a table entry plus a linker layout. The host triple is the default. Todhchai triples (`x86_64-unknown-todhchai`, `aarch64-unknown-todhchai`, `riscv64-unknown-todhchai`) are first-class.
 
@@ -79,7 +80,7 @@ Each worker owns a thread-local `DiagnosticBag`: a set of `Column`s ([00](00-ove
 | Column | Type | Meaning |
 |---|---|---|
 | `ids` | `DiagId` (u16) | Diagnostic kind from a static table (severity, message template, category) |
-| `locs` | `GlobalLocation` (`UnitId` + `SourceLocation`, 8 bytes) | Primary location. `SourceLocation` is per compilation unit and expansion-aware for C macros ([01](01-frontend.md), [10](10-semantic-ir-and-name-resolution.md)) |
+| `locs` | `GlobalLocation` (`UnitId` + `SourceLocation`, 8 bytes) | Primary location. `SourceLocation` is per compilation unit and expansion-aware for C macros and Swift macro expansions ([01](01-frontend.md), [10](10-semantic-ir-and-name-resolution.md), [16](16-macros.md)) |
 | `argsOffset` / `argsCount` | u32 / u16 | Slice into a flat argument column (types, names, integers) |
 | `notesOffset` / `notesCount` | u32 / u16 | Attached notes (secondary locations) |
 | `fixItsOffset` / `fixItsCount` | u32 / u16 | Replacement ranges and text |
@@ -124,12 +125,12 @@ D5 requires the same accepted programs, not the same messages. Differential test
 - **`--dump=macro-expansions`:** every macro expansion with its site, role and discriminator ([16](16-macros.md)).
 - **`--verify-each`:** runs IR verifiers after every pass (debug builds of the compiler enable this by default).
 
-## 5. Alternatives Considered
+## 5. Alternatives considered
 
 - **Separate executables per stage with on-disk handoff** (the traditional model). Rejected as the default because it reintroduces the serialization cost the in-memory pipeline removes. It is still supported through the personalities, for build-system compatibility.
 - **Format diagnostics eagerly.** Rejected: string formatting on worker threads costs time and makes ordering harder.
 
-## 6. Open Questions
+## 6. Open questions
 
 1. Which SwiftPM version and `swiftc` flag subset is the compatibility target?
 2. Should native mode read `Package.swift` directly? That would require evaluating Swift manifests, which in turn requires Tier 1 and Foundation.

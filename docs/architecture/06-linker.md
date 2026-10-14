@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [04](04-backend.md), [05](05-assembler.md), [07](07-debugging-and-sdi.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [04](04-backend.md), [05](05-assembler.md), [07](07-debugging-and-sdi.md), [08](08-runtime-and-stdlib.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md), [15](15-driver-and-diagnostics.md) |
 
 ## 1. Summary
 
@@ -19,10 +19,10 @@ Relative to a conventional linker it adds three things, without changing ordinar
 
 The design is motivated by the redundancies discussed by Jonathan Blow and Sean Barrett (*Redundancies in Modern Linkers*) and by the observed costs of conventional toolchains:
 
-- **Debug-info duplication.** In the classical C model every translation unit that includes a header emits debug records for the header's types, and the linker (or a post-link tool) spends significant time deduplicating them. Swift-Stack emits type debug information once per module and merges modules by content hash (§7, [07](07-debugging-and-sdi.md)).
-- **First-come symbol resolution.** Archive member selection and weak/strong rules let an unrelated definition satisfy a reference silently. Swift-Stack keeps standard semantics (so foreign code links as expected) but adds optional provider-module constraints and type checks (§4).
+- **Debug-info duplication.** In the classical C model every translation unit that includes a header emits debug records for the header's types, and the linker (or a post-link tool) spends significant time deduplicating them. Swift-Stack emits type debug information once per module and merges modules by content hash (§5.7, [07](07-debugging-and-sdi.md)).
+- **First-come symbol resolution.** Archive member selection and weak/strong rules let an unrelated definition satisfy a reference silently. Swift-Stack keeps standard semantics (so foreign code links as expected) but adds optional provider-module constraints and type checks (§5.3).
 - **No type information at link time.** In plain C, a declaration and a definition can disagree on a signature without any diagnostic. `.ss_symtypes` lets the linker report such mismatches when both sides were compiled by Swift-Stack.
-- **Disk round-trips.** Writing `.o` files only to have the linker re-parse them is unnecessary when compiler and linker share a process. In-process handoff (§3.3) removes this; on-disk objects remain supported for separate compilation and caching ([13](13-modules-and-incremental-builds.md)).
+- **Disk round-trips.** Writing `.o` files only to have the linker re-parse them is unnecessary when compiler and linker share a process. In-process handoff (§6) removes this; on-disk objects remain supported for separate compilation and caching ([13](13-modules-and-incremental-builds.md)).
 
 A note on loaders: the original document claimed that ASLR makes link-time address assignment redundant. That overstates it. Position-independent executables use PC-relative code, so text is not patched at load time; the loader applies mostly `R_*_RELATIVE` and GOT/`JUMP_SLOT` relocations to data. Link-time layout remains necessary. What *can* be co-designed with the Todhchai loader is the set of load-time relocations (zero for static `ET_EXEC`).
 
@@ -32,7 +32,7 @@ A note on loaders: the original document claimed that ASLR makes link-time addre
 - MUST produce identical output bytes for identical inputs and flags, independent of thread count and scheduling (D6).
 - MUST support the targets in §8 in the staged order given there.
 - MUST verify `.ss_symtypes` type hashes when both the reference and the definition carry them.
-- SHOULD meet the link-time targets in §11 (hypotheses, measured per [14](14-measurement-methodology.md)).
+- SHOULD meet the link-time targets in §9 (hypotheses, measured per [14](14-measurement-methodology.md)).
 
 ## 4. Non-goals
 
@@ -162,7 +162,9 @@ GOT-indirect references to symbols that resolve locally in static images SHOULD 
 ### 5.6 Unwind information
 
 - **Todhchai:** Compact Unwind Descriptors (CUD, [07](07-debugging-and-sdi.md) §5.5) are the canonical unwind format. The linker sorts CUD records by address into a binary-searchable table in `.ss_unwind`. Frame pointers are kept on all targets by default.
-- **Host targets, and foreign objects on any target:** `.eh_frame` sections are concatenated, CIEs are deduplicated, and `.eh_frame_hdr` is emitted (sorted FDE table, `PT_GNU_EH_FRAME`). On Todhchai, functions that come only with FDEs (foreign C or assembly) are covered through `.eh_frame_hdr`, and the unwinder consults CUD first and FDEs second.
+- **Linux and FreeBSD, and foreign objects on any ELF target:** `.eh_frame` sections are concatenated, CIEs are deduplicated, and `.eh_frame_hdr` is emitted (sorted FDE table, `PT_GNU_EH_FRAME`).
+- **macOS:** `__LD,__compact_unwind` inputs are turned into `__TEXT,__unwind_info`, with `__eh_frame` as the fallback ([04](04-backend.md) §4.11).
+- On Todhchai, functions that come only with FDEs (foreign C or assembly) are covered through `.eh_frame_hdr`, and the unwinder consults CUD first and FDEs second.
 - Swift errors do not use unwinding (they use the `swifterror` register convention). Unwind tables exist for backtraces, debuggers, profilers, and foreign code.
 
 ### 5.7 Debug information
@@ -173,7 +175,7 @@ The linker does not deduplicate DIE trees. Each Swift-Stack module contributes o
 2. Merges type records by content hash. Records within a module are already unique, so cross-module duplicates (types from shared C headers) are dropped with a hash-table probe.
 3. Rewrites section-relative addresses to final virtual addresses and sorts the address map.
 
-For host debuggers, `--debug-format=dwarf` emits DWARF 5 instead of (or in addition to) SDI ([07](07-debugging-and-sdi.md) §5.9).
+For host debuggers, `--debug-format=dwarf` emits DWARF 5 instead of (or in addition to) SDI ([07](07-debugging-and-sdi.md) §5.10).
 
 ### 5.8 Deterministic output (D6)
 
@@ -213,7 +215,7 @@ Only the local-exec and initial-exec models are produced in v1. The linker compu
 
 Targets are brought up in this order. Each stage is gated on the differential tests in [09](09-roadmap.md).
 
-1. **Todhchai static ELF64** (`ET_EXEC`). Fixed base `0x1000000`, 4 KiB pages, separate `PT_LOAD` segments `R-X` (text), `R--` (rodata, eh_frame_hdr), and `RW-` (data, bss). `PT_TLS`; `PT_GNU_STACK` (`RW-`); `PT_GNU_EH_FRAME`. The 256 KiB default stack is a loader contract; whether the linker should record a per-image stack size (for example in a `.note.todhchai.stack` note) is an open question (§10). No load-time relocations.
+1. **Todhchai static ELF64** (`ET_EXEC`). Fixed base `0x1000000`, 4 KiB pages, separate `PT_LOAD` segments `R-X` (text), `R--` (rodata, eh_frame_hdr), and `RW-` (data, bss). `PT_TLS`; `PT_GNU_STACK` (`RW-`); `PT_GNU_EH_FRAME`. The 256 KiB default stack is a loader contract; whether the linker should record a per-image stack size (for example in a `.note.todhchai.stack` note) is an open question (§11). No load-time relocations.
 2. **Linux ELF64.**
    - Static: `ET_EXEC` or static-PIE.
    - Dynamic: `ET_DYN` (PIE) with `PT_INTERP` (`/lib64/ld-linux-x86-64.so.2`, `/lib/ld-linux-aarch64.so.1`, `/lib/ld-linux-riscv64-lp64d.so.1`), `PT_DYNAMIC`, `DT_NEEDED`, `DT_RELA`/`DT_JMPREL`, `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT` relocations, `.dynsym`/`.dynstr`, `DT_GNU_HASH`, and a PLT/GOT.
@@ -225,22 +227,7 @@ Targets are brought up in this order. Each stage is gated on the differential te
    - Requires a Mach-O object *reader* for foreign `.o`/`.a` inputs and, on the backend side, a Mach-O relocation mapping in `RelocKind`.
    - Linking against `libSystem` needs its exported-symbol list. This is read from the SDK `.tbd` text stubs, so no binary dylib is needed at link time.
 
-## 9. Alternatives considered
-
-- **Replace ELF symbol semantics with module-scoped binding everywhere.** Rejected: it would break linking against foreign archives and system libraries. Module scoping is offered as an optional constraint (§5.3).
-- **Unmangled Swift symbol names, with type hashes for overload disambiguation.** Rejected: object formats require unique symbol names, so overloads need distinct names (D1).
-- **Fixed 64 KiB output chunks for relocation.** Rejected: a relocation's input section is the natural unit of work, and chunking by output address needs an extra mapping step and still touches every relocation.
-- **Using `TypeId` directly as the link-time type identity.** Rejected: `TypeId`s are not stable across compilations.
-
-## 10. Open questions
-
-1. **ASLR on Todhchai.** Fixed-address `ET_EXEC` at `0x1000000` means no address-space randomization for native executables. This is a deliberate trade-off (no load-time relocations, simpler loader) that weakens exploit mitigation. Should Todhchai move to static-PIE with a small `RELATIVE` table once the loader supports it?
-2. Where does the per-image stack size live: a note section, a loader default, or a program header?
-3. Should `--ss-type-mismatch` default to `warn` for C-only links until the hash canonicalization has been validated against a large C corpus?
-4. Minimal RISC-V `R_RISCV_ALIGN` handling versus rejecting such objects: what do the Todhchai foreign libraries actually contain?
-5. Should shared-library output be in scope for v2 (needed for Todhchai hot-reload of `CodeModule`s, [07](07-debugging-and-sdi.md) §5.10)?
-
-## 11. Performance targets
+## 9. Performance targets
 
 These are hypotheses to be measured per [14](14-measurement-methodology.md); they are not claims.
 
@@ -249,3 +236,18 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md); the
 | Link a Todhchai system service (static, in-memory inputs) | < 50 ms | 8 cores; compare against `ld.lld` and `mold` on identical inputs |
 | SDI merge for a 100K-LOC program | < 5 ms | fragments precomputed at compile time |
 | 1-thread vs. N-thread output | bitwise identical | CI gate, not a performance target |
+
+## 10. Alternatives considered
+
+- **Replace ELF symbol semantics with module-scoped binding everywhere.** Rejected: it would break linking against foreign archives and system libraries. Module scoping is offered as an optional constraint (§5.3).
+- **Unmangled Swift symbol names, with type hashes for overload disambiguation.** Rejected: object formats require unique symbol names, so overloads need distinct names (D1).
+- **Fixed 64 KiB output chunks for relocation.** Rejected: a relocation's input section is the natural unit of work, and chunking by output address needs an extra mapping step and still touches every relocation.
+- **Using `TypeId` directly as the link-time type identity.** Rejected: `TypeId`s are not stable across compilations.
+
+## 11. Open questions
+
+1. **ASLR on Todhchai.** Fixed-address `ET_EXEC` at `0x1000000` means no address-space randomization for native executables. This is a deliberate trade-off (no load-time relocations, simpler loader) that weakens exploit mitigation. Should Todhchai move to static-PIE with a small `RELATIVE` table once the loader supports it?
+2. Where does the per-image stack size live: a note section, a loader default, or a program header?
+3. Should `--ss-type-mismatch` default to `warn` for C-only links until the hash canonicalization has been validated against a large C corpus?
+4. Minimal RISC-V `R_RISCV_ALIGN` handling versus rejecting such objects: what do the Todhchai foreign libraries actually contain?
+5. Should shared-library output be in scope for v2 (needed for Todhchai hot-reload of `CodeModule`s, [07](07-debugging-and-sdi.md) §5.10)?

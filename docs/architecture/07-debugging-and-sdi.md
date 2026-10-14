@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [04](04-backend.md), [06](06-linker.md), [08](08-runtime-and-stdlib.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [04](04-backend.md), [06](06-linker.md), [08](08-runtime-and-stdlib.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md), [16](16-macros.md) |
 
 ## 1. Summary
 
@@ -29,7 +29,7 @@ RDI showed that a debugger can open a large program quickly if the debug informa
 - MUST describe optimized code correctly: variables whose location changes by PC range, values split across registers, values that are optimized out, and inlined calls.
 - MUST support separate compilation: per-module fragments that a linker merges without access to the compiler's in-memory `TypePool`.
 - MUST give the Swift-specific information needed to display generic, resilient, existential, and async values (§5.7).
-- SHOULD meet the latency targets in §7.
+- SHOULD meet the latency targets in §6.
 
 ## 4. Non-goals
 
@@ -76,7 +76,7 @@ typedef struct sdi_dir_entry {           /* size 24, align 8 */
 
 The tables are: string pool, source files, line rows, types, members, type lists, procedures, scopes, scope ranges, locals, locations, location pieces, globals, inline sites, address map, and (in fragments only) type content hashes.
 
-**Macro expansions.** Every Swift macro expansion buffer ([16](16-macros.md) §5.8) is a row in the source-files table, flagged `SDI_FILE_GENERATED`. Its path is `<macro:Module.Type>/<discriminator>.swift`, its text is stored in the string pool, and it has a parent link to the expansion site's file and line. Line rows for generated code point into these virtual files, so a debugger can show and step through code such as the IPC server stubs that `@IPCLibrary` generates. When DWARF is emitted, the same text goes into DWARF 5 embedded-source (`DW_LNCT_LLVM_source`-style) entries, subject to host debugger support (to be verified).
+**Macro expansions.** Every Swift macro expansion buffer ([16](16-macros.md) §5.8) is a row in the source-files table, flagged `SDI_FILE_GENERATED`. Its path is `<macro:Module.Type>/<discriminator>.swift`, its text is stored in the string pool, and it has a parent link to the expansion site's file and line. Line rows for generated code point into these virtual files, so a debugger can show and step through code such as the IPC server stubs that `@IPCLibrary` generates. When DWARF is emitted, the same text goes into the line table's embedded-source content using the LLVM vendor extension `DW_LNCT_LLVM_source`. This is not standard DWARF 5, so it depends on host debugger support (to be verified).
 
 ### 5.3 Core records
 
@@ -216,7 +216,7 @@ The 24-bit mask covers the callee-saved sets of all three targets: x86-64 `rbx, 
 - **Epilogues.** Epilogue start offsets are listed in a sorted side table (`ss_unwind_epilogues`: `(function_offset: u32, kind: u8)`). Within a listed epilogue, the unwinder applies the canonical reverse state.
 - **Escape.** A function whose prologue or epilogue is not canonical MUST use mode `10`.
 
-**Relation to `.eh_frame`.** On Todhchai, CUD is the canonical format. Foreign objects provide only `.eh_frame` FDEs, which the linker indexes with `.eh_frame_hdr` ([06](06-linker.md) §5.6). The unwinder consults CUD first and falls back to FDEs. Host targets emit `.eh_frame` because the system tools expect it. Swift error propagation does not unwind.
+**Relation to `.eh_frame`.** On Todhchai, CUD is the canonical format. Foreign objects provide only `.eh_frame` FDEs, which the linker indexes with `.eh_frame_hdr` ([06](06-linker.md) §5.6). The unwinder consults CUD first and falls back to FDEs. Linux and FreeBSD emit `.eh_frame` because the system tools expect it; macOS uses Apple compact unwind with an `__eh_frame` fallback ([04](04-backend.md) §4.11). CUD records are also kept in SDI on every target, for Swift-Stack's own tools. Swift error propagation does not unwind.
 
 ### 5.6 Per-module fragments and linking
 
@@ -226,14 +226,14 @@ The backend writes one fragment per module. Fragments are stored in the module's
 - Addresses in a fragment are section-relative (§5.1).
 - The linker merges fragments ([06](06-linker.md) §5.7): it concatenates tables, rebases indices, deduplicates types across modules by `content_hash` (for example, types from a C header used by several modules), rebases addresses, and sorts the address map and line rows.
 
-The linker needs no compiler data structures, so separately compiled modules, cached modules, and libraries built earlier are handled identically to in-process compilation. Foreign C objects carry DWARF, not SDI. Converting their DWARF to SDI at link time is optional and off by default (§9).
+The linker needs no compiler data structures, so separately compiled modules, cached modules, and libraries built earlier are handled identically to in-process compilation. Foreign C objects carry DWARF, not SDI. Converting their DWARF to SDI at link time is optional and off by default (§8).
 
 ### 5.7 Swift-specific information
 
 - **Generic values.** In unspecialized Tier 1 code ([11](11-generics-and-runtime-metadata.md)), a value of type `T` has no static layout. The procedure emits an artificial `TYPE_METADATA` local for each generic parameter, holding the location of its metadata pointer. The debugger reads size, alignment, and field layout from the target's runtime metadata and value-witness table, whose layout is specified in [11](11-generics-and-runtime-metadata.md).
 - **Resilient types.** These are marked with `size = 0xFFFFFFFF` and/or member `byte_offset = 0xFFFFFFFF`; the layout is obtained through `metadata_symbol` at run time.
 - **Existentials.** These use `kind = existential` with the container layout from [11](11-generics-and-runtime-metadata.md): inline buffer, metadata pointer, and witness tables.
-- **Async functions.** Their locals live in a heap-allocated async context, so locations use `ASYNC_CONTEXT`. The context register is `r14` on x86-64 and `x22` on AArch64 (the RISC-V assignment is defined in [04](04-backend.md)). The debugger builds a *logical* backtrace by following the parent-context chain, whose layout is defined in [08](08-runtime-and-stdlib.md) and [11](11-generics-and-runtime-metadata.md), in addition to the physical stack.
+- **Async functions.** Their locals live in a heap-allocated async context, so locations use `ASYNC_CONTEXT`. The context register is `r14` on x86-64 and `x22` on AArch64 (the RISC-V assignment is an open question in [11](11-generics-and-runtime-metadata.md) §8). The debugger builds a *logical* backtrace by following the parent-context chain, whose layout is defined in [08](08-runtime-and-stdlib.md) and [11](11-generics-and-runtime-metadata.md), in addition to the physical stack.
 - **Tier 0.** All types are specialized, so all sizes are static and no runtime metadata is required.
 
 ### 5.8 Consumers: reader, symbolizer, unwinder, debugger
@@ -276,17 +276,9 @@ Todhchai OS principle 17 makes debugging and hot reload OS services. SDI support
 - When Todhchai swaps a `CodeModule`, the debugger is notified on its event port. It maps the new generation's SDI and unmaps the old one when no frames of the old code remain live.
 - Breakpoints are stored as `(procedure display name, file, line)` and re-bound against the new generation. Breakpoints in unchanged procedures resolve to the same source positions; breakpoints in changed procedures are re-resolved, and the user is told if one cannot be bound.
 
-Hot reload needs relocatable code modules, which v1 does not link ([06](06-linker.md) §10, question 5).
+Hot reload needs relocatable code modules, which v1 does not link ([06](06-linker.md) §11, question 5).
 
-## 6. Alternatives considered
-
-- **DWARF only.** Rejected for Todhchai because of the query cost of interpreted location and CFI programs and the link-time cost of deduplication. Kept as a host output (§5.10).
-- **Swift structs as the on-disk format.** Rejected: Swift layout is not a stable format, and readers in other languages need a normative definition.
-- **Location expressions as bytecode (like DWARF).** Rejected in favor of a closed set of kinds plus `OPTIMIZED_OUT`. This costs some coverage of optimized code in exchange for simple and fast readers.
-- **Apple-style compact unwind alone.** Rejected: it is not precise at arbitrary instructions and depends on DWARF for fallbacks. CUD adds prologue and epilogue information and a table-based escape mode.
-- **Emitting SDI in the linker from the compiler's in-memory `TypePool`.** Rejected: it only works for single-process whole-program builds.
-
-## 7. Performance targets
+## 6. Performance targets
 
 These are hypotheses to be measured per [14](14-measurement-methodology.md).
 
@@ -296,12 +288,20 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md).
 | Open a 100K-LOC program's SDI (mmap + header validation) | < 1 ms |
 | Unwind 100 frames (CUD mode `00`) | < 2 µs |
 | Simple member-access expression | < 10 µs, excluding target-memory read latency |
-| Fragment merge in the linker | see [06](06-linker.md) §11 |
+| Fragment merge in the linker | see [06](06-linker.md) §9 |
+
+## 7. Alternatives considered
+
+- **DWARF only.** Rejected for Todhchai because of the query cost of interpreted location and CFI programs and the link-time cost of deduplication. Kept as a host output (§5.10).
+- **Swift structs as the on-disk format.** Rejected: Swift layout is not a stable format, and readers in other languages need a normative definition.
+- **Location expressions as bytecode (like DWARF).** Rejected in favor of a closed set of kinds plus `OPTIMIZED_OUT`. This costs some coverage of optimized code in exchange for simple and fast readers.
+- **Apple-style compact unwind alone.** Rejected: it is not precise at arbitrary instructions and depends on DWARF for fallbacks. CUD adds prologue and epilogue information and a table-based escape mode.
+- **Emitting SDI in the linker from the compiler's in-memory `TypePool`.** Rejected: it only works for single-process whole-program builds.
 
 ## 8. Open questions
 
 1. Should line rows be delta-compressed (with a sorted block index) in v1, or kept as raw 24-byte rows until size is measured?
 2. Should SDI optionally live in a separate file (`.sdi`) next to stripped release images, keyed by build-id?
 3. Should DWARF in foreign C objects be converted to SDI at link time so that whole-program symbolication works on Todhchai, and at what cost?
-4. What is the RISC-V register for the async context, and does it change the CUD canonical prologue shapes? (Depends on [04](04-backend.md).)
+4. What is the RISC-V register for the async context, and does it change the CUD canonical prologue shapes? (Depends on [11](11-generics-and-runtime-metadata.md) §8, open question 2.)
 5. What is the policy for data formatters when stdlib storage layouts change, and how are their versions recorded in SDI?

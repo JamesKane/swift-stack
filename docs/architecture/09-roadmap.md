@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [14](14-measurement-methodology.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [03](03-intermediate-representation.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md), [15](15-driver-and-diagnostics.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
@@ -24,7 +24,7 @@ An earlier draft scheduled everything through self-hosting in 25 weeks. That sch
 
 - Calendar commitments before M0 baselines exist.
 
-## 4. Module Graph and Repository Layout
+## 4. Module graph and repository layout
 
 ### 4.1 Swift package modules
 
@@ -72,6 +72,7 @@ swift-stack/
 Each milestone lists its deliverables and its **exit criteria**. A milestone is done only when its exit criteria are met, and the D6 determinism check ([14](14-measurement-methodology.md) §9) passes for everything it produces.
 
 ### M0 — Foundation and measurement
+
 - **Deliverables:**
   - `Column`/arena infrastructure ([00](00-overview-and-principles.md));
   - `SourceManager`;
@@ -85,6 +86,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - CI instruction-count gating live.
 
 ### M1 — C23 frontend
+
 - **Deliverables:**
   - C23 preprocessor, including `#embed` and the host-header profile (D7);
   - C parser into the postorder ParseTree;
@@ -96,8 +98,9 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - the c-testsuite accept/reject set matches Clang.
 
 ### M2 — Encoders, object model, assemblers
+
 - **Deliverables:**
-  - `Encode` for x86-64, then AArch64, then RV64, with a disassembler;
+  - `Encode` for x86-64 (including VEX), then AArch64, then RV64 (RVA23 extensions), with a disassembler;
   - `Object` with ELF relocatable read/write;
   - AT&T-syntax x86-64 assembler, AArch64 and RV64 assemblers, `.S` preprocessing ([05](05-assembler.md)).
 - **Exit:**
@@ -105,6 +108,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - encoder/disassembler round-trip is exhaustive over the instruction tables.
 
 ### M3 — C end-to-end at `-O0` (x86-64)
+
 - **Deliverables:**
   - C lowering to AIR ([03](03-intermediate-representation.md));
   - LIR, SSA linear-scan register allocation, x86-64 code generation ([04](04-backend.md));
@@ -117,6 +121,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - `ssdb` symbolizes a crash backtrace.
 
 ### M4 — Tier 0 Swift
+
 - **Deliverables:**
   - Swift parser;
   - name resolution and operator folding ([10](10-semantic-ir-and-name-resolution.md));
@@ -131,7 +136,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
     - `_Volatile`;
     - `-no-allocations`, `-Osize`;
   - full monomorphization ([11](11-generics-and-runtime-metadata.md));
-  - Embedded stdlib compiled from upstream sources ([12](12-standard-library-strategy.md));
+  - Embedded stdlib compiled from upstream sources, pinned to Swift 6.4 ([12](12-standard-library-strategy.md));
   - Tier 0 runtime ([08](08-runtime-and-stdlib.md)).
 - **Exit:**
   - Todhchai's Tier 0 components (`userboot`, `devmgr`, `fs`) behave identically to builds made with `swiftc -enable-experimental-feature Embedded`;
@@ -142,8 +147,9 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - Todhchai's Swift libc (`@c(memcpy)` and friends) does not compile into self-calls ([17](17-simd-and-vectorization.md) §5.5).
 
 ### M5 — Optimizer and remaining backends
+
 - **Deliverables:**
-  - the core and Swift-specific optimization passes, including loop idiom recognition ([03](03-intermediate-representation.md));
+  - the core, interprocedural and Swift-specific optimization passes, including loop idiom recognition ([03](03-intermediate-representation.md));
   - AArch64 and RV64 code generation;
   - portable SIMD (D9): AIR vector operations, per-target legalization tables, vector register classes, VEX SSE4.2/AVX, NEON and RVV encodings at the D9 baselines ([17](17-simd-and-vectorization.md));
   - Linux AArch64 and RV64 targets.
@@ -153,6 +159,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - the parity hypothesis confirmed, or the gap documented per category with a decision recorded in [00](00-overview-and-principles.md).
 
 ### M6 — Tier 1 Swift
+
 - **Deliverables:**
   - runtime metadata, witness tables, existentials, dynamic casts ([11](11-generics-and-runtime-metadata.md));
   - Tier 1 runtime;
@@ -168,6 +175,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - separate compilation across modules works through `.ssmodule`.
 
 ### M7 — Concurrency and macOS
+
 - **Deliverables:**
   - async lowering;
   - executor backends (croi port, `kqueue`, `epoll`) ([08](08-runtime-and-stdlib.md));
@@ -178,6 +186,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - Todhchai shell components (Tracker, Deskbar, Terminal) build and run.
 
 ### M8 — Self-hosting
+
 - **Deliverables:** Swift-Stack builds itself.
 - **Exit:**
   - Stage 2 (built by the Swift-Stack-built compiler) and stage 3 are bitwise identical (D6);
@@ -197,7 +206,7 @@ This track is not on the critical path and has no milestone dependency after M5 
 
 SLP vectorization is a later follow-on on the same track.
 
-## 6. Verification Strategy
+## 6. Verification strategy
 
 ### 6.1 Differential testing
 
@@ -214,6 +223,7 @@ Source ──┬──► oracle (swiftc / clang / GNU as / ld.lld) ──► ar
 | Swift execution | `swiftc` | stdout, exit code. Sources: the executable subset of the upstream Swift test suite (`test/Interpreter` and similar; most of `test/` checks compiler output and is not usable directly) plus project tests |
 | C frontend and execution | Clang | Accept/reject; stdout and exit code for c-testsuite, GCC torture `execute` tests (fetched, GPL, run as data), SQLite tests |
 | C random programs | Clang, GCC | Csmith and YARPGen generated programs: checksum output. Run continuously, not per commit. |
+| Portable SIMD | `swiftc` | Per-operation results for every `SIMDn` operation and element type at each ISA baseline ([17](17-simd-and-vectorization.md) §6) |
 | Assembler | GNU `as` / `llvm-mc` | Section bytes and relocations |
 | Linker | `ld.lld` | Program behavior. `readelf`/`llvm-readobj` structural validation. Bytes are not compared, since layout legitimately differs. |
 | Debug info | DWARF from Clang where applicable | Line tables and variable locations at sampled PCs |
@@ -235,7 +245,7 @@ Floating-point differences are triaged under the policy in [14](14-measurement-m
 
 See [14](14-measurement-methodology.md) §9.
 
-## 7. Open Questions
+## 7. Open questions
 
 1. Should the macOS target move earlier, since it's a common developer host? Swift-Stack can run on macOS (built by `swiftc`) long before it can *target* macOS.
 2. Is Linux the right first host target, or should FreeBSD come first to match Todhchai's developer environment?

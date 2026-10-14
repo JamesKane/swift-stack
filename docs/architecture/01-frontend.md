@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [14](14-measurement-methodology.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [14](14-measurement-methodology.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
 | **Consumed by** | [02](02-semantic-analysis.md), [05](05-assembler.md), [10](10-semantic-ir-and-name-resolution.md) |
 
 ## 1. Summary
@@ -13,16 +13,16 @@ The frontend turns raw source bytes into two flat, index-addressed structures pe
 - a **`TokenBuffer`**: struct-of-arrays (SoA) columns, 10 bytes per token;
 - a **`ParseTree`**: postorder SoA columns, 9 bytes per node, in the style of the Carbon toolchain.
 
-A *compilation unit* here is one Swift source file, or one C translation unit (a `.c` file plus everything it `#include`s). Units are lexed and parsed independently and in parallel. No per-token or per-node heap allocation happens. Persistent columns use the arena-backed `Column<T>` type (decision D8, [00 §Memory](00-overview-and-principles.md)).
+A *compilation unit* here is one Swift source file, or one C translation unit (a `.c` file plus everything it `#include`s). Units are lexed and parsed independently and in parallel. No per-token or per-node heap allocation happens. Persistent columns use the arena-backed `Column<T>` type (decision D8, [00 §6, Principle 2](00-overview-and-principles.md)).
 
 ```
 Source file bytes
        │  read into page-aligned buffer + 64 zero bytes of padding
        ▼
- SourceManager ──────────────► location space (per unit; §2.3)
+ SourceManager ──────────────► location space (per unit; §4.3)
        │
        ▼  SWAR / table-driven scanning
- TokenBuffer (SoA) ◄── C23 preprocessor (C units only; §4)
+ TokenBuffer (SoA) ◄── C23 preprocessor (C units only; §4.5)
        │
        ▼  explicit-stack recursive descent + Pratt (C), sequence parsing (Swift)
  ParseTree (SoA, postorder)   [kind: u8 | token: u32 | subtreeSize: u32]
@@ -85,7 +85,7 @@ Each location space is a sorted table of **location entries**. This follows Clan
 
 Mapping a location to its entry is a binary search over entry start offsets. Diagnostics show both the expansion location ("in expansion of macro `FOO`") and the spelling location.
 
-- **Budget.** A unit's location space is limited to 2³² − 1 bytes (4 GiB), counting all included file bytes and all expansion ranges. A Swift unit uses only its file size. A C unit that exceeds the budget is rejected with a diagnostic; it is never silently truncated. `#embed` payloads do not consume location space, because only the directive is located.
+- **Budget.** A unit's location space is limited to 2³² − 1 bytes (4 GiB), counting all included file bytes and all expansion ranges. A Swift unit uses its file size plus the text of its macro expansion buffers ([16](16-macros.md) §5.3). A C unit that exceeds the budget is rejected with a diagnostic; it is never silently truncated. `#embed` payloads do not consume location space, because only the directive is located.
 - **Cross-unit references.** Anything stored beyond its unit (declarations, debug info, diagnostics after merge) uses `GlobalLocation = (UnitId: UInt32, loc: SourceLocation)`. Tokens and parse nodes store only the 32-bit unit-local form.
 
 ### 4.4 Lexical analysis
@@ -104,7 +104,7 @@ public struct TokenBuffer: ~Copyable {
 - **Footprint.** 10 bytes per token across four separate columns. No column has padding. (An array-of-structs layout would have a stride of 12.)
 - **Token kinds.** Each language has its own `TokenKind` enum, because a unit is only ever Swift, C, or assembly ([05](05-assembler.md)).
   - Swift *contextual* keywords (`get`, `set`, `async`, `some`, …) are lexed as identifiers and recognized by the parser. This keeps each enum comfortably below 256 values.
-- **Locations of macro-expanded tokens.** For tokens produced by macro expansion, `starts`/`ends` fall inside an `expansion` entry, and the spelling is recovered through that entry (§4.3).
+- **Locations of macro-expanded tokens.** For tokens produced by C macro expansion, `starts`/`ends` fall inside an `expansion` entry, and the spelling is recovered through that entry (§4.3). Tokens lexed from a Swift macro expansion buffer fall inside its `macroExpansion` entry, which links back to the expansion site ([16](16-macros.md) §5.3).
 
 #### Flags
 
@@ -154,7 +154,7 @@ Whitespace and comments are never tokens. Doc comments are found later from the 
 
 The preprocessor runs per C unit and produces that unit's final, post-expansion `TokenBuffer`. The parser never sees directives.
 
-- **Macro table.** Macro definitions live in a unit-local macro arena: name `AtomId` → (parameter count, variadic flag, replacement token range in the macro-token arena, definition location). `#undef` and redefinition follow C23 §6.10.4, including the rule that a redefinition is valid only if it is identical.
+- **Macro table.** Macro definitions live in a unit-local macro arena: name `AtomId` → (parameter count, variadic flag, replacement token range in the macro-token arena, definition location). `#undef` and redefinition follow the C23 macro-replacement rules, including the rule that a redefinition is valid only if it is identical.
 - **Expansion.** Expansion uses a disabled-macro context stack, the standard algorithm that gives the "painted blue" behavior.
   - Arguments are pre-expanded lazily, only when they are used without `#`/`##`.
   - `__VA_OPT__` and `__VA_ARGS__` are supported.
@@ -162,7 +162,7 @@ The preprocessor runs per C unit and produces that unit's final, post-expansion 
   - Expansion streams tokens into the output columns without heap strings.
 - **Conditionals and queries.** `#if`/`#elif` expressions are evaluated in `intmax_t`/`uintmax_t`, following C23 rules. The following are supported: `#ifdef`, `#ifndef`, the C23 additions `#elifdef` and `#elifndef`, `defined`, `__has_include`, `__has_embed`, `__has_c_attribute`, and `#warning`.
 - **Include guards.** The preprocessor detects the include-guard pattern and `#pragma once`, and skips re-entering such files.
-- **`#embed`** (C23 §6.10.4). Full semantics MUST be preserved:
+- **`#embed`** (C23 binary resource inclusion). Full semantics MUST be preserved:
   - The parameters `limit(N)`, `prefix(...)`, `suffix(...)`, and `if_empty(...)` are supported, as are vendor parameters that `__has_embed` reports as unsupported.
   - The resource's bytes go into the module's **BinaryAssetPool**, keyed by file and byte range so that identical resources are stored once. The preprocessor emits `prefix` tokens, then one `EmbedAsset(assetId, offset, count)` token, then `suffix` tokens. If the resource is empty, it emits the `if_empty` tokens instead.
   - **Fast path.** When `EmbedAsset` appears as a run of elements in a brace initializer of an array of character type (or of any integer type whose element conversion is value-preserving), Sem records a reference to the asset slice. No per-byte tokens, nodes, or constants are created.
@@ -179,6 +179,7 @@ To parse glibc, FreeBSD libc, and macOS SDK headers, the preprocessor and parser
   - `__extension__`, `__inline`, `__restrict`, `__typeof__`
   - `_Nullable`, `_Nonnull`, `_Null_unspecified`
   - `__builtin_va_list` and other `__builtin_*` names, plus basic and extended `asm` statements
+  - vector-type attributes `vector_size(N)` and `ext_vector_type(N)`, with `__builtin_shufflevector`/`__builtin_convertvector` ([02](02-semantic-analysis.md) §4.2.5, [17](17-simd-and-vectorization.md) §5.7)
 - **Feature queries:** `__has_feature`, `__has_extension`, `__has_attribute`, and `__has_builtin` answer from one table, which is the single source of truth for the profile.
 - **Predefined macros** are generated per target triple: architecture, OS, sizes, `__STDC_VERSION__ == 202311L`, and the `__STDC_NO_*__` macros for the deferred features listed in [02](02-semantic-analysis.md). Which compiler-identity macros to define (`__GNUC__`, `__clang__`) is an open question (§7).
 - **Blocks.** `__BLOCKS__` is never defined. macOS headers guard their block-based APIs behind it, so those declarations are simply not seen.

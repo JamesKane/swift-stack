@@ -3,13 +3,13 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [04](04-backend.md), [08](08-runtime-and-stdlib.md), [14](14-measurement-methodology.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [04](04-backend.md), [08](08-runtime-and-stdlib.md), [14](14-measurement-methodology.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
-AIR (Arena Intermediate Representation) is the single middle-end IR for both C23 and Swift. It is an SSA form stored as columns of fixed-width integers (`Column<T>`, see [00 §Memory](00-overview-and-principles.md)), allocated from a per-function arena. AIR keeps Swift-level semantics — ownership, ARC, witness dispatch, async — long enough for the optimizer to reason about them, then lowers them to plain loads, stores, and runtime calls before instruction selection ([04](04-backend.md)).
+AIR (Arena Intermediate Representation) is the single middle-end IR for both C23 and Swift. It is an SSA form stored as columns of fixed-width integers (`Column<T>`, see [00 §6, Principle 2](00-overview-and-principles.md)), allocated from a per-function arena. AIR keeps Swift-level semantics — ownership, ARC, witness dispatch, async — long enough for the optimizer to reason about them, then lowers them to plain loads, stores, and runtime calls before instruction selection ([04](04-backend.md)).
 
-The optimizer is deliberately small: a fixed pipeline of well-understood passes chosen to capture most of the runtime performance available from a conventional optimizing compiler. The working hypothesis is that this reaches 80–90% of LLVM `-O2` runtime performance on non-vectorizable workloads; that number is a target to be measured ([14](14-measurement-methodology.md)), not a property of the design.
+The optimizer is deliberately small: a fixed pipeline of well-understood passes chosen to capture most of the runtime performance available from a conventional optimizing compiler. The working hypothesis is that this reaches 80–90% of LLVM `-O2` runtime performance on non-vectorizable workloads; that number is a target to be measured ([14](14-measurement-methodology.md)), not a property of the design. AIR also carries the vector types and operations behind portable SIMD; auto-vectorization is an optional pass on top of them (D9, [17](17-simd-and-vectorization.md)).
 
 ```
 SemIR (doc 10)
@@ -24,10 +24,12 @@ SemIR (doc 10)
        ▼  Mandatory lowering (runs at every -O level)
   - Definite initialization
   - Ownership & borrow verification (~Copyable, consume/borrow)
-  - Static exclusivity diagnostics
-  - Closure lowering (contexts, boxes)
-  - Async coroutine split
+  - Lifetime-dependence checking (~Escapable)
+  - Static exclusivity & region-isolation diagnostics
+  - Deinit insertion, closure lowering, async coroutine split
   - Ownership lowering (copy/destroy -> retain/release)
+  - Performance-annotation checking (@_noAllocation)
+  - Mandatory inlining (@_transparent)
        │
        ▼  Optimization (-O only)
   Interprocedural, bottom-up over call-graph SCCs:
@@ -35,7 +37,7 @@ SemIR (doc 10)
     then the per-function simplification pipeline
   Late, function-parallel:
     ARC optimization, stack promotion, check elimination,
-    LICM & unrolling, cleanup
+    LICM & unrolling, loop idioms, [vectorize], cleanup
        │
        ▼
  LIR / instruction selection (doc 04)
@@ -113,6 +115,8 @@ This form is what the mandatory ownership checks (§4.3) verify.
 
 **Volatile memory.** `air.load` and `air.store` carry a `volatile` flag. It is set by C `volatile` accesses and by the `_Volatile` module's builtins (`VolatileMappedRegister`, used for Todhchai MMIO). Optimizations MUST NOT delete, duplicate, merge, widen, narrow or split a volatile access, and MUST NOT reorder two volatile accesses relative to each other. ADCE treats them as roots, and the vectorizer and loop-idiom pass skip loops that contain them.
 
+**Vectors.** Builtin vector types (`Vec<N × E>`) and their operations (lane-wise arithmetic, masks and `select`, shuffles, reductions, vector loads and stores) are ordinary AIR types and opcodes. They are produced by `SIMDn<T>` code, C vector extensions, and the optional loop vectorizer, and are legalized per target in the backend ([17](17-simd-and-vectorization.md) §5.1–5.2).
+
 **Generics.** `air.witness_method %wt, #Protocol.requirement` loads a requirement from a witness table. `air.metadata` produces a type-metadata reference. In unspecialized (Tier 1) code, values of unknown size are address-only and are handled through value-witness calls. The representation is defined in [11](11-generics-and-runtime-metadata.md).
 
 **Async.** `air.await` marks a suspension point in an `async` function. The coroutine split (§4.3) turns each async function into a sequence of partial functions whose state lives in a heap-allocated async frame. A suspension becomes a tail call into the executor runtime interface ([08 §5](08-runtime-and-stdlib.md)), for example the `swift_task_switch` or `swift_task_enqueue` families ([12 §6](12-standard-library-strategy.md); emitted symbols use the `_SS` scheme). AIR never refers to a specific OS event mechanism. How the executor sleeps (a croi port, kqueue, or epoll) is purely a runtime concern.
@@ -133,7 +137,7 @@ These steps run at every optimization level, including `-Onone`, because they pr
    - it MUST NOT escape through returns, stores, or captures, except into a result whose `@_lifetime` annotation declares the dependence.
 
    `copy x` dependencies inherit the source's own dependencies, and `borrow x` dependencies end when the borrow ends. This runs on the same dataflow framework as step 2.
-4. **Static exclusivity diagnostics.** Accesses that conflict when both are visible in one function are compile-time errors.
+4. **Static exclusivity and isolation diagnostics.** Accesses that conflict when both are visible in one function are compile-time errors. The flow-sensitive part of Swift 6 concurrency checking, region-based isolation (SE-0414), runs here on the same CFG, using the isolation facts from Sem ([02](02-semantic-analysis.md) §4.4).
 5. **Deinit insertion.** For each `~Copyable` value whose lifetime ends without being consumed, the step inserts the destroy (which runs `deinit`) at the end of its lexical lifetime.
 6. **Closure lowering.**
    - Captures become explicit context arguments.
@@ -151,7 +155,7 @@ These steps run at every optimization level, including `-Onone`, because they pr
 
 ### 4.4 Optimization pipeline and scheduling
 
-The optimizer has three groups of passes. The first two run per function in the order listed. Where a pass sits in the schedule matters as much as which passes exist.
+The optimizer has three groups of passes, plus the optional loop vectorizer. The schedule below fixes their order. Where a pass sits in the schedule matters as much as which passes exist.
 
 **Core passes (C and Swift):**
 
@@ -255,7 +259,7 @@ air.strong_release %obj
 
 After the late pipeline, the remaining Swift operations are lowered to plain AIR:
 
-- `strong_retain` and `strong_release` become calls to the runtime's `swift_retain` and `swift_release` entry points (spelled as in [12 §6](12-standard-library-strategy.md); emitted under `_SS` names) (or inline fast paths; see [08](08-runtime-and-stdlib.md)).
+- `strong_retain` and `strong_release` become calls to the runtime's `swift_retain` and `swift_release` entry points (spelled as in [12 §6](12-standard-library-strategy.md) and emitted under `_SS` names), or inline fast paths ([08](08-runtime-and-stdlib.md)).
 - Dynamic access markers become calls to the `swift_beginAccess` / `swift_endAccess` runtime entry points ([12 §6](12-standard-library-strategy.md)).
 - `witness_method` becomes a load at a fixed offset into the witness table.
 

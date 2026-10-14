@@ -3,9 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [03](03-intermediate-representation.md), [06](06-linker.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md) |
-
----
+| **Depends on** | [00](00-overview-and-principles.md), [03](03-intermediate-representation.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [13](13-modules-and-incremental-builds.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
@@ -21,7 +19,7 @@ The Swift *standard library* (`Swift` module, FoundationEssentials) is compiled 
 
 ## 2. Goals
 
-- Provide every runtime entry point required by code that Swift-Stack emits and by the upstream stdlib sources it compiles ([12 §5](12-standard-library-strategy.md)).
+- Provide every runtime entry point required by code that Swift-Stack emits and by the upstream stdlib sources it compiles ([12 §6](12-standard-library-strategy.md)).
 - Keep Tier 0 small enough for kernel-adjacent services, drivers, and real-time components on Todhchai.
 - Use one executor abstraction across all targets so async lowering ([03](03-intermediate-representation.md)) never references OS primitives directly.
 - Match the C ABI and TLS ABI of each target exactly (D1), so C code compiled by other toolchains can be linked in.
@@ -33,9 +31,7 @@ The Swift *standard library* (`Swift` module, FoundationEssentials) is compiled 
 - `libdispatch`. Neither tier depends on it on any target.
 - Windows.
 
----
-
-## 4. Runtime Tiers
+## 4. Runtime tiers
 
 ```
 ┌──────────────────────────────────────┬──────────────────────────────────────┐
@@ -47,7 +43,7 @@ The Swift *standard library* (`Swift` module, FoundationEssentials) is compiled 
 │ - Minimal panic path                 │ - Tasks, jobs, actors, executors     │
 │ Users: drivers, fs, compositor       │ Users: shell, UI kit, tools          │
 ├──────────────────────────────────────┴──────────────────────────────────────┤
-│                      C library & startup (§7, §8)                           │
+│                      C library & startup (§6, §8)                           │
 │ Todhchai: clean-room C23 libc, static  │  Hosts: system libc, dynamic       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -61,8 +57,8 @@ Tier 0 follows the language subset of upstream Embedded Swift. All generics are 
 **"Zero heap allocation" is a profile, not an absolute property of the tier.** Embedded Swift permits class types, which are reference counted and need an allocator. The precise guarantee is:
 
 - Language operations that do not involve class instances, escaping closures, or allocating stdlib APIs (for example `Array` growth) MUST NOT allocate.
-- A module compiled with the `-no-allocations` profile flag MUST be rejected at compile time if it contains any construct that could reach the allocator. The diagnostic names the construct and the call path ([15](15-driver-and-diagnostics.md)). Accepted code is guaranteed allocation-free.
-- Without the flag, Tier 0 code that allocates calls `swift_ss_alloc` / `swift_ss_dealloc` (symbol names are illustrative; final spelling follows the `_SS` scheme in [11](11-generics-and-runtime-metadata.md)). These forward to a hook the program provides; the default hook on Todhchai is the libsys page allocator.
+- A module compiled with the `-no-allocations` profile flag MUST be rejected at compile time if it contains any construct that could reach the allocator. The diagnostic names the construct and the call path. This is the performance-annotation checker applied module-wide ([03](03-intermediate-representation.md) §4.3). Accepted code is guaranteed allocation-free.
+- Without the flag, Tier 0 code that allocates calls the runtime's allocation entry points (the `swift_slowAlloc`/`swift_allocObject` families, [12 §6](12-standard-library-strategy.md); emitted under `_SS` names, [11](11-generics-and-runtime-metadata.md)). These forward to a hook the program provides; the default hook on Todhchai is the libsys page allocator.
 
 What the Tier 0 runtime implements:
 
@@ -72,7 +68,7 @@ What the Tier 0 runtime implements:
 | Refcounting | Non-atomic and atomic retain/release for class instances. Same object header layout as Tier 1, without the side-table extension (weak references are not supported in Tier 0, to be verified against the upstream Embedded subset). |
 | Allocation | Allocator hook (see above). |
 | Memory primitives | `memset`, `memcpy`, `memmove`, `memcmp`, provided by libsys on Todhchai and libc on hosts. |
-| Failure | `swift_ss_fatal`: writes a fixed-format message to the debug port (Todhchai) or `stderr` (hosts) without allocating, then traps. |
+| Failure | The `swift_reportError` / fatal-error family ([12 §6](12-standard-library-strategy.md)): writes a fixed-format message to the debug port (Todhchai) or `stderr` (hosts) without allocating, then traps. |
 | Stack protector | `__stack_chk_guard`, `__stack_chk_fail`. |
 | Entropy | `arc4random_buf` (croi CPRNG on Todhchai; libc on hosts), needed by the stdlib's hashing seed. |
 
@@ -89,7 +85,7 @@ Tier 1 is the runtime for general user-space code. It implements the following f
 | **Conformances** | Protocol conformance lookup for dynamic casts and generic instantiation. The linker emits a sorted conformance table per image ([06](06-linker.md)); lookup is a binary search plus a cache. Conditional conformances are evaluated at instantiation time. |
 | **Existentials** | Opaque, class, and metatype existential containers; boxing of values that don't fit the inline buffer; projection and copy via value witnesses. |
 | **Dynamic casts** | `as?`, `as!`, `is` across classes, existentials, metatypes, `Optional`, and the collection bridges required by the stdlib. Cast semantics MUST match swiftc for supported types (D5). |
-| **Exclusivity** | Dynamic exclusivity checking for class properties, globals, and escaping closures. Per-thread access set, with a fast path for the common no-conflict case. Can be disabled per module in release builds, matching swiftc's `-enforce-exclusivity=unchecked`. |
+| **Exclusivity** | Dynamic exclusivity checking for class properties, globals, and escaping closures. Per-thread access set, with a fast path for the common no-conflict case. Can be disabled per module with `-enforce-exclusivity=unchecked`, as in swiftc ([03](03-intermediate-representation.md) §4.4). |
 | **Concurrency** | Task allocation (a task-local slab allocator), jobs, task groups, cancellation, task-local values, continuations, the default actor implementation, and the executor interface in §5. |
 | **Errors & failure** | `fatalError` and precondition failures, error existential boxing (for untyped `throws`), and backtrace capture on crash using the unwinder ([07](07-debugging-and-sdi.md)). |
 | **Reflection** | The field metadata needed by `Mirror` and by `print`/`debugPrint` of arbitrary values, as used by the upstream stdlib. |
@@ -97,13 +93,11 @@ Tier 1 is the runtime for general user-space code. It implements the following f
 
 The runtime is written in Swift (Tier 0 profile, so it cannot depend on itself) plus a small amount of C23 and assembly: context switching, atomics fallbacks, and the startup floor.
 
----
-
-## 5. Executor Interface & Port-Driven Concurrency
+## 5. Executor interface and port-driven concurrency
 
 ### 5.1 OS-agnostic interface
 
-Async lowering in AIR ([03](03-intermediate-representation.md)) emits calls only to the task and job runtime. That runtime enqueues work through a single executor interface, and OS-specific code exists only behind it:
+Async lowering in AIR ([03](03-intermediate-representation.md)) emits calls only to the task and job runtime (the `swift_task_*` entry-point families, [12 §6](12-standard-library-strategy.md)). That runtime enqueues work through a single executor interface, and OS-specific code exists only behind it:
 
 ```swift
 /// Implemented once per OS backend. All functions are thread-safe.
@@ -156,9 +150,7 @@ croi microkernel event sources
 
 Timer coalescing, run-queue design, and the worker-count policy are shared. Backend behaviour MUST be observably identical: the same task ordering guarantees and the same cancellation semantics.
 
----
-
-## 6. Process Startup
+## 6. Process startup
 
 ### 6.1 Todhchai: the system floor
 
@@ -187,23 +179,19 @@ Hosted executables are dynamically linked against the system C library (§8). Pr
 
 The alternative is shipping Swift-Stack's own `crt` objects for Linux and FreeBSD, which removes the dependency on locating host crt files. This is an open question (§11).
 
----
-
-## 7. Thread-Local Storage
+## 7. Thread-local storage
 
 The linker resolves static TLS offsets for executables ([06](06-linker.md)). The runtime sets up the main thread's TLS block (Todhchai floor) or relies on the system dynamic loader (hosts). Layouts per the ELF TLS ABI:
 
 | Arch | Variant | Thread pointer | Layout |
 |---|---|---|---|
-| x86-64 | II | `%fs` base | `%fs:0` holds the TCB self-pointer. The executable's TLS block sits immediately *below* the thread pointer, at negative offsets. Local-exec access is `mov %fs:-off, %reg`. |
+| x86-64 | II | `%fs` base (on Todhchai the floor sets it with `wrfsbase` when croi enables FSGSBASE, which is in the x86-64 floor ([17](17-simd-and-vectorization.md) §5.4); otherwise through a croi call) | `%fs:0` holds the TCB self-pointer. The executable's TLS block sits immediately *below* the thread pointer, at negative offsets. Local-exec access is `mov %fs:-off, %reg`. |
 | AArch64 | I | `TPIDR_EL0` | The thread pointer addresses a 16-byte TCB. The executable's TLS block starts at `tp + 16`, rounded up to the block's alignment. Local-exec uses `R_AARCH64_TLSLE_*` relocations. |
 | RISC-V 64 | I | `tp` (`x4`) | The thread pointer addresses the start of the executable's TLS block (offset 0). The TCB, if any, lies below `tp`, so there is no gap above it. Local-exec uses `R_RISCV_TPREL_*` relocations. To be verified against the RISC-V ELF psABI for the pinned version. |
 
-Executables use the local-exec model for their own TLS. Hosted executables that reference TLS in shared libraries use initial-exec or general-dynamic as required by the host ABI ([06](06-linker.md)). The Swift runtime uses TLS for the current task, the exclusivity access set, and the current executor.
+Executables use the local-exec model for their own TLS. Hosted executables that reference TLS defined in shared libraries use initial-exec. v1 produces no shared libraries, so general-dynamic is not generated; it appears only in foreign objects, which are handled as described in [06](06-linker.md) §5.5. The Swift runtime uses TLS for the current task, the exclusivity access set, and the current executor.
 
----
-
-## 8. C Library Linkage
+## 8. C library linkage
 
 | Target | C library | Linkage |
 |---|---|---|
@@ -218,8 +206,6 @@ On Todhchai:
 - `pthread_mutex_t` and `pthread_cond_t` are implemented on croi priority-inheritance futexes (`td_futex_wait`, `td_futex_wake`).
 
 C headers for all targets are parsed by Swift-Stack's own C frontend. Host headers require the GNU/Clang host-header profile (D7, [02](02-semantic-analysis.md)).
-
----
 
 ## 9. Testing
 

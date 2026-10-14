@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [09](09-roadmap.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [09](09-roadmap.md), [15](15-driver-and-diagnostics.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
@@ -43,7 +43,7 @@ All values are **targets**. The "Baseline" column records the comparison toolcha
 | B6 | SDI emission, 100K-line program | < 5 ms | `ld.lld` DWARF 5 handling: TBM | Unmeasured |
 | B7 | Stack unwind, 100 frames, frame-pointer path | < 2 µs | libunwind with `.eh_frame`: TBM | Unmeasured |
 | B8 | Peak RSS, 100K-line build | < 256 MB | `swiftc` + LLVM: TBM | Unmeasured |
-| B9 | Runtime performance, optimized | 80–90% of LLVM `-O2` (geomean per category, §7) | `swiftc -O`, `clang -O2` | Hypothesis |
+| B9 | Runtime performance, optimized | 80–90% of `clang -O2` (C) / `swiftc -O` (Swift) (geomean per category, §7) | `swiftc -O`, `clang -O2` | Hypothesis |
 | B10 | Incremental rebuild after body-only edit, 100K-line module | < 200 ms | `swiftc` incremental: TBM | Unmeasured |
 | B11 | Assembling a typical OS stub (`start.S`, context switch) | < 1 ms | GNU `as`, Clang integrated assembler: TBM | Unmeasured |
 | B12 | Macro expansion overhead: plugin start-up, per-expansion round-trip, and cache-hit cost, on the Todhchai `@IPCLibrary` corpus | Per-expansion host overhead (excluding plugin compute) < 0.5 ms; cache hit < 20 µs | `swiftc` with the same plugins: TBM | Unmeasured |
@@ -51,9 +51,9 @@ All values are **targets**. The "Baseline" column records the comparison toolcha
 
 Chapters MAY define finer-grained internal budgets (e.g. AIR instructions optimized per second). They MUST use the same measurement rules.
 
-## 5. Metric Definitions
+## 5. Metric definitions
 
-**Lines.** Non-blank, non-comment physical source lines of the corpus files given on the command line, counted by the corpus tool (`Tests/Bench/count-lines`). Lines from headers and imported modules are reported separately and not counted in lines/s.
+**Lines.** Non-blank, non-comment physical source lines of the corpus files given on the command line, counted by the corpus tool (`Benchmarks/count-lines`). Lines from headers and imported modules are reported separately and not counted in lines/s.
 
 **Throughput (MB/s).** Source bytes processed divided by wall time of that phase alone. Input is already in memory: file I/O is excluded and measured separately as B0 "I/O + mapping". Phase boundaries are instrumented with the compiler's own `--time-phases` output ([15](15-driver-and-diagnostics.md)). For baselines, the closest available stage-limiting flag is used. The comparison is documented as approximate wherever stages don't line up exactly.
 
@@ -79,13 +79,13 @@ Both are reported.
 | `swift-synth` | Generated Swift with controlled mix: declarations, generic code, closures, operator-heavy expressions | B1–B4, B8, type-checker stress |
 | `swift-real` | Swift-Stack's own sources (once self-hosting-capable), selected open-source Swift packages pinned by commit | B1–B4, B8, B10 |
 | `c-real` | SQLite amalgamation, Lua, a pinned c-testsuite snapshot | B1–B4 (C), differential tests |
-| `todhchai` | Pinned snapshot of Todhchai OS sources, assembly stubs, and macro plugins | B5, B6, B11, B12, end-to-end |
+| `todhchai` | Pinned snapshot of Todhchai OS sources, assembly stubs, and macro plugins | B5, B6, B9 (portable-SIMD codec kernels), B11, B12, end-to-end |
 | `runtime-swift` | A subset of the upstream Swift benchmark suite (input per D2) plus project micro-benchmarks | B9 |
 | `runtime-c` | CoreMark, selected Embench programs, SQLite speed test | B9 |
 
 Corpora are pinned by content hash. Changing a corpus resets the regression history for the metrics that use it.
 
-## 7. Runtime Performance (B9)
+## 7. Runtime performance (B9)
 
 - **Categories, reported separately:**
   - Swift scalar compute
@@ -99,9 +99,9 @@ Corpora are pinned by content hash. Changing a corpus resets the regression hist
 - **Comparison flags:** Swift-Stack's optimized mode vs `swiftc -O` (not `-Ounchecked`) and `clang -O2`, same target CPU baseline on both sides ([17](17-simd-and-vectorization.md) §5.4): x86-64 Ivy Bridge-class (`-march=ivybridge` for Clang; the equivalent target CPU for `swiftc`), `armv8-a`, and RVA23 (`-march=rva23u64`).
 - **Floating-point policy:** no fast-math on either side. FMA contraction is disabled on both sides for differential correctness runs. Performance runs record the contraction setting used.
 
-## 8. Measurement Protocol
+## 8. Measurement protocol
 
-- **Reference machines.** At least one x86-64 and one AArch64 machine, specs recorded in `Tests/Bench/machines/`. RV64 is measured opportunistically and not gated.
+- **Reference machines.** At least one x86-64 and one AArch64 machine, specs recorded in `Benchmarks/machines/` ([09](09-roadmap.md) §4.2). RV64 is measured opportunistically and not gated.
 - **Environment:**
   - frequency scaling fixed (performance governor; turbo disabled where possible);
   - benchmark process pinned to isolated cores;
@@ -111,7 +111,7 @@ Corpora are pinned by content hash. Changing a corpus resets the regression hist
   - runtime benchmarks: each benchmark run until its 95% confidence interval is within ±1%, or 30 runs, whichever comes first.
 - **Baselines** are re-measured whenever the comparison toolchain version changes. Versions are recorded alongside results.
 
-## 9. Continuous Integration Gates
+## 9. Continuous integration gates
 
 Wall-clock time on shared CI machines is too noisy to gate on small percentages. CI therefore gates on deterministic proxies and only watches wall time.
 
@@ -125,12 +125,12 @@ Wall-clock time on shared CI machines is too noisy to gate on small percentages.
 
 Intentional regressions are allowed with a commit trailer (`Perf-Regression: <reason>`), which resets the baseline for that metric.
 
-## 10. Alternatives Considered
+## 10. Alternatives considered
 
 - **Gate on wall time per commit.** Rejected: noise on shared hardware exceeds the 2% threshold.
 - **Single aggregate runtime score.** Rejected: hides the category-specific risks in Principle 4.
 
-## 11. Open Questions
+## 11. Open questions
 
 1. Which open-source Swift packages make up `swift-real` before self-hosting is possible?
 2. Do we need a Todhchai-native benchmark harness (running on croi), or are host measurements sufficient until M6?
