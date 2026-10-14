@@ -346,7 +346,7 @@ struct SwiftStackTests {
 
             #expect(tree.count > 10)
 
-            var sem = CSemanticAnalyzer(typePool: TypePool(), sourceBuffer: file.buffer.baseAddress!, sourceLength: file.length)
+            let sem = CSemanticAnalyzer(typePool: TypePool(), sourceBuffer: file.buffer.baseAddress!, sourceLength: file.length)
             let semResult = sem.analyze(tree: tree, tokens: tokenBuffer)
 
             #expect(semResult.functions["add"] != nil)
@@ -608,5 +608,309 @@ struct SwiftStackTests {
             #expect(ssExit == gccExit, "Differential mismatch on \(relPath): ss=\(ssExit), gcc=\(gccExit)")
         }
     }
-}
 
+    @Test("Diagnostics engine bag storage, caret excerpt rendering, and JSON formatting")
+    func testDiagnosticsEngine() {
+        let sm = SourceManager()
+        let code = """
+        int main() {
+            int x = 10
+            return x;
+        }
+        """
+        let fileId = sm.addBuffer(bytes: Array(code.utf8), path: "main.c")
+        let file = sm[fileId]
+
+        var bag = DiagnosticBag()
+        let count0 = bag.count
+        let hasErrors0 = bag.hasErrors
+        #expect(count0 == 0)
+        #expect(!hasErrors0)
+
+        // Add error at line 2, col 15 (after 'int x = 10')
+        let loc = SourceLocation(file.baseLocation.rawValue + 27) // roughly around '10'
+        let noteLoc = SourceLocation(file.baseLocation.rawValue + 4) // around 'main'
+        let note = DiagNote(message: "in function definition", location: GlobalLocation(unitId: UnitId(0), location: noteLoc))
+        let fixIt = DiagFixIt(location: GlobalLocation(unitId: UnitId(0), location: loc), length: 0, replacementText: ";")
+
+        bag.report(.parseExpectedAfter, at: loc, args: [";", "expression"], notes: [note], fixIts: [fixIt])
+
+        let count1 = bag.count
+        let hasErrors1 = bag.hasErrors
+        let errorCount1 = bag.errorCount
+        #expect(count1 == 1)
+        #expect(hasErrors1)
+        #expect(errorCount1 == 1)
+
+        // Render text
+        let textOutput = DiagnosticRenderer.render(diagnostics: bag, sourceManager: sm, format: .text, useColor: false)
+        #expect(textOutput.contains("main.c:"))
+        #expect(textOutput.contains("error: expected ';' after expression [parse.expected_after]"))
+        #expect(textOutput.contains("note: in function definition"))
+        #expect(textOutput.contains("^")) // caret excerpt
+
+        // Render JSON
+        let jsonOutput = DiagnosticRenderer.render(diagnostics: bag, sourceManager: sm, format: .json)
+        #expect(jsonOutput.contains("\"file\":\"main.c\""))
+        #expect(jsonOutput.contains("\"severity\":\"error\""))
+        #expect(jsonOutput.contains("\"id\":\"parse.expected_after\""))
+        #expect(jsonOutput.contains("\"message\":\"expected ';' after expression\""))
+    }
+
+    @Test("C23 Preprocessor macro expansion, directives, conditionals, and #embed")
+    func testCPreprocessor() throws {
+        let sm = SourceManager()
+        let pp = CPreprocessor(sourceManager: sm)
+
+        // 1. Predefined macros check
+        #expect(pp.isMacroDefined("__STDC__"))
+        #expect(pp.isMacroDefined("__STDC_VERSION__"))
+        #expect(pp.isMacroDefined("__x86_64__"))
+        #expect(pp.isMacroDefined("__linux__"))
+
+        // 2. Conditionals evaluation
+        let codeCond = """
+        #if defined(__x86_64__) && 10 > 5
+        int arch = 64;
+        #else
+        int arch = 32;
+        #endif
+
+        #if __has_c_attribute(nodiscard)
+        int has_nodiscard = 1;
+        #endif
+
+        #if __has_builtin(__builtin_expect)
+        int has_expect = 1;
+        #endif
+        """
+        let fCond = sm.addBuffer(bytes: Array(codeCond.utf8), path: "cond.c")
+        var tbCond = TokenBuffer()
+        pp.preprocess(fileId: fCond, into: &tbCond)
+
+        // Verify tokens in output
+        let sfCond = sm[fCond]
+        var tokensCond: [String] = []
+        for i in 1..<Int(tbCond.count) {
+            let tid = TokenId(UInt32(i))
+            let s = tbCond.start(of: tid)
+            let e = tbCond.end(of: tid)
+            let off = Int(s.rawValue - sfCond.baseLocation.rawValue)
+            let len = Int(e.rawValue - s.rawValue)
+            if off >= 0 && len > 0 && off + len <= sfCond.length {
+                tokensCond.append(String(decoding: UnsafeBufferPointer(start: sfCond.buffer.baseAddress! + off, count: len), as: UTF8.self))
+            }
+        }
+        #expect(tokensCond.contains("arch"))
+        #expect(tokensCond.contains("64"))
+        #expect(!tokensCond.contains("32"))
+        #expect(tokensCond.contains("has_nodiscard"))
+        #expect(tokensCond.contains("has_expect"))
+
+        // 3. Macro expansion: function-like, stringizing, token pasting, __VA_OPT__
+        let codeMacros = """
+        #define ADD(a, b) ((a) + (b))
+        #define STR(x) #x
+        #define CONCAT(a, b) a ## b
+        #define LOG(fmt, ...) printf(fmt __VA_OPT__(,) __VA_ARGS__)
+
+        int r1 = ADD(10, 20);
+        char *r2 = STR(hello world);
+        int r3 = CONCAT(foo, bar);
+        LOG("simple");
+        LOG("with args", 1, 2);
+        """
+        let fMacros = sm.addBuffer(bytes: Array(codeMacros.utf8), path: "macros.c")
+        var tbMacros = TokenBuffer()
+        pp.preprocess(fileId: fMacros, into: &tbMacros)
+
+        var macroKinds: [CTokenKind] = []
+        for i in 1..<Int(tbMacros.count) {
+            let tid = TokenId(UInt32(i))
+            macroKinds.append(CTokenKind(rawValue: tbMacros.kind(of: tid))!)
+        }
+        // Check that macro expansions produced expected kinds
+        #expect(macroKinds.contains(.stringLiteral)) // from STR and LOG
+        #expect(macroKinds.contains(.plus))          // from ADD
+
+        // 4. C23 #embed
+        let tempDir = FileManager.default.temporaryDirectory
+        let assetPath = tempDir.appendingPathComponent("test_data.bin").path
+        let assetBytes: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF]
+        try Data(assetBytes).write(to: URL(fileURLWithPath: assetPath))
+        defer { try? FileManager.default.removeItem(atPath: assetPath) }
+
+        let codeEmbed = """
+        const unsigned char data[] = {
+        #embed "\(assetPath)" limit(2) prefix(0xFF,) suffix(,0x00)
+        };
+        """
+        let fEmbed = sm.addBuffer(bytes: Array(codeEmbed.utf8), path: "embed.c")
+        var tbEmbed = TokenBuffer()
+        pp.preprocess(fileId: fEmbed, into: &tbEmbed)
+
+        var hasEmbedAsset = false
+        for i in 1..<Int(tbEmbed.count) {
+            let tid = TokenId(UInt32(i))
+            if CTokenKind(rawValue: tbEmbed.kind(of: tid)) == .embedAsset {
+                hasEmbedAsset = true
+            }
+        }
+        #expect(hasEmbedAsset)
+    }
+
+    @Test("C23 Parser for structs, enums with underlying type, typedefs, designated initializers, and expressions")
+    func testC23Parser() {
+        let sm = SourceManager()
+        let src = """
+        typedef struct Point {
+            int x;
+            int y;
+        } Point_t;
+
+        enum Status : unsigned char {
+            OK = 0,
+            ERROR = 1
+        };
+
+        [[nodiscard]] static inline int compute(Point_t *pt, int bias) {
+            if (!pt) return -1;
+            auto total = pt->x + pt->y * bias;
+            for (int i = 0; i < 10; i++) {
+                total += i;
+            }
+            switch (bias) {
+            case 0: return total;
+            default: break;
+            }
+            return total > 0 ? total : 0;
+        }
+
+        int main() {
+            Point_t p = { .x = 10, .y = 20 };
+            return compute(&p, 2);
+        }
+        """
+        let fId = sm.addBuffer(bytes: Array(src.utf8), path: "c23_test.c")
+        var tb = TokenBuffer()
+        let lexer = CLexer(fileId: fId, buffer: sm[fId].buffer, length: sm[fId].length, baseLocation: sm[fId].baseLocation)
+        lexer.lexInto(&tb)
+
+        let tree = withUnsafePointer(to: tb) { tbPtr in
+            let parser = CParser(tokens: tbPtr, sourceBuffer: sm[fId].buffer.baseAddress!, sourceLength: sm[fId].length)
+            return parser.parse()
+        }
+
+        #expect(tree.count > 10)
+        let rootNode = NodeId(tree.count - 1)
+        let rootKind = tree.kind(of: rootNode)
+        let hasErr = tree.hasError(node: rootNode)
+        #expect(rootKind == .translationUnit)
+        #expect(!hasErr)
+    }
+
+    @Test("C23 Semantic Analysis, TypePool, DeclTable, anonymous structs/unions, typeof, _Generic, and static_assert")
+    func testC23SemanticAnalysisAndSemIR() {
+        let sm = SourceManager()
+        let src = """
+        typedef struct Packet {
+            int tag;
+            union {
+                long i64;
+                struct {
+                    int lo;
+                    int hi;
+                };
+            };
+        } Packet_t, *PacketPtr_t;
+
+        static_assert(sizeof(Packet_t) >= 16, "Packet size check");
+
+        static int process_packet(PacketPtr_t pkt) {
+            typeof(pkt->lo) val = pkt->lo + pkt->hi;
+            int kind = _Generic(val,
+                int: 1,
+                long: 2,
+                default: 0
+            );
+            return val + kind;
+        }
+        """
+        let fId = sm.addBuffer(bytes: Array(src.utf8), path: "sema_c23.c")
+        let pp = CPreprocessor(sourceManager: sm)
+        var tb = TokenBuffer()
+        pp.preprocess(fileId: fId, into: &tb)
+        let ppHasErrors = pp.diagnostics.hasErrors
+        #expect(!ppHasErrors)
+
+        let sf = sm[fId]
+        let tree = withUnsafePointer(to: tb) { tbPtr in
+            let parser = CParser(
+                tokens: tbPtr,
+                sourceBuffer: sf.buffer.baseAddress!,
+                sourceLength: sf.length,
+                sourceManager: sm
+            )
+            return parser.parse()
+        }
+
+        let analyzer = CSemanticAnalyzer(
+            typePool: TypePool(),
+            sourceBuffer: sf.buffer.baseAddress!,
+            sourceLength: sf.length,
+            sourceManager: sm
+        )
+        let semResult = analyzer.analyze(tree: tree, tokens: tb)
+        let semHasErrors = semResult.semModule.diagnosticBag.hasErrors
+        let declCount = semResult.semModule.declTable.count
+        let instBlocksEmpty = semResult.semModule.instBlocks.isEmpty
+        #expect(!semHasErrors)
+        #expect(declCount >= 4)
+        #expect(!instBlocksEmpty)
+    }
+
+    @Test("Host glibc headers preprocess, parse, and type-check cleanly")
+    func testHostGlibcHeaders() {
+        let sm = SourceManager()
+        let src = """
+        #include <stdint.h>
+        #include <stddef.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+
+        int check_headers(const char *s) {
+            size_t n = strlen(s);
+            uint64_t v = (uint64_t)n;
+            return (int)v;
+        }
+        """
+        let fId = sm.addBuffer(bytes: Array(src.utf8), path: "host_headers.c")
+        let pp = CPreprocessor(sourceManager: sm)
+        var tb = TokenBuffer()
+        pp.preprocess(fileId: fId, into: &tb)
+        let ppHasErrors = pp.diagnostics.hasErrors
+        #expect(!ppHasErrors)
+
+        let sf = sm[fId]
+        let tree = withUnsafePointer(to: tb) { tbPtr in
+            let parser = CParser(
+                tokens: tbPtr,
+                sourceBuffer: sf.buffer.baseAddress!,
+                sourceLength: sf.length,
+                sourceManager: sm
+            )
+            return parser.parse()
+        }
+
+        let analyzer = CSemanticAnalyzer(
+            typePool: TypePool(),
+            sourceBuffer: sf.buffer.baseAddress!,
+            sourceLength: sf.length,
+            sourceManager: sm
+        )
+        let semResult = analyzer.analyze(tree: tree, tokens: tb)
+        let semHasErrors = semResult.semModule.diagnosticBag.hasErrors
+        #expect(!semHasErrors)
+    }
+}

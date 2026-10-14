@@ -62,6 +62,26 @@ func main() {
             options.language = .swift
         } else if arg == "--lang=c" {
             options.language = .c
+        } else if arg == "-I" && i + 1 < args.count {
+            i += 1
+            options.includePaths.append(args[i])
+        } else if arg.hasPrefix("-I") {
+            options.includePaths.append(String(arg.dropFirst(2)))
+        } else if arg == "-D" && i + 1 < args.count {
+            i += 1
+            let def = args[i]
+            if let eq = def.firstIndex(of: "=") {
+                options.defines.append((name: String(def[..<eq]), value: String(def[def.index(after: eq)...])))
+            } else {
+                options.defines.append((name: def, value: "1"))
+            }
+        } else if arg.hasPrefix("-D") {
+            let def = String(arg.dropFirst(2))
+            if let eq = def.firstIndex(of: "=") {
+                options.defines.append((name: String(def[..<eq]), value: String(def[def.index(after: eq)...])))
+            } else {
+                options.defines.append((name: def, value: "1"))
+            }
         } else if !arg.hasPrefix("-") {
             options.inputFiles.append(arg)
         } else {

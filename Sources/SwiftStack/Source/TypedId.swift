@@ -124,6 +124,9 @@ public struct TypeId: TypedId {
     public let rawIndex: UInt32
 
     @inlinable
+    public var rawValue: UInt32 { rawIndex }
+
+    @inlinable
     public init(rawIndex: UInt32) {
         self.rawIndex = rawIndex
     }
@@ -133,11 +136,112 @@ public struct TypeId: TypedId {
         self.rawIndex = rawIndex
     }
 
+    @inlinable
+    public init(rawValue: UInt32) {
+        self.rawIndex = rawValue
+    }
+
+    // Reserved slots per 02-semantic-analysis.md §4.1
+    public static let error = TypeId(0)
     public static let void = TypeId(1)
-    public static let int = TypeId(2)
-    public static let long = TypeId(3)
-    public static let char = TypeId(4)
-    public static let pointer = TypeId(5)
+    public static let int1 = TypeId(2)
+    public static let int8 = TypeId(3)
+    public static let int16 = TypeId(4)
+    public static let int32 = TypeId(5)
+    public static let int64 = TypeId(6)
+    public static let int128 = TypeId(7)
+    public static let word = TypeId(8)
+    public static let intLiteral = TypeId(9)
+    public static let float16 = TypeId(10)
+    public static let float32 = TypeId(11)
+    public static let float64 = TypeId(12)
+    public static let float80 = TypeId(13)
+    public static let rawPointer = TypeId(14)
+    public static let nativeObject = TypeId(15)
+
+    // C Types (16-40)
+    public static let bool = TypeId(16)
+    public static let char = TypeId(17)
+    public static let schar = TypeId(18)
+    public static let uchar = TypeId(19)
+    public static let short = TypeId(20)
+    public static let ushort = TypeId(21)
+    public static let int = TypeId(22)
+    public static let uint = TypeId(23)
+    public static let long = TypeId(24)
+    public static let ulong = TypeId(25)
+    public static let longlong = TypeId(26)
+    public static let ulonglong = TypeId(27)
+    public static let float = TypeId(28)
+    public static let double = TypeId(29)
+    public static let longdouble = TypeId(30)
+    public static let nullptr = TypeId(31)
+    public static let cVoid = TypeId(32)
+
+    // Legacy M0.5 compatibility alias
+    public static let pointer = TypeId(33)
+}
+
+/// Declaration handle in DeclTable.
+@frozen
+public struct DeclId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public var rawValue: UInt32 { rawIndex }
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(rawValue: UInt32) {
+        self.rawIndex = rawValue
+    }
+}
+
+/// SemIR Instruction Block handle.
+@frozen
+public struct InstBlockId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public var rawValue: UInt32 { rawIndex }
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// SemIR Instruction handle within an InstBlock.
+@frozen
+public struct SemInstId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public var rawValue: UInt32 { rawIndex }
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
 }
 
 /// Function handle.

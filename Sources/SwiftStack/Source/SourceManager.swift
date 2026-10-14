@@ -180,7 +180,7 @@ public final class SourceManager: @unchecked Sendable {
         return lock.withLock {
             let fileId = FileId(UInt32(files.count))
             let baseLoc = SourceLocation(nextBaseLocation)
-            nextBaseLocation += UInt32(length)
+            nextBaseLocation += UInt32(length + 1)
             let sourceFile = SourceFile(
                 id: fileId,
                 path: path,
@@ -240,7 +240,7 @@ public final class SourceManager: @unchecked Sendable {
         return lock.withLock {
             let fileId = FileId(UInt32(files.count))
             let baseLoc = SourceLocation(nextBaseLocation)
-            nextBaseLocation += UInt32(bytesRead)
+            nextBaseLocation += UInt32(bytesRead + 1)
             let sourceFile = SourceFile(
                 id: fileId,
                 path: path,
@@ -261,7 +261,7 @@ public final class SourceManager: @unchecked Sendable {
                 guard file.id.isValid else { continue }
                 let start = file.baseLocation.rawValue
                 let end = start + UInt32(file.length)
-                if loc >= start && loc <= end {
+                if (loc >= start && loc < end) || (file.length == 0 && loc == start) {
                     return (file, loc - start)
                 }
             }

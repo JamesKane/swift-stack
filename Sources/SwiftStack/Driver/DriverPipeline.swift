@@ -25,6 +25,8 @@ public struct DriverOptions {
     public var profilePath: String? = nil
     public var language: SourceLanguage? = nil
     public var benchRepetition: Bool = false
+    public var includePaths: [String] = []
+    public var defines: [(name: String, value: String)] = []
 
     public init() {}
 }
@@ -150,12 +152,38 @@ public final class DriverPipeline {
             return 0
         }
 
-        // For M0.5 slice, process the primary C unit
+        // For M0.5 / M1 slice, process the primary C unit
         let cFile = loadedFiles.first { $0.1 == .c }!
         let sourceFile = sourceManager[cFile.0]
         guard let sourcePtr = sourceFile.buffer.baseAddress else { return 1 }
 
-        return try withUnsafePointer(to: tokenBuffer) { tokPtr in
+        // Phase 1.5: Preprocessing
+        var parseTokens = TokenBuffer()
+        let pp = CPreprocessor(sourceManager: sourceManager)
+        pp.includePaths.append(contentsOf: options.includePaths)
+        for def in options.defines {
+            pp.defineMacro(def.name, replacement: def.value)
+        }
+        let p15_start = ss_monotonic_time_ns()
+        Profiler.shared.timeBlock(name: "Phase 1.5: Preprocessing", category: "frontend") {
+            pp.preprocess(fileId: cFile.0, into: &parseTokens)
+        }
+        let p15_end = ss_monotonic_time_ns()
+        let p15_dur = Double(p15_end - p15_start) / 1_000_000_000.0
+        phaseTimings.append(PhaseTiming(
+            name: "Preprocessing",
+            durationSeconds: p15_dur,
+            bytesProcessed: totalBytes,
+            itemsProcessed: Int(parseTokens.count)
+        ))
+
+        if pp.diagnostics.errorCount > 0 {
+            let rendered = DiagnosticRenderer.render(diagnostics: pp.diagnostics, sourceManager: sourceManager)
+            FileHandle.standardError.write(Data(rendered.utf8))
+            return 1
+        }
+
+        return try withUnsafePointer(to: parseTokens) { tokPtr in
             // Phase 2: Parsing (ParseTree)
             var pTree: ParseTree? = nil
             let p2_start = ss_monotonic_time_ns()
@@ -163,7 +191,8 @@ public final class DriverPipeline {
                 let parser = CParser(
                     tokens: tokPtr,
                     sourceBuffer: sourcePtr,
-                    sourceLength: sourceFile.length
+                    sourceLength: sourceFile.length,
+                    sourceManager: sourceManager
                 )
                 pTree = parser.parse()
             }
@@ -182,27 +211,43 @@ public final class DriverPipeline {
             self.parseTreeCommittedBytes = tree.bytesCommitted
             self.parseTreeReservedBytes = tree.bytesReserved
 
-            if tree.count > 1 && tree.hasError(node: NodeId(tree.count - 1)) {
-                FileHandle.standardError.write(Data("Parse error: source contains syntax errors or unsupported constructs\n".utf8))
-                return 1
-            }
-
             if options.dumpStage == "parse-tree" {
                 dumpParseTree(tree: tree)
                 return 0
             }
 
-            // Phase 3: Semantic Analysis / Minimal Type Checking
+            if tree.count > 1 && tree.hasError(node: NodeId(tree.count - 1)) {
+                var detail = ""
+                for i in 1..<Int(tree.count) {
+                    let nid = NodeId(UInt32(i))
+                    if tree.kind(of: nid) == .errorNode || (tree.hasError(node: nid) && tree.subtreeSize(of: nid) == 1) {
+                        let tid = tree.token(of: nid)
+                        if tid.isValid {
+                            let loc = parseTokens.start(of: tid)
+                            if let (f, off) = sourceManager.file(containing: loc) {
+                                let (line, col) = f.lineTable().lineAndColumn(at: off)
+                                detail = " at \(f.path):\(line):\(col)"
+                            }
+                        }
+                        break
+                    }
+                }
+                FileHandle.standardError.write(Data("Parse error: source contains syntax errors or unsupported constructs\(detail)\n".utf8))
+                return 1
+            }
+
+            // Phase 3: Semantic Analysis / SemIR
             let typePool = TypePool()
             var sem: SemResult? = nil
             let p3_start = ss_monotonic_time_ns()
             Profiler.shared.timeBlock(name: "Phase 3: Semantic Analysis", category: "sem") {
-                var analyzer = CSemanticAnalyzer(
+                let analyzer = CSemanticAnalyzer(
                     typePool: typePool,
                     sourceBuffer: sourcePtr,
-                    sourceLength: sourceFile.length
+                    sourceLength: sourceFile.length,
+                    sourceManager: sourceManager
                 )
-                sem = analyzer.analyze(tree: tree, tokens: tokenBuffer)
+                sem = analyzer.analyze(tree: tree, tokens: parseTokens)
             }
             let p3_end = ss_monotonic_time_ns()
             let p3_dur = Double(p3_end - p3_start) / 1_000_000_000.0
@@ -215,11 +260,15 @@ public final class DriverPipeline {
             ))
 
             guard let semRes = sem else { return 1 }
-            if !semRes.diagnostics.isEmpty {
-                for diag in semRes.diagnostics {
-                    FileHandle.standardError.write(Data("Semantic error: \(diag)\n".utf8))
-                }
+            if semRes.semModule.diagnosticBag.errorCount > 0 {
+                let rendered = DiagnosticRenderer.render(diagnostics: semRes.semModule.diagnosticBag, sourceManager: sourceManager)
+                FileHandle.standardError.write(Data(rendered.utf8))
                 return 1
+            }
+
+            if options.dumpStage == "sem-ir" {
+                dumpSemIR(sem: semRes)
+                return 0
             }
 
             if semRes.functionOrder.isEmpty {
@@ -229,6 +278,7 @@ public final class DriverPipeline {
 
             // Phase 4: AIR Lowering
             var airMod: AIRModule? = nil
+            var hasLoweringError = false
             let p4_start = ss_monotonic_time_ns()
             withUnsafePointer(to: tree) { treePtr in
                 Profiler.shared.timeBlock(name: "Phase 4: AIR Lowering", category: "air") {
@@ -241,6 +291,7 @@ public final class DriverPipeline {
                         sourceLength: sourceFile.length
                     )
                     airMod = lowering.lower()
+                    hasLoweringError = lowering.hasLoweringError
                 }
             }
             let p4_end = ss_monotonic_time_ns()
@@ -252,6 +303,11 @@ public final class DriverPipeline {
                 bytesProcessed: totalBytes,
                 itemsProcessed: airInstCount
             ))
+
+            if hasLoweringError {
+                FileHandle.standardError.write(Data("Error: unsupported construct in backend lowering\n".utf8))
+                return 1
+            }
 
             guard let module = airMod else { return 1 }
             self.airInstructionCount = module.totalInstructions
@@ -451,6 +507,10 @@ public final class DriverPipeline {
             let kindStr = "\(k)".padding(toLength: 20, withPad: " ", startingAt: 0)
             print(String(format: "%5d | %@ | %7d | %11d | %@", i, kindStr, t, sz, err ? "YES" : "no"))
         }
+    }
+
+    public func dumpSemIR(sem: SemResult) {
+        sem.semModule.dump()
     }
 
     public func dumpAIR(module: borrowing AIRModule) {

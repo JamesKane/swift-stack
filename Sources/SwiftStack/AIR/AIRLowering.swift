@@ -9,6 +9,7 @@ public struct AIRLowering {
     private let typePool: TypePool
     private let sourceBuffer: UnsafePointer<UInt8>
     private let sourceLength: Int
+    public private(set) var hasLoweringError: Bool = false
 
     public init(
         tree: UnsafePointer<ParseTree>,
@@ -55,7 +56,7 @@ public struct AIRLowering {
                 if !pName.isEmpty, let sym = lookupParam(pName, in: sig) {
                     let pVal = ValueId.instResult(airFn.appendInstruction(
                         opcode: .param,
-                        type: sym.type,
+                        type: sym.type.typeId,
                         aux: UInt32(idx),
                         inBlock: currentBlock
                     ))
@@ -101,7 +102,7 @@ public struct AIRLowering {
         for (idx, pName) in sig.paramNames.enumerated() where pName == name {
             let ty = sig.paramTypes[idx]
             let offset: Int32 = -Int32(idx + 1) * 8
-            return CSymbol(name: name, type: ty, storage: .param(index: idx, offset: offset))
+            return CSymbol(name: name, type: QualType(typeId: ty), storage: .param(index: idx, offset: offset))
         }
         return nil
     }
@@ -335,11 +336,13 @@ public struct AIRLowering {
                     )
                     let loadInst = airFn.appendInstruction(
                         opcode: .load,
-                        type: sym.type,
+                        type: sym.type.typeId,
                         op0: ValueId.instResult(ptrInst),
                         inBlock: currentBlock
                     )
                     return ValueId.instResult(loadInst)
+                case .global:
+                    hasLoweringError = true
                 default:
                     break
                 }
@@ -485,14 +488,14 @@ public struct AIRLowering {
             if opKind == .plus {
                 if typePool.isPointer(type: t0) {
                     let elem = typePool.pointeeType(of: t0)
-                    let sz = typePool.size(of: elem)
+                    let sz = typePool.size(of: elem.typeId)
                     if sz > 1 {
                         let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
                         v1 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v1, op1: szVal, inBlock: currentBlock))
                     }
                 } else if typePool.isPointer(type: t1) {
                     let elem = typePool.pointeeType(of: t1)
-                    let sz = typePool.size(of: elem)
+                    let sz = typePool.size(of: elem.typeId)
                     if sz > 1 {
                         let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
                         v0 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v0, op1: szVal, inBlock: currentBlock))
@@ -501,7 +504,7 @@ public struct AIRLowering {
             } else if opKind == .minus {
                 if typePool.isPointer(type: t0) && typePool.isPointer(type: t1) {
                     let elem = typePool.pointeeType(of: t0)
-                    let sz = typePool.size(of: elem)
+                    let sz = typePool.size(of: elem.typeId)
                     let diff = airFn.appendInstruction(opcode: .sub, type: .int, op0: v0, op1: v1, inBlock: currentBlock)
                     if sz > 1 {
                         let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
@@ -511,7 +514,7 @@ public struct AIRLowering {
                     return ValueId.instResult(diff)
                 } else if typePool.isPointer(type: t0) {
                     let elem = typePool.pointeeType(of: t0)
-                    let sz = typePool.size(of: elem)
+                    let sz = typePool.size(of: elem.typeId)
                     if sz > 1 {
                         let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
                         v1 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v1, op1: szVal, inBlock: currentBlock))

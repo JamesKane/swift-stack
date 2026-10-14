@@ -82,8 +82,26 @@ public struct CLexer: ~Copyable {
         while cursor < end {
             let b = cursor.pointee
 
-            // Whitespace
-            if b == 0x20 || b == 0x09 {
+            // Backslash-newline line continuation (ISO C Translation Phase 2)
+            if b == 0x5C {
+                var look = cursor + 1
+                while look < end && (look.pointee == 0x20 || look.pointee == 0x09) {
+                    look += 1
+                }
+                if look < end && look.pointee == 0x0A {
+                    cursor = look + 1
+                    continue
+                } else if look < end && look.pointee == 0x0D {
+                    cursor = look + 1
+                    if cursor < end && cursor.pointee == 0x0A {
+                        cursor += 1
+                    }
+                    continue
+                }
+            }
+
+            // Whitespace (space, horizontal tab, vertical tab, form feed)
+            if b == 0x20 || b == 0x09 || b == 0x0B || b == 0x0C {
                 hasLeadingSpace = true
                 cursor += 1
                 while cursor + 8 <= end {
@@ -186,29 +204,66 @@ public struct CLexer: ~Copyable {
 
             case .digit:
                 cursor += 1
+                var isHex = false
                 if b == 0x30 /* '0' */ && cursor < end {
                     let next = cursor.pointee
-                    if next == 0x78 /* 'x' */ || next == 0x58 /* 'X' */ || next == 0x62 /* 'b' */ || next == 0x42 /* 'B' */ {
+                    if next == 0x78 /* 'x' */ || next == 0x58 /* 'X' */ {
+                        isHex = true
+                        cursor += 1
+                    } else if next == 0x62 /* 'b' */ || next == 0x42 /* 'B' */ {
                         cursor += 1
                     }
                 }
+                var isFloat = false
                 while cursor < end {
                     let c = cursor.pointee
-                    if (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A) || c == 0x27 /* '\'' */ {
+                    if (c >= 0x30 && c <= 0x39) || c == 0x27 /* '\'' */ {
+                        cursor += 1
+                    } else if isHex && ((c >= 0x61 && c <= 0x66) || (c >= 0x41 && c <= 0x46)) {
                         cursor += 1
                     } else {
                         break
                     }
                 }
-                if cursor + 1 < end && cursor.pointee == 0x2E /* '.' */ && cursor[1] >= 0x30 && cursor[1] <= 0x39 {
-                    tokenKind = 3 // floatLiteral
-                    cursor += 2
-                    while cursor < end && ((cursor.pointee >= 0x30 && cursor.pointee <= 0x39) || cursor.pointee == 0x27) {
+                if cursor < end && cursor.pointee == 0x2E /* '.' */ {
+                    if cursor + 1 >= end || cursor[1] != 0x2E {
+                        isFloat = true
                         cursor += 1
+                        while cursor < end {
+                            let c = cursor.pointee
+                            if (c >= 0x30 && c <= 0x39) || c == 0x27 {
+                                cursor += 1
+                            } else if isHex && ((c >= 0x61 && c <= 0x66) || (c >= 0x41 && c <= 0x46)) {
+                                cursor += 1
+                            } else {
+                                break
+                            }
+                        }
                     }
-                } else {
-                    tokenKind = 2 // intLiteral
                 }
+                if cursor < end {
+                    let c = cursor.pointee
+                    let isExp = isHex ? (c == 0x70 /* 'p' */ || c == 0x50 /* 'P' */) : (c == 0x65 /* 'e' */ || c == 0x45 /* 'E' */)
+                    if isExp {
+                        isFloat = true
+                        cursor += 1
+                        if cursor < end && (cursor.pointee == 0x2B /* '+' */ || cursor.pointee == 0x2D /* '-' */) {
+                            cursor += 1
+                        }
+                        while cursor < end && ((cursor.pointee >= 0x30 && cursor.pointee <= 0x39) || cursor.pointee == 0x27) {
+                            cursor += 1
+                        }
+                    }
+                }
+                while cursor < end {
+                    let c = cursor.pointee
+                    if (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A) || (c >= 0x30 && c <= 0x39) || c == 0x5F {
+                        cursor += 1
+                    } else {
+                        break
+                    }
+                }
+                tokenKind = isFloat ? 3 : 2
 
             case .quote:
                 cursor += 1
@@ -303,6 +358,28 @@ public struct CLexer: ~Copyable {
                 if cursor + 1 < end && cursor.pointee == 0x2E && cursor[1] == 0x2E {
                     cursor += 2
                     tokenKind = 95 // ellipsis
+                } else if cursor < end && cursor.pointee >= 0x30 && cursor.pointee <= 0x39 {
+                    while cursor < end && ((cursor.pointee >= 0x30 && cursor.pointee <= 0x39) || cursor.pointee == 0x27) {
+                        cursor += 1
+                    }
+                    if cursor < end && (cursor.pointee == 0x65 /* 'e' */ || cursor.pointee == 0x45 /* 'E' */) {
+                        cursor += 1
+                        if cursor < end && (cursor.pointee == 0x2B || cursor.pointee == 0x2D) {
+                            cursor += 1
+                        }
+                        while cursor < end && ((cursor.pointee >= 0x30 && cursor.pointee <= 0x39) || cursor.pointee == 0x27) {
+                            cursor += 1
+                        }
+                    }
+                    while cursor < end {
+                        let c = cursor.pointee
+                        if (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A) {
+                            cursor += 1
+                        } else {
+                            break
+                        }
+                    }
+                    tokenKind = 3 // floatLiteral
                 } else {
                     tokenKind = 69 // period
                 }
@@ -478,6 +555,7 @@ public struct CLexer: ~Copyable {
             if ptr[0] == 0x75 && ptr[1] == 0x6E && ptr[2] == 0x69 && ptr[3] == 0x6F && ptr[4] == 0x6E { return 39 } // union
             if ptr[0] == 0x77 && ptr[1] == 0x68 && ptr[2] == 0x69 && ptr[3] == 0x6C && ptr[4] == 0x65 { return 43 } // while
             if ptr[0] == 0x66 && ptr[1] == 0x61 && ptr[2] == 0x6C && ptr[3] == 0x73 && ptr[4] == 0x65 { return 49 } // false
+            if ptr[0] == 0x5F && ptr[1] == 0x42 && ptr[2] == 0x6F && ptr[3] == 0x6F && ptr[4] == 0x6C { return 47 } // _Bool
         case 6:
             if ptr[0] == 0x64 && ptr[1] == 0x6F && ptr[2] == 0x75 && ptr[3] == 0x62 && ptr[4] == 0x6C && ptr[5] == 0x65 { return 18 } // double
             if ptr[0] == 0x65 && ptr[1] == 0x78 && ptr[2] == 0x74 && ptr[3] == 0x65 && ptr[4] == 0x72 && ptr[5] == 0x6E { return 21 } // extern
@@ -495,18 +573,52 @@ public struct CLexer: ~Copyable {
             if ptr[0] == 0x6E && ptr[1] == 0x75 && ptr[2] == 0x6C && ptr[3] == 0x6C && ptr[4] == 0x70 && ptr[5] == 0x74 && ptr[6] == 0x72 { return 51 } // nullptr
             if ptr[0] == 0x61 && ptr[1] == 0x6C && ptr[2] == 0x69 && ptr[3] == 0x67 && ptr[4] == 0x6E && ptr[5] == 0x61 && ptr[6] == 0x73 { return 44 } // alignas
             if ptr[0] == 0x61 && ptr[1] == 0x6C && ptr[2] == 0x69 && ptr[3] == 0x67 && ptr[4] == 0x6E && ptr[5] == 0x6F && ptr[6] == 0x66 { return 45 } // alignof
+            if ptr[0] == 0x5F && ptr[1] == 0x41 && ptr[2] == 0x74 && ptr[3] == 0x6F && ptr[4] == 0x6D && ptr[5] == 0x69 && ptr[6] == 0x63 { return 46 } // _Atomic
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x63 && ptr[3] == 0x6F && ptr[4] == 0x6E && ptr[5] == 0x73 && ptr[6] == 0x74 { return 14 } // __const
         case 8:
             if ptr[0] == 0x63 && ptr[1] == 0x6F && ptr[2] == 0x6E && ptr[3] == 0x74 && ptr[4] == 0x69 && ptr[5] == 0x6E && ptr[6] == 0x75 && ptr[7] == 0x65 { return 15 } // continue
             if ptr[0] == 0x72 && ptr[1] == 0x65 && ptr[2] == 0x67 && ptr[3] == 0x69 && ptr[4] == 0x73 && ptr[5] == 0x74 && ptr[6] == 0x65 && ptr[7] == 0x72 { return 29 } // register
             if ptr[0] == 0x72 && ptr[1] == 0x65 && ptr[2] == 0x73 && ptr[3] == 0x74 && ptr[4] == 0x72 && ptr[5] == 0x69 && ptr[6] == 0x63 && ptr[7] == 0x74 { return 30 } // restrict
             if ptr[0] == 0x75 && ptr[1] == 0x6E && ptr[2] == 0x73 && ptr[3] == 0x69 && ptr[4] == 0x67 && ptr[5] == 0x6E && ptr[6] == 0x65 && ptr[7] == 0x64 { return 40 } // unsigned
             if ptr[0] == 0x76 && ptr[1] == 0x6F && ptr[2] == 0x6C && ptr[3] == 0x61 && ptr[4] == 0x74 && ptr[5] == 0x69 && ptr[6] == 0x6C && ptr[7] == 0x65 { return 42 } // volatile
+            if ptr[0] == 0x5F && ptr[1] == 0x41 && ptr[2] == 0x6C && ptr[3] == 0x69 && ptr[4] == 0x67 && ptr[5] == 0x6E && ptr[6] == 0x61 && ptr[7] == 0x73 { return 44 } // _Alignas
+            if ptr[0] == 0x5F && ptr[1] == 0x41 && ptr[2] == 0x6C && ptr[3] == 0x69 && ptr[4] == 0x67 && ptr[5] == 0x6E && ptr[6] == 0x6F && ptr[7] == 0x66 { return 45 } // _Alignof
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x69 && ptr[3] == 0x6E && ptr[4] == 0x6C && ptr[5] == 0x69 && ptr[6] == 0x6E && ptr[7] == 0x65 { return 26 } // __inline
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x73 && ptr[3] == 0x69 && ptr[4] == 0x67 && ptr[5] == 0x6E && ptr[6] == 0x65 && ptr[7] == 0x64 { return 33 } // __signed
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x74 && ptr[3] == 0x79 && ptr[4] == 0x70 && ptr[5] == 0x65 && ptr[6] == 0x6F && ptr[7] == 0x66 { return 54 } // __typeof
         case 9:
             if ptr[0] == 0x63 && ptr[1] == 0x6F && ptr[2] == 0x6E && ptr[3] == 0x73 && ptr[4] == 0x74 && ptr[5] == 0x65 && ptr[6] == 0x78 && ptr[7] == 0x70 && ptr[8] == 0x72 { return 48 } // constexpr
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x63 && ptr[3] == 0x6F && ptr[4] == 0x6E && ptr[5] == 0x73 && ptr[6] == 0x74 && ptr[7] == 0x5F && ptr[8] == 0x5F { return 14 } // __const__
+        case 10:
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x69 && ptr[3] == 0x6E && ptr[4] == 0x6C && ptr[5] == 0x69 && ptr[6] == 0x6E && ptr[7] == 0x65 && ptr[8] == 0x5F && ptr[9] == 0x5F { return 26 } // __inline__
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x72 && ptr[3] == 0x65 && ptr[4] == 0x73 && ptr[5] == 0x74 && ptr[6] == 0x72 && ptr[7] == 0x69 && ptr[8] == 0x63 && ptr[9] == 0x74 { return 30 } // __restrict
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x73 && ptr[3] == 0x69 && ptr[4] == 0x67 && ptr[5] == 0x6E && ptr[6] == 0x65 && ptr[7] == 0x64 && ptr[8] == 0x5F && ptr[9] == 0x5F { return 33 } // __signed__
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x74 && ptr[3] == 0x79 && ptr[4] == 0x70 && ptr[5] == 0x65 && ptr[6] == 0x6F && ptr[7] == 0x66 && ptr[8] == 0x5F && ptr[9] == 0x5F { return 54 } // __typeof__
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x76 && ptr[3] == 0x6F && ptr[4] == 0x6C && ptr[5] == 0x61 && ptr[6] == 0x74 && ptr[7] == 0x69 && ptr[8] == 0x6C && ptr[9] == 0x65 { return 42 } // __volatile
+        case 11:
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x61 && ptr[3] == 0x6C && ptr[4] == 0x69 && ptr[5] == 0x67 && ptr[6] == 0x6E && ptr[7] == 0x6F && ptr[8] == 0x66 && ptr[9] == 0x5F && ptr[10] == 0x5F { return 45 } // __alignof__
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x61 && ptr[3] == 0x75 && ptr[4] == 0x74 && ptr[5] == 0x6F && ptr[6] == 0x5F && ptr[7] == 0x74 && ptr[8] == 0x79 && ptr[9] == 0x70 && ptr[10] == 0x65 { return 10 } // __auto_type
+        case 12:
+            if ptr[0] == 0x74 && ptr[1] == 0x68 && ptr[2] == 0x72 && ptr[3] == 0x65 && ptr[4] == 0x61 && ptr[5] == 0x64 && ptr[6] == 0x5F && ptr[7] == 0x6C && ptr[8] == 0x6F && ptr[9] == 0x63 && ptr[10] == 0x61 && ptr[11] == 0x6C { return 53 } // thread_local
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x72 && ptr[3] == 0x65 && ptr[4] == 0x73 && ptr[5] == 0x74 && ptr[6] == 0x72 && ptr[7] == 0x69 && ptr[8] == 0x63 && ptr[9] == 0x74 && ptr[10] == 0x5F && ptr[11] == 0x5F { return 30 } // __restrict__
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x76 && ptr[3] == 0x6F && ptr[4] == 0x6C && ptr[5] == 0x61 && ptr[6] == 0x74 && ptr[7] == 0x69 && ptr[8] == 0x6C && ptr[9] == 0x65 && ptr[10] == 0x5F && ptr[11] == 0x5F { return 42 } // __volatile__
         case 13:
             if ptr[0] == 0x73 && ptr[1] == 0x74 && ptr[2] == 0x61 && ptr[3] == 0x74 && ptr[4] == 0x69 && ptr[5] == 0x63 && ptr[6] == 0x5F &&
                ptr[7] == 0x61 && ptr[8] == 0x73 && ptr[9] == 0x73 && ptr[10] == 0x65 && ptr[11] == 0x72 && ptr[12] == 0x74 {
                 return 52 // static_assert
+            }
+            if ptr[0] == 0x5F && ptr[1] == 0x54 && ptr[2] == 0x68 && ptr[3] == 0x72 && ptr[4] == 0x65 && ptr[5] == 0x61 && ptr[6] == 0x64 &&
+               ptr[7] == 0x5F && ptr[8] == 0x6C && ptr[9] == 0x6F && ptr[10] == 0x63 && ptr[11] == 0x61 && ptr[12] == 0x6C {
+                return 53 // _Thread_local
+            }
+            if ptr[0] == 0x74 && ptr[1] == 0x79 && ptr[2] == 0x70 && ptr[3] == 0x65 && ptr[4] == 0x6F && ptr[5] == 0x66 && ptr[6] == 0x5F &&
+               ptr[7] == 0x75 && ptr[8] == 0x6E && ptr[9] == 0x71 && ptr[10] == 0x75 && ptr[11] == 0x61 && ptr[12] == 0x6C {
+                return 55 // typeof_unqual
+            }
+        case 14:
+            if ptr[0] == 0x5F && ptr[1] == 0x53 && ptr[2] == 0x74 && ptr[3] == 0x61 && ptr[4] == 0x74 && ptr[5] == 0x69 && ptr[6] == 0x63 &&
+               ptr[7] == 0x5F && ptr[8] == 0x61 && ptr[9] == 0x73 && ptr[10] == 0x73 && ptr[11] == 0x65 && ptr[12] == 0x72 && ptr[13] == 0x74 {
+                return 52 // _Static_assert
             }
         default:
             break

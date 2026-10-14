@@ -6,25 +6,51 @@ import Foundation
 public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible {
     case nilNode = 0
 
-    // Declarations & Structure
+    // Declarations & Structure (1..15)
     case translationUnit = 1
     case functionDecl = 2
     case paramList = 3
     case paramDecl = 4
     case varDecl = 5
+    case structDecl = 6
+    case unionDecl = 7
+    case enumDecl = 8
+    case enumeratorDecl = 9
+    case fieldDecl = 12
+    case typedefDecl = 13
+    case attributeSpec = 14
+    case staticAssertDecl = 15
 
-    // Types
+    // Types (10..19, 25..28)
     case typeSpec = 10
     case pointerType = 11
+    case arrayType = 16
+    case functionType = 17
+    case structType = 18
+    case unionType = 19
+    case enumType = 25
+    case typeofType = 26
+    case typeofUnqualType = 27
+    case atomicType = 28
 
-    // Statements
+    // Statements (20..24, 29, 40..48)
     case compoundStmt = 20
     case returnStmt = 21
     case ifStmt = 22
     case whileStmt = 23
     case exprStmt = 24
+    case doWhileStmt = 29
+    case forStmt = 40
+    case switchStmt = 41
+    case caseStmt = 42
+    case defaultStmt = 43
+    case gotoStmt = 44
+    case continueStmt = 45
+    case breakStmt = 46
+    case labelStmt = 47
+    case asmStmt = 48
 
-    // Expressions
+    // Expressions (30..38, 49..63)
     case assignExpr = 30
     case binaryExpr = 31
     case unaryExpr = 32
@@ -34,6 +60,28 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
     case intLiteral = 36
     case stringLiteral = 37
     case charLiteral = 38
+    case castExpr = 49
+    case conditionalExpr = 50
+    case commaExpr = 51
+    case memberExpr = 52
+    case subscriptExpr = 53
+    case compoundLiteralExpr = 54
+    case genericExpr = 55
+    case genericAssocList = 56
+    case genericAssoc = 57
+    case embedSequence = 58
+    case floatLiteral = 59
+    case boolLiteral = 60
+    case nullptrLiteral = 61
+    case initList = 62
+    case designatedInit = 63
+
+    // Start markers for bidirectional checking (70..74)
+    case varDeclStart = 70
+    case callArgsStart = 71
+    case functionBodyStart = 72
+    case ifConditionStart = 73
+    case returnStart = 74
 
     // Error recovery
     case errorNode = 255
@@ -46,13 +94,39 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
         case .paramList: return "paramList"
         case .paramDecl: return "paramDecl"
         case .varDecl: return "varDecl"
+        case .structDecl: return "structDecl"
+        case .unionDecl: return "unionDecl"
+        case .enumDecl: return "enumDecl"
+        case .enumeratorDecl: return "enumeratorDecl"
+        case .fieldDecl: return "fieldDecl"
+        case .typedefDecl: return "typedefDecl"
+        case .attributeSpec: return "attributeSpec"
+        case .staticAssertDecl: return "staticAssertDecl"
         case .typeSpec: return "typeSpec"
         case .pointerType: return "pointerType"
+        case .arrayType: return "arrayType"
+        case .functionType: return "functionType"
+        case .structType: return "structType"
+        case .unionType: return "unionType"
+        case .enumType: return "enumType"
+        case .typeofType: return "typeofType"
+        case .typeofUnqualType: return "typeofUnqualType"
+        case .atomicType: return "atomicType"
         case .compoundStmt: return "compoundStmt"
         case .returnStmt: return "returnStmt"
         case .ifStmt: return "ifStmt"
         case .whileStmt: return "whileStmt"
         case .exprStmt: return "exprStmt"
+        case .doWhileStmt: return "doWhileStmt"
+        case .forStmt: return "forStmt"
+        case .switchStmt: return "switchStmt"
+        case .caseStmt: return "caseStmt"
+        case .defaultStmt: return "defaultStmt"
+        case .gotoStmt: return "gotoStmt"
+        case .continueStmt: return "continueStmt"
+        case .breakStmt: return "breakStmt"
+        case .labelStmt: return "labelStmt"
+        case .asmStmt: return "asmStmt"
         case .assignExpr: return "assignExpr"
         case .binaryExpr: return "binaryExpr"
         case .unaryExpr: return "unaryExpr"
@@ -62,6 +136,26 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
         case .intLiteral: return "intLiteral"
         case .stringLiteral: return "stringLiteral"
         case .charLiteral: return "charLiteral"
+        case .castExpr: return "castExpr"
+        case .conditionalExpr: return "conditionalExpr"
+        case .commaExpr: return "commaExpr"
+        case .memberExpr: return "memberExpr"
+        case .subscriptExpr: return "subscriptExpr"
+        case .compoundLiteralExpr: return "compoundLiteralExpr"
+        case .genericExpr: return "genericExpr"
+        case .genericAssocList: return "genericAssocList"
+        case .genericAssoc: return "genericAssoc"
+        case .embedSequence: return "embedSequence"
+        case .floatLiteral: return "floatLiteral"
+        case .boolLiteral: return "boolLiteral"
+        case .nullptrLiteral: return "nullptrLiteral"
+        case .initList: return "initList"
+        case .designatedInit: return "designatedInit"
+        case .varDeclStart: return "varDeclStart"
+        case .callArgsStart: return "callArgsStart"
+        case .functionBodyStart: return "functionBodyStart"
+        case .ifConditionStart: return "ifConditionStart"
+        case .returnStart: return "returnStart"
         case .errorNode: return "errorNode"
         }
     }

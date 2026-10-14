@@ -19,6 +19,11 @@ public struct SourceLocation: Hashable, Equatable, Sendable, BitwiseCopyable, Co
     public static let invalid = SourceLocation(UInt32.max)
 
     @inlinable
+    public var isValid: Bool {
+        rawValue != UInt32.max
+    }
+
+    @inlinable
     public static func < (lhs: SourceLocation, rhs: SourceLocation) -> Bool {
         lhs.rawValue < rhs.rawValue
     }
