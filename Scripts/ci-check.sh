@@ -71,6 +71,16 @@ if ! cmp -s "$TMP_RUN1" "$TMP_RUN2"; then
     exit 1
 fi
 
+# Binary executable determinism
+"$SWIFT_STACK_BIN" Benchmarks/corpora/c-subset/08_recursion.c -o "$TMP_RUN1"
+"$SWIFT_STACK_BIN" Benchmarks/corpora/c-subset/08_recursion.c -o "$TMP_RUN2"
+
+if ! cmp -s "$TMP_RUN1" "$TMP_RUN2"; then
+    echo "ERROR: D6 violation! Non-deterministic executable binary output on 08_recursion.c"
+    rm -f "$TMP_RUN1" "$TMP_RUN2"
+    exit 1
+fi
+
 rm -f "$TMP_RUN1" "$TMP_RUN2"
 echo "PASSED: Output determinism (D6) verified byte-identical."
 

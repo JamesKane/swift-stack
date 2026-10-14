@@ -8,9 +8,12 @@ func printUsage() {
     Usage: swift-stack [options] <input-files...>
 
     Options:
-      --dump=<stage>       Dump internal stage representation (tokens)
+      -o <file>            Output binary executable path (default: a.out)
+      --run                Compile and execute immediately on Linux
+      --dump=<stage>       Dump internal stage (tokens, parse-tree, air, asm)
       --stats              Display compiler table statistics and memory usage
       --time-phases        Display execution time and throughput for each phase
+      --bench              Run micro-benchmark repetitions for each phase
       --profile=<file>     Write execution trace to Chrome trace JSON file
       --lang=<swift|c>     Explicitly set input language (default: inferred from extension)
       -v, --version        Print version and exit
@@ -27,7 +30,7 @@ func main() {
     }
 
     if args.contains("-v") || args.contains("--version") {
-        print("swift-stack version 0.1.0 (Milestone 0)")
+        print("swift-stack version 0.5.0 (Milestone 0.5: Vertical Slice)")
         exit(0)
     }
 
@@ -36,7 +39,14 @@ func main() {
     var i = 1
     while i < args.count {
         let arg = args[i]
-        if arg.hasPrefix("--dump=") {
+        if arg == "-o" && i + 1 < args.count {
+            i += 1
+            options.outputBinaryPath = args[i]
+        } else if arg.hasPrefix("-o") {
+            options.outputBinaryPath = String(arg.dropFirst(2))
+        } else if arg == "--run" {
+            options.runBinary = true
+        } else if arg.hasPrefix("--dump=") {
             let stage = String(arg.dropFirst("--dump=".count))
             options.dumpStage = stage
         } else if arg == "--stats" {

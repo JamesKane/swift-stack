@@ -1,4 +1,4 @@
-// Tests/SwiftStackTests/SwiftStackTests.swift
+import Foundation
 import Testing
 @testable import SwiftStack
 
@@ -212,5 +212,86 @@ struct SwiftStackTests {
 
         let span = results.first { $0.name == "Span" }
         #expect(span != nil && span!.count == 1)
+    }
+
+    @Test("ParseTree postorder layout and children navigation")
+    func testParseTree() {
+        var pt = ParseTree()
+        #expect(pt.count == 1) // nil root
+        let leaf1 = pt.appendLeaf(kind: .intLiteral, token: TokenId(1))
+        let leaf2 = pt.appendLeaf(kind: .intLiteral, token: TokenId(2))
+        let binOp = pt.append(kind: .binaryExpr, token: TokenId(3), subtreeSize: 3)
+
+        #expect(pt.count == 4)
+        let ch = pt.children(of: binOp)
+        #expect(ch.count == 2)
+        #expect(ch[0] == leaf1)
+        #expect(ch[1] == leaf2)
+    }
+
+    @Test("CParser and CSemanticAnalyzer")
+    func testCParserAndSemantics() {
+        let sm = SourceManager()
+        let src = """
+        int add(int a, int b) {
+            return a + b;
+        }
+        int main() {
+            int x = 10;
+            return add(x, 20);
+        }
+        """
+        let fileId = sm.addBuffer(bytes: Array(src.utf8), path: "test.c")
+        let file = sm[fileId]
+
+        var tokenBuffer = TokenBuffer()
+        let lexer = CLexer(fileId: fileId, buffer: file.buffer, length: file.length)
+        lexer.lexInto(&tokenBuffer)
+
+        withUnsafePointer(to: tokenBuffer) { tbPtr in
+            let parser = CParser(tokens: tbPtr, sourceBuffer: file.buffer.baseAddress!, sourceLength: file.length)
+            let tree = parser.parse()
+
+            #expect(tree.count > 10)
+
+            var sem = CSemanticAnalyzer(typePool: TypePool(), sourceBuffer: file.buffer.baseAddress!, sourceLength: file.length)
+            let semResult = sem.analyze(tree: tree, tokens: tokenBuffer)
+
+            #expect(semResult.functions["add"] != nil)
+            #expect(semResult.functions["main"] != nil)
+            #expect(semResult.diagnostics.isEmpty)
+        }
+    }
+
+    @Test("End-to-end C program compilation and execution")
+    func testEndToEndExecution() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+
+        let programs: [(file: String, expectedExit: Int32)] = [
+            ("Benchmarks/corpora/c-subset/00_exit42.c", 42),
+            ("Benchmarks/corpora/c-subset/02_arith.c", 40),
+            ("Benchmarks/corpora/c-subset/03_bitwise.c", 45),
+            ("Benchmarks/corpora/c-subset/04_locals.c", 55),
+            ("Benchmarks/corpora/c-subset/05_if_else.c", 70),
+            ("Benchmarks/corpora/c-subset/06_while_sum.c", 55),
+            ("Benchmarks/corpora/c-subset/07_functions.c", 55),
+            ("Benchmarks/corpora/c-subset/08_recursion.c", 55),
+            ("Benchmarks/corpora/c-subset/09_pointers.c", 50),
+            ("Benchmarks/corpora/c-subset/10_collatz.c", 16),
+        ]
+
+        for (relPath, expectedCode) in programs {
+            let outBinary = tempDir.appendingPathComponent("ss_test_\(UUID().uuidString)").path
+            defer { try? FileManager.default.removeItem(atPath: outBinary) }
+
+            var opts = DriverOptions()
+            opts.inputFiles = [relPath]
+            opts.outputBinaryPath = outBinary
+            opts.runBinary = true
+
+            let pipeline = DriverPipeline(options: opts)
+            let exitCode = try pipeline.run()
+            #expect(exitCode == expectedCode, "Execution of \(relPath) returned \(exitCode), expected \(expectedCode)")
+        }
     }
 }

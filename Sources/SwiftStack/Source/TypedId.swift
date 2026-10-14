@@ -117,3 +117,229 @@ public struct DiagId: TypedId {
         self.rawIndex = rawIndex
     }
 }
+
+/// Type handle in TypePool.
+@frozen
+public struct TypeId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    public static let void = TypeId(1)
+    public static let int = TypeId(2)
+    public static let long = TypeId(3)
+    public static let char = TypeId(4)
+    public static let pointer = TypeId(5)
+}
+
+/// Function handle.
+@frozen
+public struct FunctionId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// AIR Instruction handle.
+@frozen
+public struct InstId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// AIR Block handle.
+@frozen
+public struct BlockId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// AIR Value handle (tagged 32-bit handle per 03 §4.1).
+@frozen
+public struct ValueId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// Index handle for extra operands column.
+@frozen
+public struct ExtraId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// Index handle for block instruction ordering.
+@frozen
+public struct BlockOrderIndex: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// Index handle for successor edge column.
+@frozen
+public struct SuccEdgeIndex: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// Index handle for predecessor edge column.
+@frozen
+public struct PredEdgeIndex: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// LIR Instruction handle.
+@frozen
+public struct LIRInstId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// LIR Block handle.
+@frozen
+public struct LIRBlockId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// Symbol handle.
+@frozen
+public struct SymbolId: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// Object section index handle.
+@frozen
+public struct SectionIndex: TypedId {
+    public let rawIndex: UInt32
+
+    @inlinable
+    public init(rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+
+    @inlinable
+    public init(_ rawIndex: UInt32) {
+        self.rawIndex = rawIndex
+    }
+}
+
+/// Deterministic 16-bit FNV-1a hash for symbol IDs and linkage keys (D6 determinism).
+@inlinable
+public func fnv1a16(_ str: String) -> UInt32 {
+    var h: UInt32 = 0x811c9dc5
+    for b in str.utf8 {
+        h ^= UInt32(b)
+        h = h &* 0x01000193
+    }
+    return h & 0xFFFF
+}
+
