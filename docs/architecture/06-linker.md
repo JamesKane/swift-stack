@@ -3,11 +3,11 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [04](04-backend.md), [05](05-assembler.md), [07](07-debugging-and-sdi.md), [08](08-runtime-and-stdlib.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md), [15](15-driver-and-diagnostics.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [02](02-semantic-analysis.md), [04](04-backend.md), [05](05-assembler.md), [07](07-debugging-and-sdi.md), [08](08-runtime-and-stdlib.md), [09](09-roadmap.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [14](14-measurement-methodology.md), [15](15-driver-and-diagnostics.md) |
 
 ## 1. Summary
 
-The Swift-Stack linker (`ss-ld`) runs in-process with the compiler. It consumes relocatable objects in a shared in-memory **object model** (the `Object` module, defined canonically in this chapter), whether they were produced by Codegen, by the native assemblers, or read from foreign ELF / Mach-O `.o` and `.a` files. It produces static ELF executables for Todhchai OS and static or dynamic executables for the POSIX host targets.
+The Swift-Stack linker runs in-process with the compiler, driven by the main `swift-stack` driver. A standalone `ld`-compatible personality (`ss-ld`) is deferred until a concrete external build needs one ([15](15-driver-and-diagnostics.md)). It consumes relocatable objects in a shared in-memory **object model** (the `Object` module, defined canonically in this chapter), whether they were produced by Codegen, by the native assemblers, or read from foreign ELF / Mach-O `.o` and `.a` files. It produces static ELF executables for Todhchai OS and static or dynamic executables for the POSIX host targets.
 
 Relative to a conventional linker it adds three things, without changing ordinary ELF/Mach-O symbol semantics:
 
@@ -17,7 +17,7 @@ Relative to a conventional linker it adds three things, without changing ordinar
 
 ## 2. Motivation
 
-The design is motivated by the redundancies discussed by Jonathan Blow and Sean Barrett (*Redundancies in Modern Linkers*) and by the observed costs of conventional toolchains:
+The design is motivated by linker redundancies discussed by Jonathan Blow and others in the Handmade community (streams and talks; citation to be added), and by the observed costs of conventional toolchains:
 
 - **Debug-info duplication.** In the classical C model every translation unit that includes a header emits debug records for the header's types, and the linker (or a post-link tool) spends significant time deduplicating them. Swift-Stack emits type debug information once per module and merges modules by content hash (§5.7, [07](07-debugging-and-sdi.md)).
 - **First-come symbol resolution.** Archive member selection and weak/strong rules let an unrelated definition satisfy a reference silently. Swift-Stack keeps standard semantics (so foreign code links as expected) but adds optional provider-module constraints and type checks (§5.3).
@@ -70,16 +70,24 @@ public struct RelocatableObject: ~Copyable {
     public var symbolVisibility: Column<SymbolVisibility>
     public var symbolTypes: Column<SymbolTypeRecord> // optional; from .ss_symtypes (§5.3)
 
-    // Relocations, grouped by section (CSR layout)
-    public var relocSectionStart: Column<UInt32>    // per section, offset into relocation columns
-    public var relocOffsets: Column<UInt64>
-    public var relocKinds: Column<RelocKind>        // target-neutral enum, mapped from ELF/Mach-O types
-    public var relocSymbols: Column<SymbolIndex>
-    public var relocAddends: Column<Int64>
+    // Relocations, grouped by section (CSR layout). Stored as whole rows (AoS): every
+    // relocation is applied by reading all four fields together ([18](18-data-catalog.md) §5.4).
+    public var relocSectionStart: Column<UInt32>    // per section, offset into `relocs`
+    public var relocs: Column<Relocation>           // 24-byte rows, see below
 
     // Unwind and debug
     public var unwind: Column<UnwindRecord>         // CUD records (07 §5.5); FDEs stay in an eh_frame section
     public var debugFragment: SDIFragmentRef?       // per-module SDI fragment (07 §5.6)
+}
+```
+
+```swift
+@frozen public struct Relocation {      // stride 24 (layout hypothesis, 18)
+    public var offset: UInt64            // within the section
+    public var addend: Int64
+    public var symbol: SymbolIndex       // UInt32; 0 = nil row (00 Principle 7)
+    public var kind: RelocKind           // UInt16, target-neutral, mapped from ELF/Mach-O types
+    public var flags: UInt16
 }
 ```
 
@@ -138,7 +146,7 @@ typedef struct ss_symtype {
 
 ### 5.5 Relocation processing
 
-Relocations are applied in parallel, **partitioned by input section** as in mold and lld, not by fixed-size chunks of the output. Each input section's relocations are contiguous in the `Object` model (CSR layout) and patch only that section's bytes, so workers never write to shared bytes. Large input sections MAY be split by relocation index range.
+Relocations are applied in parallel, **partitioned by input section** as in mold and lld, not by fixed-size chunks of the output. Each input section's relocations are contiguous in the `Object` model (CSR layout) and patch only that section's bytes, so workers never write to shared bytes. Large input sections MAY be split by relocation index range. Scheduling follows D11: input sections are pre-sorted by `(inputPriority, index)`, and lanes claim the next one through an atomic cursor. Each lane writes only to that section's precomputed output range, so the result is independent of which lane took which section.
 
 Relocation coverage required in v1:
 
@@ -250,4 +258,8 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md); the
 2. Where does the per-image stack size live: a note section, a loader default, or a program header?
 3. Should `--ss-type-mismatch` default to `warn` for C-only links until the hash canonicalization has been validated against a large C corpus?
 4. Minimal RISC-V `R_RISCV_ALIGN` handling versus rejecting such objects: what do the Todhchai foreign libraries actually contain?
-5. Should shared-library output be in scope for v2 (needed for Todhchai hot-reload of `CodeModule`s, [07](07-debugging-and-sdi.md) §5.10)?
+5. Should shared-library output be in scope for v2 (needed for Todhchai hot-reload of `CodeModule`s, [07](07-debugging-and-sdi.md) §5.11)?
+6. **Patchable code modules ahead of macOS.** Should relocatable, patchable code modules, which enable live code editing, move ahead of macOS Mach-O output in the roadmap ([09](09-roadmap.md))?
+   - **What they are:** a code image the Todhchai loader can map, relocate and swap while the process runs. This is Handmade Hero-style hot reload and serves Todhchai principle 17.
+   - **Why now:** function-level incremental compilation ([13](13-modules-and-incremental-builds.md)) plus such modules would give edit-and-continue in seconds, which arguably matters more to day-to-day development than a fourth host format.
+   - **Overlap with question 5:** shared-library output is the conventional route to the same capability.

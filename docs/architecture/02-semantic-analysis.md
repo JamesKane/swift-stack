@@ -74,10 +74,13 @@ The reserved slots are **compiler-builtin** types, not Swift standard-library ty
 
 | Range | Contents |
 |---|---|
-| 0–1 | `error` (poison type, [10](10-semantic-ir-and-name-resolution.md) §4.8), `void` / `()` |
+| 0 | `error`: the nil row (see below) and the poison type of [10](10-semantic-ir-and-name-resolution.md) §4.8 |
+| 1 | `void` / `()` |
 | 2–15 | `Builtin.Int1/8/16/32/64/128`, `Builtin.Word`, `Builtin.IntLiteral`, `Builtin.FPIEEE16/32/64`, `Builtin.FPIEEE80` (x86 only), `Builtin.RawPointer`, `Builtin.NativeObject` |
 | 16–40 | C types, all distinct: `_Bool`, `char`, `signed char`, `unsigned char`, `short`, `unsigned short`, `int`, `unsigned`, `long`, `unsigned long`, `long long`, `unsigned long long`, `float`, `double`, `long double`, `nullptr_t`, `void` (C) |
 | 41–63 | reserved |
+
+**Slot 0 is the nil row** ([00](00-overview-and-principles.md) Principle 7). `TypeId(rawValue: 0)` is the zero value of every `TypeId` column, so an unset or failed type is the error type by construction. Its row holds valid defaults: kind `error`, size 0, alignment 1, canonical type itself, every flag clear, and no payload. Any query on it (layout, conformance, member lookup, import mapping) returns a harmless answer instead of trapping. Because every operation on `error` yields `error` and no diagnostics, errors do not cascade, and the type checker needs no `Optional<TypeId>` branches. The error type described in [10](10-semantic-ir-and-name-resolution.md) §4.8 *is* this slot.
 
 Builtin vector types `Vec<N × E>` (behind `Builtin.Vec*`, Swift `SIMDn<T>`, and C `vector_size`/`ext_vector_type`) are parametric, so they are not reserved slots. They are interned structurally with kind `vector` ([17](17-simd-and-vectorization.md) §5.1).
 
@@ -244,7 +247,7 @@ Todhchai, the first-party user, builds against the **Swift 6.4** compiler, and i
 | `@_noAllocation`, `-no-allocations` | `@AudioRenderer` ([16](16-macros.md)); Embedded builds | Performance-annotation checking, per function or for a whole module | [03](03-intermediate-representation.md) §4.3–4.4 |
 | `-enforce-exclusivity=unchecked` | One host-side target | Omit dynamic exclusivity checks. Static exclusivity diagnostics still apply. | [03](03-intermediate-representation.md) §4.4 |
 
-New features that Todhchai adopts are added to this table as they appear. The [09](09-roadmap.md) differential corpus is the source tree itself, so additions are detected by the build failing.
+New features that Todhchai adopts are added to this table as they appear. The table is kept current by the `ss-census` tool ([09](09-roadmap.md)). In CI it counts feature, attribute and flag uses over the pinned Todhchai tree, and ranks the unsupported ones by use count, which in turn sets implementation order. The [09](09-roadmap.md) differential corpus is the source tree itself, so additions are detected by the build failing.
 
 ### 4.4 Swift 6 concurrency checking
 

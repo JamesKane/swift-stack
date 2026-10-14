@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [04](04-backend.md), [08](08-runtime-and-stdlib.md), [14](14-measurement-methodology.md), [17](17-simd-and-vectorization.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [10](10-semantic-ir-and-name-resolution.md), [11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [04](04-backend.md), [08](08-runtime-and-stdlib.md), [14](14-measurement-methodology.md), [17](17-simd-and-vectorization.md), [18](18-data-catalog.md) |
 
 ## 1. Summary
 
@@ -88,7 +88,9 @@ public struct AIRFunction: ~Copyable {
 }
 ```
 
-**Size.** Because each column is a separate contiguous array, there is no per-row padding. The fixed cost is 1 + 4 + 4 + 4 + 4 = **17 bytes per instruction**, plus 4 bytes in `blockOrder`, plus 4 bytes per operand beyond the third in `extra`. (An array-of-structs with the same fields would have a 20-byte stride.) LLVM, by contrast, allocates each `llvm::Instruction` individually and links it into intrusive instruction and use lists, costing several machine words of overhead per instruction; we make no stronger quantitative claim than that.
+**Size.** Because each column is a separate contiguous array, there is no per-row padding. The fixed cost is 1 + 4 + 4 + 4 + 4 = **17 bytes per instruction**, plus 4 bytes in `blockOrder`, plus 4 bytes per operand beyond the third in `extra`. (An array-of-structs with the same fields would have a 20-byte stride.) LLVM, by contrast, allocates each `llvm::Instruction` individually and links it into intrusive instruction and use lists, costing several machine words of overhead per instruction; we make no stronger quantitative claim than that. The SoA choice is a hypothesis tracked in [18](18-data-catalog.md) §5.3. Many passes read only `opcode` and operands, but random def lookups pay one cache line per column, so an AoS or AoSoA layout is measured against it on the M0.5 slice ([09](09-roadmap.md)).
+
+**Nil row.** `InstId` 0, `BlockId` 0 and `ValueId` 0 are nil rows (a `.nil` opcode with no operands, an empty block) per [18](18-data-catalog.md) §4. A missing operand is `ValueId` 0, not an `Optional`.
 
 **Edges as CSR.** Successor and predecessor lists are stored in compressed-sparse-row form (an offset column plus a flat edge column) rather than as `[[BlockId]]`, which would allocate one heap array per block. CFG edits mark the CSR as stale; it is rebuilt in one linear pass at the next pass boundary that needs it.
 
@@ -210,7 +212,7 @@ The optimizer has three groups of passes, plus the optional loop vectorizer. The
 - `-no-allocations` applies the performance-annotation checker (§4.3 step 9) to every function in the module, as if each were `@_noAllocation`.
 - `-enforce-exclusivity=unchecked` lowers dynamic `begin_access` markers to nothing. Static exclusivity diagnostics (§4.3 step 4) still run.
 
-**Parallelism.** Intraprocedural passes run function-parallel over a work queue. Interprocedural work in step 3 is parallel across independent SCCs in the bottom-up DAG. Because a function's callees have all finished before it starts, the inliner always sees optimized callee bodies and final effect summaries. Functions in the same SCC (mutual recursion) are not inlined into one another.
+**Parallelism** (D11, SPMD lanes). Every lane runs the same pass code. Intraprocedural stages hand out functions through a shared **atomic cursor** over the `FunctionId`-ordered list: each lane takes the next index until the list is exhausted, and a barrier ends the stage. This is the irregular-work case of the lane model, with no deques and no job graph. Interprocedural work in step 3 runs lanes over a per-level frontier of the bottom-up SCC DAG: all SCCs whose callees are finished form one level, lanes claim SCCs from that level by atomic cursor, and a barrier separates levels. Because a function's callees have all finished before it starts, the inliner always sees optimized callee bodies and final effect summaries. Functions in the same SCC (mutual recursion) are not inlined into one another.
 
 **Determinism (D6).** Every function's output depends only on its own input and the final state of its callees. In particular:
 

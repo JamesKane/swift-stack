@@ -38,11 +38,13 @@ Todhchai's Embedded CMake build passes `-load-plugin-executable <path>#<Module>`
 - Macros usable from Tier 0 and Tier 1 code. Expansion happens on the build host and is independent of the target tier.
 - Deterministic, cacheable expansion (D6, [13](13-modules-and-incremental-builds.md)).
 - Diagnostics and debugging that work inside expansions.
+- Replayable builds: record bundles ([15](15-driver-and-diagnostics.md)) capture every plugin *response*, so a replayed compile never runs a plugin and needs no plugin binaries (§5.7).
 
 ## 4. Non-goals
 
 - **In-process library plugins** (`-load-plugin-library`, `swift-plugin-server`). Loading a `swiftc`-built dynamic library into the compiler would need `swiftc` ABI compatibility (D1). The executable form covers the same macros.
 - **Linking or reimplementing swift-syntax in the compiler.** Plugins use swift-syntax; the compiler does not.
+- **Plugin sandboxing in v1.** Deferred (§5.5, open question 5).
 - **Native reimplementation of specific macros** (an allowlist). The general mechanism makes that unnecessary. The only native macros are the built-in ones in §5.6.
 
 ## 5. Design
@@ -112,13 +114,7 @@ The driver owns plugin processes ([15](15-driver-and-diagnostics.md) §4.4):
   - Framing is a length-prefixed JSON message on stdin/stdout.
 - **Concurrency.** One plugin process handles one request at a time. The host keeps a small pool per plugin, up to `min(jobs, 4)` processes by default, started lazily. Requests are dispatched from worker threads, and results are attached to the expansion site, so arrival order never affects output (D6).
 - **Failure handling.** If a plugin crashes, times out (default 30 s, configurable) or sends a malformed reply, the expansion fails with a diagnostic naming the plugin and the macro, and the process is restarted for later requests. A plugin failure never crashes the compiler.
-- **Sandboxing.** Plugins SHOULD run with only stdin, stdout and stderr:
-  - Capsicum `cap_enter` on FreeBSD;
-  - Landlock plus seccomp on Linux;
-  - the system sandbox profile on macOS;
-  - on Todhchai, the plugin process is given only its two channel handles.
-
-  `--plugin-sandbox=off` disables this for debugging.
+- **Sandboxing (deferred).** v1 runs plugins **unsandboxed**, as `swiftc` does on Linux: a plugin is trusted build-time code, like any other tool in the build. Per-OS confinement is deferred until a concrete need appears (open question 5). Candidates are Capsicum `cap_enter` on FreeBSD, Landlock plus seccomp on Linux, the system sandbox profile on macOS, and on Todhchai a process holding only its two channel handles.
 
 ### 5.6 Built-in macros
 
@@ -134,6 +130,7 @@ When `#fileID`, `#line` and the others are used as default arguments, they expan
 
 - **Expansion cache key:** BLAKE3 of (plugin executable content hash, macro module and type, role, the full request payload *excluding* absolute file paths, and the protocol version). Absolute paths are replaced by the stable file identity used elsewhere ([13](13-modules-and-incremental-builds.md)), so cache hits survive moving the checkout.
 - **Purity assumption.** Plugins are assumed pure: the same request gives the same expansion. The cache makes the output deterministic even if a plugin isn't.
+  - **Record and replay.** A record bundle ([15](15-driver-and-diagnostics.md)) stores each expansion request together with the plugin's response. Replaying the bundle serves expansions from it and never starts a plugin process, so a bug report reproduces bit for bit on a machine without the plugins.
   - `--verify-macro-determinism`, which CI enables, expands each site twice in separate processes and reports any difference as a plugin defect.
 - **Incremental builds.** An expansion depends on its request payload and the plugin hash. Editing an attached declaration re-expands only that site. Changing a plugin binary invalidates all of its expansions.
 - **Module interfaces.** Declarations introduced by expansions are serialized into `.ssmodule` files as ordinary declarations, along with the expansion buffers' text, so that diagnostics and debug info can still show them. Clients of a module never need the plugins that module used. Only modules that *use* a macro need its plugin.
@@ -167,3 +164,4 @@ When `#fileID`, `#line` and the others are used as default arguments, they expan
 2. ~~Should Swift-Stack build Todhchai's plugins itself?~~ Resolved: yes, from M6 ([09](09-roadmap.md) M6 deliverables). Until then the host `swiftc` builds them.
 3. Is a `swiftc`-compatible `-dump-macro-expansions` format worth matching byte-for-byte, or is only the expanded text compared?
 4. How does swift-testing discover tests at runtime on Linux and Todhchai (a section-based record or metadata scanning)? This is needed for running Todhchai's test suites ([12](12-standard-library-strategy.md)).
+5. Should plugins be sandboxed per OS (`--plugin-sandbox`), and if so by default or opt-in? v1 runs them unsandboxed (§5.5). The case for sandboxing grows if Swift-Stack is used on untrusted packages, or if Todhchai-hosted builds want capability confinement by default.

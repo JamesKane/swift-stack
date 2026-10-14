@@ -7,10 +7,11 @@
 
 ## 1. Summary
 
-This chapter defines the module layout, the milestone sequence, and how correctness is verified. Two principles shape the sequence:
+This chapter defines the module layout, the milestone sequence, and how correctness is verified. Three principles shape the sequence:
 
 1. **C before Swift.** C exercises the whole backend (IR, register allocation, encoders, linker, debug info) with a far smaller frontend and no runtime. Bringing C up end-to-end first de-risks everything Swift depends on.
-2. **Measure first.** Baselines and the benchmark harness ([14](14-measurement-methodology.md)) are milestone-0 deliverables, so every later claim has something to be measured against.
+2. **Measure first.** Baselines, the benchmark harness and the built-in profiler ([14](14-measurement-methodology.md)) are milestone-0 deliverables, so every later claim has something to be measured against.
+3. **A vertical slice before breadth.** M0.5 is a thin end-to-end path (a tiny C subset to a running Linux executable). Every data layout in [18](18-data-catalog.md) gets its first real measurement from it, before any layer is built out horizontally ("compression-oriented programming").
 
 An earlier draft scheduled everything through self-hosting in 25 weeks. That schedule has been withdrawn. It did not account for the standard library, generics, runtime metadata, or module serialization ([11](11-generics-and-runtime-metadata.md), [12](12-standard-library-strategy.md), [13](13-modules-and-incremental-builds.md)). Milestones are now sized one at a time, using what was measured in the previous milestone. M4 (Tier 0 Swift) and M6 (Tier 1) are expected to be the largest by a wide margin.
 
@@ -26,22 +27,27 @@ An earlier draft scheduled everything through self-hosting in 25 weeks. That sch
 
 ## 4. Module graph and repository layout
 
-### 4.1 Swift package modules
+### 4.1 Swift package modules (D10)
 
 ```
-Source ─► Lex ─► Parse ─► Sem ─► AIR ─► Opt ─► LIR ─► Codegen ──┐
-             └─────────────────────────► Asm ───────────────────┤
-                                         Encode  (shared: Codegen, Asm; instruction tables,
-                                                  encoders, disassembler)
-                                         Object  (shared: Codegen, Asm, Linker; relocatable
-                                                  object model, ELF/Mach-O readers & writers)
-                                                         Linker ◄┘
-Driver ─► everything
+SwiftStack (one library module; folders, not modules)
+  Source/ Lex/ Parse/ Sem/ AIR/ Opt/ LIR/ Codegen/
+  Encode/   shared instruction tables, encoders, disassembler (Codegen, Asm)
+  Object/   relocatable object model, ELF/Mach-O readers & writers (Codegen, Asm, Linker)
+  Asm/ Linker/
+Driver (executable) ─► SwiftStack
+Runtime/Tier0, Runtime/Tier1 ─ built by Swift-Stack itself, not by SwiftPM
 ```
 
-- `Encode` and `Object` are leaf libraries with no dependency on the compiler. That keeps the assembler and linker usable on their own ([04](04-backend.md), [05](05-assembler.md), [06](06-linker.md)).
-- `Asm` depends on `Lex` (shared lexer infrastructure), `Encode` and `Object`, and not on `Codegen`.
-- Targets are added to `Package.swift` only when their source directories exist, so the manifest always builds.
+- **One module** so that `Column`, handle types and hot helpers are specialized and inlined everywhere without cross-module annotations (D10). Release builds use whole-module optimization.
+- **Folder dependencies are still a rule:**
+  - `Encode/` and `Object/` MUST NOT reference compiler folders, which keeps the assembler and linker usable on their own ([04](04-backend.md), [05](05-assembler.md), [06](06-linker.md));
+  - `Asm/` MUST NOT reference `Codegen/`.
+
+  A CI script checks folder-level imports by symbol prefix and file location.
+- Standalone tools (`ss-as`, `ss-ld`, `ss-demangle`, `ssdb`), when they exist, are thin executable targets over `SwiftStack`.
+- Test targets use `@testable import SwiftStack`.
+- **Current state:** `Package.swift` still has separate `Source` and `Lex` targets. Merging them into `SwiftStack` is an M0 task.
 
 ### 4.2 Repository layout
 
@@ -49,15 +55,17 @@ Driver ─► everything
 swift-stack/
 ├── Package.swift
 ├── README.md
-├── docs/architecture/            # This document set (00–17)
+├── docs/architecture/            # This document set (00–18)
 ├── Sources/
-│   ├── Source/  Lex/  Parse/  Sem/  AIR/  Opt/  LIR/  Codegen/
-│   ├── Encode/  Object/  Asm/  Linker/  Driver/
+│   ├── SwiftStack/               # One module (D10), organized by folder:
+│   │   ├── Source/  Lex/  Parse/  Sem/  AIR/  Opt/  LIR/  Codegen/
+│   │   └── Encode/  Object/  Asm/  Linker/  Profile/  Census/
+│   ├── Driver/
 │   └── Runtime/
 │       ├── Tier0/                # Freestanding runtime (Swift + C23)
 │       └── Tier1/                # Full runtime: refcounting, metadata, casts, concurrency
 ├── Tests/
-│   ├── <Module>Tests/            # SwiftPM unit test targets, one per module
+│   ├── SwiftStackTests/          # Unit tests (@testable import), one folder per subsystem
 │   ├── Golden/                   # --dump=<stage> golden files (FileCheck-style)
 │   └── Differential/             # Harness for swiftc / clang / GNU as / lld oracles
 ├── Benchmarks/                   # Harnesses and machine descriptions (see 14)
@@ -74,9 +82,12 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
 ### M0 — Foundation and measurement
 
 - **Deliverables:**
-  - `Column`/arena infrastructure ([00](00-overview-and-principles.md));
+  - restructure the package into the single `SwiftStack` module (D10);
+  - `Column`/arena infrastructure with reserve-then-commit storage and nil row 0 ([00](00-overview-and-principles.md) Principles 2 and 7). The existing `TokenBuffer` (four separate `malloc`s, copy-on-grow) and `SourceManager` (a class with a `[String: FileId]` dictionary) are brought in line with this;
   - `SourceManager`;
-  - Swift and C lexers;
+  - Swift and C lexers, with inner loops marked `@_noAllocation` (Principle 8);
+  - the built-in profiler and repetition tester ([14](14-measurement-methodology.md));
+  - `ss-census`, a feature-census tool that counts Swift features, attributes and flags used in a source tree, ranks the unsupported ones by use count, and runs in CI over the pinned Todhchai snapshot. It keeps [02](02-semantic-analysis.md) §4.3.5 current and orders work in M4 and M6 by real use;
   - benchmark harness and reference-machine setup ([14](14-measurement-methodology.md));
   - baseline numbers for `swiftc`, Clang and lld on the corpora;
   - `--dump`, `--stats` and `--time-phases` plumbing ([15](15-driver-and-diagnostics.md)).
@@ -84,6 +95,20 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - B1 measured for both languages, with the target met or the gap documented;
   - baselines recorded;
   - CI instruction-count gating live.
+
+### M0.5 — Vertical slice
+
+- **Deliverables:** the thinnest possible end-to-end path, written directly and without generality.
+  - **C subset:** `int`/`long`/pointers, functions, locals, `if`/`while`/`return`, calls, string literals.
+  - **Pipeline:** lexer → postorder parse tree → minimal type checking → AIR → naive instruction selection → simple linear scan → x86-64 encoding → static ELF linked in process → runs on Linux. It calls `write`/`exit` through a hand-written `_start`.
+  - The built-in profiler is wired through every stage. `--stats` reports per-table sizes.
+- **Exit:**
+  - the slice compiles and runs a small program corpus (e.g. a few dozen c-testsuite programs in the subset);
+  - cycles per byte (or per item) are measured for every stage;
+  - each table in [18](18-data-catalog.md) touched by the slice has its layout hypothesis confirmed or revised, with the measurement recorded;
+  - a recorded decision on which parts of the slice become the foundation and which are rewritten.
+
+The slice is deliberately throwaway where needed. Its purpose is to replace guesses in chapters 01–04 with measurements before M1–M3 build each layer out.
 
 ### M1 — C23 frontend
 
@@ -115,6 +140,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - linker for Todhchai static ELF and Linux static/dynamic ELF ([06](06-linker.md));
   - CUD and `.eh_frame`;
   - minimal SDI plus an `ssdb` symbolizer ([07](07-debugging-and-sdi.md)).
+  - `--record`/`--replay` compile bundles ([15](15-driver-and-diagnostics.md)), so every M3 bug report and fuzzer find is one reproducible file.
 - **Exit:**
   - c-testsuite and SQLite's test suite pass on Linux x86-64 via differential execution against Clang;
   - a C program built by Swift-Stack runs on Todhchai;
@@ -239,7 +265,7 @@ Floating-point differences are triaged under the policy in [14](14-measurement-m
 ### 6.3 Robustness
 
 - **Coverage-guided fuzzing** of the lexers, preprocessor, parsers, assembler parser, and the ELF/Mach-O object readers. The compiler MUST NOT crash or hang on any input.
-- Fuzzing runs continuously. Crashes found by fuzzing become regression tests.
+- Fuzzing runs continuously. Crashes found by fuzzing are saved as `.ssrec` record bundles ([15](15-driver-and-diagnostics.md) §4.8), and each bundle becomes a regression test replayed in CI.
 
 ### 6.4 Performance gates
 
@@ -249,4 +275,5 @@ See [14](14-measurement-methodology.md) §9.
 
 1. Should the macOS target move earlier, since it's a common developer host? Swift-Stack can run on macOS (built by `swiftc`) long before it can *target* macOS.
 2. Is Linux the right first host target, or should FreeBSD come first to match Todhchai's developer environment?
-3. Which Todhchai components define the M4 corpus beyond `userboot`, `devmgr` and `fs`?
+3. Which Todhchai components define the M4 corpus beyond `userboot`, `devmgr` and `fs`? `ss-census` output can guide this.
+4. Should relocatable, patchable code modules (live code editing, Todhchai principle 17) come before macOS Mach-O output in M7? Function-level incremental compilation ([13](13-modules-and-incremental-builds.md)) plus patchable modules would give edit-and-continue in seconds ([06](06-linker.md) open questions).

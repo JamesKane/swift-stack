@@ -79,12 +79,14 @@ Each decision has an ID that other chapters cite. Status is **Proposed** until t
 | **D7** | **C dialect.** ISO C23 plus a documented "host-header profile" of GNU/Clang extensions (attributes, `__builtin_*`, asm labels, `_Nullable`, `__has_feature`, inline asm, vector types) sufficient to parse glibc, FreeBSD libc and macOS SDK headers. | Without it, C interop on POSIX hosts is impossible; full GNU C is unbounded. | Proposed |
 | **D8** | **Storage.** Persistent compiler tables use `Column<Element>` (§6, Principle 2), not Swift `Array`. Transient scratch code may use `Array`. | Keeps ARC and copy-on-write out of hot tables. Gives stable addresses and O(1) reset. | Proposed |
 | **D9** | **SIMD and vectorization.** Portable SIMD is required: Swift `SIMDn<T>` and C `vector_size`/`ext_vector_type` lower to native vector code at each ISA baseline, at every optimization level. The baselines are: x86-64 at the 2013 Mac Pro-class floor (`x86-64-v2` + AVX, F16C, AES-NI, PCLMULQDQ, RDRAND, FSGSBASE; AVX2/FMA/BMI opt-in); AArch64 `armv8-a` with NEON; RV64 **RVA23** (RVV 1.0, Zba/Zbb/Zbs, Zicond, …). Loop idiom recognition is required at `-O`. Auto-vectorization of inner loops is an **optional** track (`-vectorize`), built on the same AIR vector operations and legalization tables, and becomes default only when it meets its compile-time budget. ([17](17-simd-and-vectorization.md)) | Hand-written per-architecture SIMD is tedious. Todhchai already writes its codec kernels with `SIMDn` types and guards out RV64. Making portable SIMD good everywhere removes the per-architecture work for experts. Auto-vectorization helps ordinary code, but it is the most complex pass in a conventional optimizer, so it is not a spec requirement. | Proposed |
+| **D10** | **Compiler module structure.** The compiler, assemblers and linker are **one Swift library module, `SwiftStack`**, organized by folders (`Source/`, `Lex/`, `Parse/`, `Sem/`, `AIR/`, `Opt/`, `LIR/`, `Codegen/`, `Encode/`, `Object/`, `Asm/`, `Linker/`), plus a thin `Driver` executable target. Hot generic types (`Column`, handles) are `@frozen`, with `@inlinable` accessors. Release builds use whole-module optimization. Swift-Stack's own build time is budgeted (B14, [14](14-measurement-methodology.md)). | Swift does not specialize or inline non-`@inlinable` generic code across module boundaries. A 13-module split would put unspecialized `Column` accessors on every hot path, and it builds slower. A single module is Swift's version of a unity build. | Proposed |
+| **D11** | **Parallelism: lanes, not a job system.** Every worker runs the same phase function over a deterministic partition of that phase's input, identified by `(laneIndex, laneCount)` and separated by barriers. The partition is by stable key and sized by estimated cost. Irregular phases (per-function optimization and codegen, call-graph SCC levels) take items from a pre-sorted work array through a shared atomic cursor, and write results by item index. There is no general job graph and no work-stealing deque in v1. ([15](15-driver-and-diagnostics.md) §4.3) | "Multi-core by default" (Fleury). There is no scheduler to build or debug, determinism (D6) follows from fixed partitioning, and the phase structure is visible in the code. | Proposed |
 
 ## 6. Core principles
 
 ### Principle 1: Arrays over objects
 
-Compiler entities (tokens, parse nodes, types, declarations, instructions, symbols) are rows in typed tables addressed by 32-bit handles (`TokenId`, `NodeId`, `TypeId`, `InstId`, `BlockId`, `SymbolId`). Tables are stored as **struct-of-arrays (SoA)**: one contiguous column per field, so a pass that reads only `kind` touches only the `kind` column.
+Compiler entities (tokens, parse nodes, types, declarations, instructions, symbols) are rows in typed tables addressed by 32-bit handles (`TokenId`, `NodeId`, `TypeId`, `InstId`, `BlockId`, `SymbolId`). Tables are stored in contiguous arena memory. Where passes sweep or filter one field at a time, a table is stored as **struct-of-arrays (SoA)**, one contiguous column per field, so a pass that reads only `kind` touches only the `kind` column. Tables consumed whole-row use array-of-structs instead (Principle 6).
 
 ```
 ParseTree (postorder, SoA)
@@ -167,6 +169,40 @@ Parallelism is only allowed where it cannot change the output (D6). In practice:
 - **Hash tables are never iterated to produce output** unless iteration order is defined.
 - **Output layout is a pure function of the canonical inputs:** sections, symbols, relocations and debug tables ([06](06-linker.md)).
 
+### Principle 6: Layout follows transforms
+
+"The purpose of all programs is to transform data" (Acton). A table's layout is chosen from the passes that read and write it, the fields each one touches, and the row counts. It is not chosen by blanket rule:
+
+- **Struct-of-arrays** suits tables that passes filter or sweep one field at a time, such as token kinds, parse-node kinds, and type kinds and flags.
+- **Array-of-structs** (or hybrid AoSoA) suits tables that are consumed whole-row, such as LIR instructions in the encoder and register allocator, relocations, and live intervals.
+
+Every persistent table is listed in the data catalog ([18](18-data-catalog.md)) with its producers, consumers, access pattern, expected size and current layout. Layouts in the chapters are **initial hypotheses**, to be revised from the M0.5 vertical slice ([09](09-roadmap.md)) with the built-in profiler ([14](14-measurement-methodology.md)). A layout change needs an attached measurement. APIs come in batch form ("where there's one, there's many"): append ranges, lookup batches, and diagnostics in bulk.
+
+### Principle 7: Zero is nil
+
+Row 0 of every table is a valid **nil row**, with default field values and a self-referencing parent. Handle value 0 means "none" everywhere (zero-is-initialization):
+
+- Looking up a nil handle returns harmless defaults instead of trapping.
+- Most `Optional<Id>` branches disappear.
+- Error recovery reduces to propagating nil. `TypeId 0` is the nil/error type that suppresses cascading diagnostics ([02](02-semantic-analysis.md), [10](10-semantic-ir-and-name-resolution.md) §4.8).
+
+Freshly reserved arena memory is zero, so a zeroed row is always a valid (nil) row.
+
+### Principle 8: Hot-path discipline for the compiler's own Swift
+
+D8 keeps ARC out of the tables. These rules keep it out of the code that walks them, and apply in every pass inner loop:
+
+- No class instances, existentials (`any P`), `String`, `Array`/`Dictionary` growth, or escaping closures. Use interned `AtomId`s instead of strings, and arena scratch buffers instead of `Array`.
+- Dispatch with `switch` over kind enums, not protocol witnesses. Closed `enum`s replace protocols for target selection ([05](05-assembler.md), [08](08-runtime-and-stdlib.md)).
+- Hot generics are `@frozen`/`@inlinable` and specialized (D10).
+- **Enforced, not reviewed:** lexer, parser, register-allocator and encoder inner loops are marked `@_noAllocation`. `swiftc` already checks this attribute, and Swift-Stack will too once self-hosted, so unwanted allocation or retain/release fails the build instead of showing up in a profile.
+
+### Principle 9: Measure from first principles, with built-in tools
+
+- **Budgets are stated in cycles per byte or per item** next to the hardware limit, not only relative to other compilers ([14](14-measurement-methodology.md)).
+- **The profiler is part of the compiler** (always compiled in, cycle-counter timed blocks, per-lane timelines), and so is a repetition tester for kernels. Measurement then works the same on Todhchai, where `perf` does not exist.
+- **Every compile is recordable.** `--record` captures all inputs, including macro-plugin responses, into one bundle, and `--replay` reproduces the compile bit for bit (D6, [15](15-driver-and-diagnostics.md)). Bug reports and fuzzer finds become one file each.
+
 ## 7. Targets
 
 ### Primary: Todhchai OS on croi
@@ -196,40 +232,46 @@ Targets are brought up in order: **Todhchai static ELF → Linux → FreeBSD →
 
 ## 8. Execution model
 
+Every phase runs on all lanes (D11). "Lanes over X" means a deterministic partition of X by stable key. "Cursor over X" means lanes take items from a pre-sorted array through an atomic cursor and write results by index.
+
 ```
-Phase 1  Lex + parse + declaration collection         parallel per file
+Phase 1  Lex + parse + declaration collection         lanes over files (by size)
            │  per-file ParseTrees, provisional handles
-           ▼
+           ▼  barrier
 Phase 2  Name binding, extensions, operators,         sequential in v1
          eager macro expansion, signatures,            (memoized requests)
          conformances
-           │  canonical renumbering (D6)               serial barrier
+           │  canonical renumbering (D6)               barrier
            ▼
-Phase 3  Body type checking → SemIR → AIR             parallel per function
+Phase 3  Body type checking → SemIR → AIR             cursor over functions
          (incl. mandatory lowering)
-           │
-           ▼
-Phase 4  Interprocedural optimization                 parallel per call-graph SCC,
-         (specialization, inlining)                    bottom-up order
-           ▼
-Phase 5  Intraprocedural optimization → LIR →         parallel per function
+           ▼  barrier
+Phase 4  Interprocedural optimization                 cursor over each SCC level,
+         (specialization, inlining)                    bottom-up, barrier per level
+           ▼  barrier
+Phase 5  Intraprocedural optimization → LIR →         cursor over functions
          register allocation → encoding
            │  in-memory RelocatableObjects
-           ▼
-Phase 6  Link: resolve, lay out, relocate, emit       parallel per input section
+           ▼  barrier
+Phase 6  Link: resolve, lay out, relocate, emit       lanes over input sections
 ```
 
-Scaling is bounded by the serial barriers, by Phase 2 (sequential in v1, to be parallelized only if measurement shows it matters), and by the dependency structure of Phase 4 (Amdahl). The detailed semantic-phase breakdown is in [10](10-semantic-ir-and-name-resolution.md) §4.6. Speed-up curves by core count are part of the benchmark suite. "Linear scaling" is not assumed.
+Scaling is bounded by the barriers, by Phase 2 (sequential in v1, to be parallelized only if measurement shows it matters), and by the depth of the SCC levels in Phase 4 (Amdahl). The detailed semantic-phase breakdown is in [10](10-semantic-ir-and-name-resolution.md) §4.6. Speed-up curves by core count are part of the benchmark suite, and the built-in profiler shows per-lane idle time at each barrier. "Linear scaling" is not assumed.
 
 ## 9. Alternatives considered
 
 - **Reuse LLVM as the backend.** This would give mature codegen and close the 10–20% gap immediately. Rejected: it contradicts G2/G3 and reintroduces the IR and compile-time costs the project exists to avoid. It could serve as a temporary oracle for codegen correctness.
 - **Apple Swift ABI compatibility from day one.** This would allow linking existing Swift binaries. Deferred (D1): it multiplies scope (mangling, metadata, runtime) before the compiler works at all.
-- **Array-of-structs tables with Swift `Array`.** Simpler code. Rejected for persistent tables (D8) because of copy-on-write and ARC overhead and the lack of stable addresses. Still fine for scratch data.
+- **Swift `Array` for persistent tables.** Simpler code. Rejected (D8) because of copy-on-write and ARC overhead and the lack of stable addresses. Still fine for scratch data. (Array-of-structs as a *layout* is a separate question, decided per table under Principle 6.)
+- **Struct-of-arrays for every table.** Rejected (Principle 6). It costs several cache streams per item for tables consumed whole-row.
+- **One Swift module per subsystem (13 modules).** Rejected (D10). Module boundaries block generic specialization and inlining in Swift, and slow the compiler's own build.
+- **A work-stealing job graph.** Rejected as the default (D11). It is more machinery than phase-structured lanes, and its scheduling order has to be engineered out of the output to keep D6.
+- **Design every subsystem fully before writing code.** Rejected in favor of an early vertical slice (M0.5, [09](09-roadmap.md)). Byte-level layouts in this document set are hypotheses until the slice and profiler confirm them ("compression-oriented programming", Muratori).
 
 ## 10. Open questions
 
 1. Is ASLR required for Todhchai user processes, which would mean PIE images instead of fixed `0x1000000`? ([06](06-linker.md))
 2. Should Tier 1 eventually pursue Apple Swift ABI compatibility on macOS, or remain self-contained?
 3. What is the minimum host Swift toolchain for bootstrapping before self-hosting? Currently Swift 6.2+.
-4. How will the D1–D9 decisions be accepted and versioned? This doc's table, or separate ADR files?
+4. How will the D1–D11 decisions be accepted and versioned? This doc's table, or separate ADR files?
+5. Should relocatable, patchable code modules (live code editing in the Handmade Hero style, Todhchai principle 17) be prioritized ahead of macOS Mach-O output ([06](06-linker.md), [09](09-roadmap.md))?

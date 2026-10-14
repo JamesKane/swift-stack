@@ -13,7 +13,7 @@ A Swift-Stack module compiles to three artifacts:
 2. **Objects**, in the [06](06-linker.md) `Object` model, serialized as ELF or Mach-O when written to disk. They carry `.ss_symtypes` and an `.ss_debug` SDI fragment.
 3. **Dependency records**, used by incremental builds.
 
-The driver ([15](15-driver-and-diagnostics.md)) schedules modules as a DAG. Rebuild decisions use fine-grained, per-declaration interface hashes, so a change to a function body does not invalidate the modules or files that depend on it. All artifacts are stored in a content-addressed cache, which is safe because outputs are deterministic (D6).
+The driver ([15](15-driver-and-diagnostics.md)) orders modules by their dependency DAG and runs each phase across all worker lanes (D11). Rebuild decisions use fine-grained, per-declaration interface hashes, so a change to a function body does not invalidate the modules or files that depend on it. All artifacts are stored in a content-addressed cache, which is safe because outputs are deterministic (D6).
 
 ## 2. Goals
 
@@ -135,18 +135,30 @@ Function-level caching: within a file that must be rebuilt, the code for each fu
 - **Values.** Module interfaces, macro expansion results, per-file SemIR summaries, per-function code and SDI records, objects, header-parse results, and dependency records.
 - **Location.** A per-user cache (for example `$XDG_CACHE_HOME/swift-stack`) plus an optional per-project cache. Eviction is least-recently-used with a size cap.
 - **Integrity.** Each value records its key and a content hash and is verified when read; a corrupt entry is discarded and rebuilt.
-- **Sharing.** Because of D6 and path remapping, cache entries may be shared between machines with the same compiler build. A remote cache is an open question (§8, question 5).
+- **Sharing.** Because of D6 and path remapping, cache entries may be shared between machines with the same compiler build. A remote cache is deferred until a concrete user exists (§8, question 5).
 
 ### 5.7 Driver build graph
 
-The driver ([15](15-driver-and-diagnostics.md)) builds a DAG of jobs: per-module declaration phase, per-file (or per-function-batch) body phase, per-TU C compilation, assembly, and link. It:
+The driver ([15](15-driver-and-diagnostics.md) §4.3) orders work by the module dependency DAG. It does not build a general job graph. Each step is a phase run by all lanes (D11): per-module declaration phase, per-file (or per-function-batch) body phase, per-TU C compilation, assembly, and link. Independent modules at the same depth share a phase. The driver:
 
 1. Loads the previous dependency records and computes the invalid set (§5.5) before scheduling anything.
-2. Runs jobs on the work-stealing pool, with module pipelining (§5.2).
+2. Runs the phases with module pipelining (§5.2): a dependent module's declaration phase can join the same lane phase as its upstream module's body phase.
 3. Compares the interface fingerprint after each declaration phase. If the fingerprint did not change, no downstream module is invalidated, even though the module's bodies are recompiled.
 4. Writes new dependency records atomically when the build finishes.
 
 A *null build* (nothing changed) MUST check only content hashes and `stat` results and do no compiler work.
+
+### 5.8 Record bundles
+
+A record bundle (`.ssrec`, [15](15-driver-and-diagnostics.md) §4.8) is a single file in the same content-addressed store format as §5.6. It holds:
+
+- every input blob a compilation read, keyed by content hash;
+- the command line, target and pins;
+- the macro-plugin responses ([16](16-macros.md) §5.7);
+- the compiler build id;
+- the expected output hashes.
+
+Replay mounts the bundle as the only file system and plugin source. Because inputs are already content-addressed and outputs are deterministic (D6), recording adds no new identity scheme, just a way to export a closed subset of the store.
 
 ## 6. Incremental-build targets
 
@@ -176,5 +188,5 @@ Each scenario is also a correctness test: the incremental output MUST be bitwise
 2. What granularity should the body phase use: per file, or per function batch? Per-function batches balance work better but complicate dependency records.
 3. Should inlinable bodies be serialized as AIR before or after optimization? Before is more stable across optimizer changes; after is faster for importers.
 4. How should header caching handle macro state? It could be keyed by the full incoming macro-state digest, or only by the macros the header actually tests (more cache hits, more bookkeeping).
-5. Should there be a remote or shared cache protocol, and what trust model would it need (signed entries, a build-id allow-list)?
+5. *Deferred:* a remote or shared cache protocol, and the trust model it would need (signed entries, a build-id allow-list). Revisit when a concrete user exists.
 6. When Tier 1 library evolution is added, does the interface hash split into separate "layout" and "API" hashes?

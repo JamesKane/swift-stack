@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [09](09-roadmap.md), [15](15-driver-and-diagnostics.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [09](09-roadmap.md), [13](13-modules-and-incremental-builds.md), [15](15-driver-and-diagnostics.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
 
 ## 1. Summary
 
@@ -33,23 +33,33 @@ It follows the Todhchai principle "slower is a claim to measure, not assume". Th
 
 All values are **targets**. The "Baseline" column records the comparison toolchain to be measured; until it has been measured it says *TBM* (to be measured). Earlier drafts quoted figures such as "`swiftc`: ~40 MB/s lexing". Those were unsourced and have been removed.
 
-| ID | Metric | Target | Baseline | Status |
-|---|---|---|---|---|
-| B1 | Lexing throughput, single core | ≥ 600 MB/s | `swiftc -dump-parse` lex phase, Clang `-E`: TBM | Unmeasured |
-| B2 | Parsing throughput (lex + parse), single core | ≥ 300 MB/s | `swiftc -parse`, Clang `-fsyntax-only` (C, headers pre-expanded): TBM | Unmeasured |
-| B3 | End-to-end debug build, single core | ≥ 100,000 lines/s | `swiftc -Onone` + lld; `clang -O0` + lld: TBM | Unmeasured |
-| B4 | End-to-end optimized build, single core | ≥ 20,000 lines/s | `swiftc -O`; `clang -O2`: TBM | Unmeasured |
-| B5 | Link time, Todhchai system-service image | < 50 ms | `ld.lld` with equivalent inputs: TBM | Unmeasured |
-| B6 | SDI emission, 100K-line program | < 5 ms | `ld.lld` DWARF 5 handling: TBM | Unmeasured |
-| B7 | Stack unwind, 100 frames, frame-pointer path | < 2 µs | libunwind with `.eh_frame`: TBM | Unmeasured |
-| B8 | Peak RSS, 100K-line build | < 256 MB | `swiftc` + LLVM: TBM | Unmeasured |
-| B9 | Runtime performance, optimized | 80–90% of `clang -O2` (C) / `swiftc -O` (Swift) (geomean per category, §7) | `swiftc -O`, `clang -O2` | Hypothesis |
-| B10 | Incremental rebuild after body-only edit, 100K-line module | < 200 ms | `swiftc` incremental: TBM | Unmeasured |
-| B11 | Assembling a typical OS stub (`start.S`, context switch) | < 1 ms | GNU `as`, Clang integrated assembler: TBM | Unmeasured |
-| B12 | Macro expansion overhead: plugin start-up, per-expansion round-trip, and cache-hit cost, on the Todhchai `@IPCLibrary` corpus | Per-expansion host overhead (excluding plugin compute) < 0.5 ms; cache hit < 20 µs | `swiftc` with the same plugins: TBM | Unmeasured |
-| B13 | Compile-time cost of `-vectorize` (optional loop vectorizer, [17](17-simd-and-vectorization.md)) | ≤ 5% added to optimized build time on `swift-real` and `c-real`; its benefit is reported per B9 category | LLVM loop vectorizer share of `clang -O2` time: TBM | Unmeasured |
+| ID | Metric | Target | Per item at 3.5 GHz | Baseline | Status |
+|---|---|---|---|---|---|
+| B1 | Lexing throughput, single core | ≥ 600 MB/s | ≈ 5.8 cycles/byte | `swiftc -dump-parse` lex phase, Clang `-E`: TBM | Unmeasured |
+| B2 | Parsing throughput (lex + parse), single core | ≥ 300 MB/s | ≈ 11.7 cycles/byte | `swiftc -parse`, Clang `-fsyntax-only` (C, headers pre-expanded): TBM | Unmeasured |
+| B3 | End-to-end debug build, single core | ≥ 100,000 lines/s | ≈ 35,000 cycles/line | `swiftc -Onone` + lld; `clang -O0` + lld: TBM | Unmeasured |
+| B4 | End-to-end optimized build, single core | ≥ 20,000 lines/s | ≈ 175,000 cycles/line | `swiftc -O`; `clang -O2`: TBM | Unmeasured |
+| B5 | Link time, Todhchai system-service image | < 50 ms | ≈ 175 M cycles per link | `ld.lld` with equivalent inputs: TBM | Unmeasured |
+| B6 | SDI emission, 100K-line program | < 5 ms | ≈ 175 cycles/line | `ld.lld` DWARF 5 handling: TBM | Unmeasured |
+| B7 | Stack unwind, 100 frames, frame-pointer path | < 2 µs | ≈ 70 cycles/frame | libunwind with `.eh_frame`: TBM | Unmeasured |
+| B8 | Peak RSS, 100K-line build | < 256 MB | ≈ 2.6 KB/line | `swiftc` + LLVM: TBM | Unmeasured |
+| B9 | Runtime performance, optimized | 80–90% of `clang -O2` (C) / `swiftc -O` (Swift) (geomean per category, §7) | — | `swiftc -O`, `clang -O2` | Hypothesis |
+| B10 | Incremental rebuild after body-only edit, 100K-line module | < 200 ms | ≈ 700 M cycles per rebuild | `swiftc` incremental: TBM | Unmeasured |
+| B11 | Assembling a typical OS stub (`start.S`, context switch) | < 1 ms | ≈ 3.5 M cycles per file | GNU `as`, Clang integrated assembler: TBM | Unmeasured |
+| B12 | Macro expansion overhead: plugin start-up, per-expansion round-trip, and cache-hit cost, on the Todhchai `@IPCLibrary` corpus | Per-expansion host overhead (excluding plugin compute) < 0.5 ms; cache hit < 20 µs | ≈ 1.75 M cycles per expansion; ≈ 70,000 cycles per cache hit | `swiftc` with the same plugins: TBM | Unmeasured |
+| B13 | Compile-time cost of `-vectorize` (optional loop vectorizer, [17](17-simd-and-vectorization.md)) | ≤ 5% added to optimized build time on `swift-real` and `c-real`; its benefit is reported per B9 category | — | LLVM loop vectorizer share of `clang -O2` time: TBM | Unmeasured |
+| B14 | Clean build of Swift-Stack itself (D10), ~100K lines, reference machine, current host `swiftc` | ≤ 20 s debug; ≤ 60 s release (WMO) | ≈ 700,000 cycles/line (debug) | Tracked over time; no external baseline | Unmeasured |
 
-Chapters MAY define finer-grained internal budgets (e.g. AIR instructions optimized per second). They MUST use the same measurement rules.
+The "per item" column converts each target into a cycle budget, assuming a **3.5 GHz reference clock** (an assumption to be replaced by the reference machines' measured sustained clock). It states the cost of one unit of work, which is easier to reason about against the hardware than a rate.
+
+Chapters MAY define finer-grained internal budgets (e.g. AIR instructions optimized per second). They MUST use the same measurement rules and SHOULD state them in cycles per item as well.
+
+**Speed of light.** Each throughput target is compared with what the hardware can do, not only with other compilers:
+
+- **Memory bandwidth is not the limit.** A single core streams sequential memory at roughly 10–20 GB/s, which is well under 0.5 cycles per byte. B1 (≈ 5.8 cycles/byte) and B2 (≈ 11.7 cycles/byte) are therefore far from memory-bound: lexing and parsing are **compute-bound**, limited by instructions and branches per byte.
+- **The lexer's realistic ceiling.** A SWAR or SIMD lexer that classifies bytes in bulk and branches once per token, not once per byte, plausibly needs 1–2 cycles per byte. That suggests B1 could be raised several-fold.
+- **Targets are revised from data.** They are raised once the M0 repetition-tester measurements (§8) show where the real limit is. They are not lowered without a recorded reason.
+- **These figures are estimates** to be confirmed on the reference machines, not measurements.
 
 ## 5. Metric definitions
 
@@ -110,6 +120,18 @@ Corpora are pinned by content hash. Changing a corpus resets the regression hist
   - wall-time metrics: ≥ 10 runs after 2 warm-up runs, reported as median and median absolute deviation (MAD);
   - runtime benchmarks: each benchmark run until its 95% confidence interval is within ±1%, or 30 runs, whichever comes first.
 - **Baselines** are re-measured whenever the comparison toolchain version changes. Versions are recorded alongside results.
+- **Built-in profiler (primary attribution tool).** Every phase and hot routine is wrapped in a timed block that reads the cycle counter: `rdtsc` on x86-64, `cntvct_el0` on AArch64, `rdtime` on RV64 ([15](15-driver-and-diagnostics.md) §4.7).
+  - Blocks are always compiled in and cost one predictable branch when off.
+  - `--profile=<file>` writes per-lane timelines as Chrome trace JSON.
+  - It runs identically on Linux, FreeBSD, macOS and Todhchai. That makes it the one tool available everywhere, including on croi, where `perf` and Cachegrind don't exist.
+  - Counter frequencies are calibrated at startup and recorded in the output. `cntvct_el0` and `rdtime` tick at a fixed timer rate rather than the core clock, so their results are reported in nanoseconds and converted to cycles using the measured core clock.
+- **Repetition tester.** `Benchmarks/` contains a harness for kernels (the lexer inner loop, instruction encoding, relocation application, legalization tables). It runs a kernel repeatedly on fixed input until the best time stops improving, and reports:
+  - best and mean cycles per byte or per item;
+  - effective bandwidth;
+  - the ratio to the speed-of-light estimate (§4).
+
+  This is how budgets get grounded in the hardware.
+- **External tools (secondary).** `perf`, Cachegrind and hardware counters are used for deeper analysis (cache misses, branch mispredictions) and for retired-instruction gating where available. No measurement in this chapter depends on them alone.
 
 ## 9. Continuous integration gates
 
@@ -118,6 +140,8 @@ Wall-clock time on shared CI machines is too noisy to gate on small percentages.
 | Signal | Tool | Gate |
 |---|---|---|
 | Retired instructions per phase on fixed corpora | `perf stat -e instructions` (Linux) or Cachegrind | Fail if > 2% increase vs. the main-branch rolling median |
+| Cycles per phase, from the built-in profiler (used where hardware instruction counts are unavailable, e.g. Todhchai, some CI virtual machines) | `--profile`, median of 5 runs | Fail if > 5% increase (cycles are noisier than retired instructions, hence the wider threshold) |
+| Self-build time (B14) | Nightly on reference machines | Alert on a sustained shift > 10% |
 | Peak RSS on fixed corpora | `ru_maxrss` | Fail if > 2% increase |
 | Output size (text, data, SDI) | Driver statistics | Fail if > 1% increase without an accompanying note |
 | Wall time on reference machines | Nightly, not per commit | Alert when a sustained shift > 5% is detected by a change-point test |
@@ -129,6 +153,7 @@ Intentional regressions are allowed with a commit trailer (`Perf-Regression: <re
 
 - **Gate on wall time per commit.** Rejected: noise on shared hardware exceeds the 2% threshold.
 - **Single aggregate runtime score.** Rejected: hides the category-specific risks in Principle 4.
+- **Rely only on external profilers.** Rejected: they don't exist on Todhchai, differ between hosts, and see the compiler from outside. The built-in profiler sees phases and lanes as the compiler defines them, everywhere.
 
 ## 11. Open questions
 

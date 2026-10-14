@@ -276,7 +276,7 @@ Todhchai OS principle 17 makes debugging and hot reload OS services. SDI support
 - When Todhchai swaps a `CodeModule`, the debugger is notified on its event port. It maps the new generation's SDI and unmaps the old one when no frames of the old code remain live.
 - Breakpoints are stored as `(procedure display name, file, line)` and re-bound against the new generation. Breakpoints in unchanged procedures resolve to the same source positions; breakpoints in changed procedures are re-resolved, and the user is told if one cannot be bound.
 
-Hot reload needs relocatable code modules, which v1 does not link ([06](06-linker.md) §11, question 5).
+Hot reload needs relocatable code modules, which v1 does not link ([06](06-linker.md) §11, question 5). Whether patchable code modules for live code editing should move ahead of macOS output in the roadmap is [06](06-linker.md) §11, question 6.
 
 ## 6. Performance targets
 
@@ -297,6 +297,7 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md).
 - **Location expressions as bytecode (like DWARF).** Rejected in favor of a closed set of kinds plus `OPTIMIZED_OUT`. This costs some coverage of optimized code in exchange for simple and fast readers.
 - **Apple-style compact unwind alone.** Rejected: it is not precise at arbitrary instructions and depends on DWARF for fallbacks. CUD adds prologue and epilogue information and a table-based escape mode.
 - **Emitting SDI in the linker from the compiler's in-memory `TypePool`.** Rejected: it only works for single-process whole-program builds.
+- **Emit RDI directly, or a strict superset of it, instead of defining SDI.** Under evaluation (open question 6). RDI is a published format with an MIT-licensed reference implementation, so emitting it would give Swift-Stack the RAD Debugger wherever that debugger runs. SDI was designed after RDI, so the cost is mainly field layout and naming.
 
 ## 8. Open questions
 
@@ -305,3 +306,10 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md).
 3. Should DWARF in foreign C objects be converted to SDI at link time so that whole-program symbolication works on Todhchai, and at what cost?
 4. What is the RISC-V register for the async context, and does it change the CUD canonical prologue shapes? (Depends on [11](11-generics-and-runtime-metadata.md) §8, open question 2.)
 5. What is the policy for data formatters when stdlib storage layouts change, and how are their versions recorded in SDI?
+6. **Emit RDI instead of SDI?** Producing RDI directly, or a strict superset, would give Swift-Stack a mature debugger (the RAD Debugger) instead of only the `ssdb` symbolizer.
+   - **Clean-room:** compatible. RDI is a published format with an MIT-licensed reference implementation, and emitting a documented format is no different from emitting ELF or DWARF (Principle 3).
+   - **To evaluate:**
+     - the RAD Debugger's support for non-Windows hosts and ELF targets, to be verified at its current version;
+     - whether RDI can carry Swift-specific needs (async frame chains, metadata-dependent layouts, §5.7, and macro virtual files, §5.2) as extensions without forking the format;
+     - whether CUD maps onto RDI's unwind model.
+   - **Deadline:** this should be decided before the SDI layout is frozen in M3 ([09](09-roadmap.md)).

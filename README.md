@@ -103,7 +103,7 @@ All chapters are in [`docs/architecture/`](docs/architecture/). Each one has a S
 
 | # | Chapter | Covers |
 |---|---|---|
-| 00 | [Overview, Principles, and Key Decisions](docs/architecture/00-overview-and-principles.md) | Goals, non-goals, decision log D1–D9, DOD principles, `Column` storage, targets, execution model |
+| 00 | [Overview, Principles, and Key Decisions](docs/architecture/00-overview-and-principles.md) | Goals, non-goals, decision log D1–D11, DOD principles (layout follows transforms, zero is nil, hot-path rules), `Column` storage, targets, execution model |
 | 01 | [Frontend](docs/architecture/01-frontend.md) | Source buffers, SWAR lexing, SoA tokens, C23 preprocessor and `#embed`, postorder parse tree |
 | 02 | [Semantic Analysis](docs/architecture/02-semantic-analysis.md) | TypePool, C23 semantics, Swift staged type checking, Todhchai feature profile, strict concurrency, C/Swift interop |
 | 03 | [AIR and Optimizer](docs/architecture/03-intermediate-representation.md) | Flat SSA IR, mandatory lowering (ownership, lifetime, performance-annotation checks), optimization pipeline, `-Osize` |
@@ -121,6 +121,7 @@ All chapters are in [`docs/architecture/`](docs/architecture/). Each one has a S
 | 15 | [Driver and Diagnostics](docs/architecture/15-driver-and-diagnostics.md) | Personalities, job scheduling, plugin host, diagnostics engine, build-system integration |
 | 16 | [Swift Macros](docs/architecture/16-macros.md) | Plugin protocol, expansion buffers, lookup ordering, caching, Todhchai use cases |
 | 17 | [SIMD and Vectorization](docs/architecture/17-simd-and-vectorization.md) | ISA floors, portable SIMD lowering, legalization tables, loop idioms, optional auto-vectorizer |
+| 18 | [Data Catalog](docs/architecture/18-data-catalog.md) | Every persistent table: producers, consumers, access patterns, sizes, layout choice (hypotheses until measured) |
 
 ---
 

@@ -46,7 +46,7 @@ The assembler:
               ▼  Assembly lexer (shared Lex primitives; per-arch comment and separator rules)
          Statement stream: label | directive | instruction
               ▼  Macro and conditional expansion (.macro/.rept/.irp/.if...)
-              ▼  Per-target instruction parsing (AssemblerTarget) → Encode
+              ▼  Per-architecture instruction parsing (AssemblerArch switch) → Encode
          Fragments per section: fixed bytes | relaxable branch | alignment | fill | data expression
               ▼  Layout + branch relaxation to a fixpoint (§4.5)
               ▼  Fixup resolution: local → patched bytes; external or section-relative → relocations
@@ -54,52 +54,61 @@ The assembler:
 Object.RelocatableObject ──► Linker (06) in memory, or ELF/Mach-O .o via -c
 ```
 
-### 4.2 Module structure
+### 4.2 Component structure
 
-| Module | Role |
+All of these are folders in the single `SwiftStack` module (D10), not separate Swift modules:
+
+| Component | Role |
 |---|---|
-| `Asm` | Statement parser, directives, macro engine, expression evaluator, layout and relaxation, CFI processing, `AssemblerTarget` implementations |
-| `Encode` | Instruction tables, encoders, disassemblers (shared with `Codegen`; [04 §4.9](04-backend.md)) |
-| `Object` | `RelocatableObject` model and ELF/Mach-O writers (canonical in [06](06-linker.md)) |
-| `Lex` | SWAR scanning primitives and the C23 preprocessor |
+| `Asm/` | Statement parser, directives, macro engine, expression evaluator, layout and relaxation, CFI processing, per-architecture instruction parsers |
+| `Encode/` | Instruction tables, encoders, disassemblers (shared with `Codegen/`; [04 §4.9](04-backend.md)) |
+| `Object/` | `RelocatableObject` model and ELF/Mach-O writers (canonical in [06](06-linker.md)) |
+| `Lex/` | SWAR scanning primitives and the C23 preprocessor |
 
-`Asm` depends on `Source`, `Lex`, `Encode` and `Object`. It does **not** depend on `Codegen`. `Package.swift` should reflect this once `Encode` and `Object` exist.
+**Layering rule:** code in `Asm/` uses `Source/`, `Lex/`, `Encode/` and `Object/`, and MUST NOT reference `Codegen/`. With one module, the compiler can't enforce this, so a CI check on cross-folder symbol references does ([09](09-roadmap.md)).
 
-### 4.3 The `AssemblerTarget` protocol
+### 4.3 Architecture dispatch: a closed enum
 
-The generic layer owns everything shared across targets: lexing, directives, macros, expressions, sections, symbols, layout, relaxation and CFI. A target supplies only instruction parsing, relaxation rules and relocation mapping.
+The generic layer owns everything shared across targets: lexing, directives, macros, expressions, sections, symbols, layout, relaxation and CFI. An architecture supplies only three things: instruction parsing, relaxation rules and relocation mapping. They are selected by an exhaustive `switch` over a closed enum, not by a protocol:
 
 ```swift
-public protocol AssemblerTarget: Sendable {
-    /// Architecture whose `Encode` tables this target uses.
-    static var architecture: Encode.Architecture { get }
+public enum AssemblerArch: UInt8, BitwiseCopyable {
+    case x86_64, aarch64, riscv64
+}
 
-    /// Comment and statement-separator conventions for this target's GNU dialect
-    /// (x86: `#`; AArch64: `//`; RISC-V: `#`; `;` separates statements on all three).
-    static var lexicalRules: AsmLexicalRules { get }
-
+extension AssemblerArch {
     /// Parses one instruction statement and appends one fragment: fixed bytes,
     /// or a relaxable fragment with its short-form encoding.
-    static func parseInstruction(
-        _ statement: AsmStatement,
-        tokens: borrowing TokenBuffer,
-        into section: inout FragmentBuilder,
-        diagnostics: inout DiagnosticBag
-    )
+    @inline(__always)
+    func parseInstruction(_ s: AsmStatement, _ tokens: borrowing TokenBuffer,
+                          into section: inout FragmentBuilder,
+                          diagnostics: inout DiagnosticBag) {
+        switch self {
+        case .x86_64:  X86Asm.parseInstruction(s, tokens, into: &section, diagnostics: &diagnostics)
+        case .aarch64: A64Asm.parseInstruction(s, tokens, into: &section, diagnostics: &diagnostics)
+        case .riscv64: RVAsm.parseInstruction(s, tokens, into: &section, diagnostics: &diagnostics)
+        }
+    }
 
-    /// Returns the encoding size for a relaxable fragment, given the current
-    /// displacement to its target. Must be monotonic: never shrink a fragment.
-    static func relaxedSize(of fragment: RelaxableFragment, displacement: Int64) -> UInt8
+    /// Encoding size of a relaxable fragment at a given displacement.
+    /// Monotonic: a fragment never shrinks.
+    func relaxedSize(of f: RelaxableFragment, displacement: Int64) -> UInt8 {
+        switch self {
+        case .x86_64:  X86Asm.relaxedSize(of: f, displacement: displacement)
+        case .aarch64: A64Asm.relaxedSize(of: f, displacement: displacement)
+        case .riscv64: RVAsm.relaxedSize(of: f, displacement: displacement)
+        }
+    }
 
-    /// Maps a symbolic operand modifier (`:lo12:`, `%pcrel_hi`, `@GOTPCREL`, ...)
-    /// to the target relocation kind for the current object format.
-    static func relocationKind(
-        for modifier: OperandModifier, format: Object.Format
-    ) -> Object.RelocationKind?
+    // relocationKind(for:format:) and lexicalRules follow the same pattern.
 }
 ```
 
-Adding an architecture means adding `Encode` tables and one `AssemblerTarget` conformance. The directive, macro, layout and object layers do not change.
+`X86Asm`, `A64Asm` and `RVAsm` are caseless enums holding static functions. Why a closed enum instead of a protocol:
+
+- **No dynamic dispatch.** The architecture is fixed for a whole assembly, so the `switch` is perfectly predicted. Each per-architecture function is a direct call that can be inlined. A protocol would invite existential or generic dispatch on every statement, and an unspecialized generic would be one optimization flag away ([00](00-overview-and-principles.md) Principle 8).
+- **Exhaustiveness.** Adding an architecture means adding an enum case and `Encode` tables. The compiler then reports every `switch` that must handle it, so a missing piece can't slip through.
+- **The extension point is stated honestly.** The supported set is closed and changes only by editing these files. The directive, macro, layout and object layers don't change when an architecture is added.
 
 ### 4.4 Common language (all targets)
 
@@ -219,6 +228,7 @@ Functions with no CFI region (common in entry stubs and context switches) get no
 ### 4.10 Integration
 
 - **In-process (default):** the assembler's `RelocatableObject` goes to the linker with the compiler's objects. No temporary files are written.
+- **Through the main driver only.** Assembly sources are passed to `swift-stack` like any other input. A standalone, GNU-`as`-option-compatible `as` personality is **deferred** until a concrete external build needs it ([15](15-driver-and-diagnostics.md)).
 - **`-c`:** `Object`'s ELF or Mach-O writer serializes a standard relocatable `.o` that GNU `ld`, `lld` and Apple `ld` can consume. This keeps Swift-Stack assembly usable in external builds and lets host linkers act as differential oracles.
 - **Line info:** `.loc`/`.file` directives, or automatic line rows when `-g` is given without them, produce line-table rows for SDI ([07](07-debugging-and-sdi.md)) and DWARF `.debug_line` on hosts.
 - **Throughput target:** typical stub and context-switch files (a few hundred lines) assemble in **under 1 ms**. This is a target, measured per [14](14-measurement-methodology.md).

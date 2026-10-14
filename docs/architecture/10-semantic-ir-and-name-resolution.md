@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [01](01-frontend.md), [02](02-semantic-analysis.md), [16](16-macros.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [01](01-frontend.md), [02](02-semantic-analysis.md), [16](16-macros.md), [18](18-data-catalog.md) |
 | **Consumed by** | [03](03-intermediate-representation.md), [11](11-generics-and-runtime-metadata.md), [13](13-modules-and-incremental-builds.md), [15](15-driver-and-diagnostics.md) |
 
 ## 1. Summary
@@ -45,7 +45,7 @@ The language rules that SemIR encodes are in [02](02-semantic-analysis.md).
 
 #### Declarations
 
-The module declaration table is SoA, indexed by `DeclId`:
+The module declaration table is SoA, indexed by `DeclId`. `DeclId` 0 is the nil declaration: kind `nil`, empty name, its own parent, and type `error`. Absent declarations are handle 0 ([18](18-data-catalog.md) §4).
 
 ```swift
 public struct DeclTable: ~Copyable {
@@ -75,7 +75,7 @@ public struct SemInstBlock: ~Copyable {
 }
 ```
 
-- **Footprint.** 18 bytes per instruction across five columns.
+- **Footprint.** 18 bytes per instruction across five columns. This is a hypothesis: AIR lowering, the only bulk consumer, reads whole rows, so an AoS layout is the leading alternative ([18](18-data-catalog.md) §5.2, §6). `InstId` 0 in every block is a nil instruction of type `error`.
 - **Extra operands.** Calls, tuples, argument lists, and switch cases store their operands in a CSR side array: `arg1 = offset`, and `arg0` or the kind gives the count. Nested regions such as closure bodies, `if` branches, and loop bodies are separate `InstBlockId`s that their parent instruction references, so blocks stay contiguous.
 - **Decoupled from parsing.** A SemIR instruction refers to its parse node only for location. The *structure* comes from SemIR alone, so lowering never re-reads the parse tree.
 - **Literals** go into a module constant pool:
@@ -136,7 +136,7 @@ For C, everything resolves in one pass. Declarators precede initializers, and `_
 ### 4.6 Phase structure, interning, and deterministic IDs
 
 ```
-Phase 1  (parallel per unit)   lex, preprocess (C), parse, collect declaration skeletons
+Phase 1  (lanes, per unit)     lex, preprocess (C), parse, collect declaration skeletons
             │                    → unit-local DeclTable, provisional local IDs
             ▼  barrier: merge + canonical renumbering
 Phase 2  (sequential v1)       build module DeclTable, bind extensions, build member tables,
@@ -148,8 +148,8 @@ Phase 3  (sequential v1)       resolve interface types, generic signatures, conf
             │                    (on-demand "requests" with memoization + cycle detection;
             │                    lazy macro expansion is one such request, §4.10)
             ▼  barrier
-Phase 4  (parallel per body)   check function/initializer bodies → SemIR instruction blocks
-            │                    (types interned into worker-local overlays)
+Phase 4  (lanes, atomic cursor) check function/initializer bodies → SemIR instruction blocks
+            │                    (types interned into lane-local overlays)
             ▼  barrier: merge type overlays + canonical renumbering
 Phase 5  (queue)               enqueue bodies for AIR lowering ([03]), in FunctionId order
 ```
@@ -158,13 +158,13 @@ Phase numbers here are local to Sem. Sem phases 1, 2–3 and 4–5 correspond to
 
 - **Phase 1** produces declaration *skeletons*: kind, name, parent, attributes, and the parse range of the signature and body. Nothing is resolved yet.
 - **Phase 3 is sequential in v1** and evaluated lazily. A request such as "interface type of D" or "does T conform to P" computes its answer on first use and memoizes it. A request found in progress means a cycle, which is diagnosed. Parallelizing phase 3 would need in-progress states that are safe across threads, plus cross-thread cycle detection. It is deferred until measurement shows phase 3 matters ([14](14-measurement-methodology.md)).
-- **Phase 4 is embarrassingly parallel.** Signatures are fixed, and each body only reads the shared tables and writes its own arena.
+- **Phase 4 is embarrassingly parallel.** Signatures are fixed, and each body only reads the shared tables and writes its own arena. Under D11, all lanes run the body checker and claim bodies from the canonical body list through an atomic cursor. There is no job queue, and the barrier at the end of the phase is the only synchronization point.
 
 #### Interning and renumbering
 
-Atoms (identifiers, operator spellings, string literals), types, declarations, and generic signatures are all interned. In a parallel phase, a worker assigns **provisional IDs** in a worker-local table, carrying a worker tag. At the barrier that follows:
+Atoms (identifiers, operator spellings, string literals), types, declarations, and generic signatures are all interned. In a parallel phase, a lane assigns **provisional IDs** in a lane-local table, carrying a lane tag. At the barrier that follows:
 
-1. **Merge.** Union the worker tables. Each entry has a **stable key**:
+1. **Merge.** Union the lane tables. Each entry has a **stable key**:
    - atoms: their UTF-8 bytes;
    - declarations: `(canonical unit order, parse NodeId)`, where unit order comes from the driver's sorted input list ([15](15-driver-and-diagnostics.md));
    - types: the structural encoding over canonical component IDs, assigned bottom-up from leaves to composites.
@@ -175,7 +175,7 @@ After a barrier, every ID is a function of the inputs alone. A second, independe
 
 ### 4.7 Diagnostics
 
-- **Collection.** Each worker owns a `DiagnosticBag`, whose column layout is defined in [15](15-driver-and-diagnostics.md) §4.5: `DiagId`, `GlobalLocation`, and slices into argument, note and fix-it arenas. Arguments (types, names, numbers) are stored *as IDs*, and rendered only when the diagnostic is printed.
+- **Collection.** Each lane owns a `DiagnosticBag`, whose column layout is defined in [15](15-driver-and-diagnostics.md) §4.5: `DiagId`, `GlobalLocation`, and slices into argument, note and fix-it arenas. Arguments (types, names, numbers) are stored *as IDs*, and rendered only when the diagnostic is printed.
 - **Ordering.** At each barrier, the bags are merged and sorted by the key in [15](15-driver-and-diagnostics.md) §4.5 (unit order, `SourceLocation`, `DiagId`, argument values). This makes diagnostic order deterministic.
 - **Notes and fix-its** are slices attached to their parent diagnostic.
 - Rendering (source snippets, column computation, colors) and the command-line interface are in [15](15-driver-and-diagnostics.md).
@@ -191,7 +191,7 @@ After a barrier, every ID is a function of the inputs alone. A second, independe
 ### 4.9 Lowering queue
 
 - **Phase 5.** Every successfully checked body (function, initializer, accessor, closure, C function, and the static initializer of a global) is enqueued as `(FunctionId, InstBlockId)`, sorted by `FunctionId`.
-- **Lowering workers.** These pull from the queue, lower SemIR to AIR, and run the mandatory passes and the optimizer ([03](03-intermediate-representation.md)).
+- **Lowering lanes.** All lanes claim entries from the sorted list through an atomic cursor (D11), lower SemIR to AIR, and run the mandatory passes and the optimizer ([03](03-intermediate-representation.md) §4.4). The "queue" is just this sorted list, not a scheduler.
 - **Specialization requests.** In Tier 0, and when specializing in Tier 1 ([11](11-generics-and-runtime-metadata.md)), lowering produces requests of the form *(generic FunctionId, substitution map)*. These are deduplicated by a stable key, assigned canonical `FunctionId`s at the next barrier, and lowered from the same SemIR with the substitutions applied.
 - **When SemIR is freed.** `@inlinable`/`@_alwaysEmitIntoClient` bodies and C `static inline` functions go into the module interface as AIR after mandatory lowering, not as SemIR ([13](13-modules-and-incremental-builds.md) §5.1). A body's SemIR is freed after lowering, unless:
   - it is generic and may still receive specialization requests;
@@ -204,7 +204,7 @@ Swift macros ([16](16-macros.md)) are integrated with lookup as **memoized expan
 - **Recording.** Phase 1 records every custom attribute and `#name` use in declaration skeletons. Phase 2 resolves which attributes name macros and records each attached macro's role and introduced-name patterns (`named`, `overloaded`, `prefixed`, `suffixed`, `arbitrary`) on its scope.
 - **Lookup that resolves a macro never expands macros.** Resolving `@IPCLibrary` to its macro declaration uses lookup with expansion disabled. If that resolution would depend on a macro-introduced name, a cycle diagnostic is produced, matching `swiftc`.
 - **Eager expansions** happen at the end of phase 2 ([16](16-macros.md) §5.4), ordered by stable key: `extension` macros that add conformances, `memberAttribute`, `peer` on public declarations, and `body` macros. Their results are needed for conformance tables and signatures regardless of lookup.
-- **Lazy expansions** run as phase-3 requests when a lookup could see their names, or when a body (phase 4) uses a freestanding macro. Phase-4 expansions inside bodies run on the worker checking that body. Their expansion buffers and declarations get provisional IDs like any other worker-local entity, and are renumbered at the phase-4 barrier.
+- **Lazy expansions** run as phase-3 requests when a lookup could see their names, or when a body (phase 4) uses a freestanding macro. Phase-4 expansions inside bodies run on the lane checking that body. Their expansion buffers and declarations get provisional IDs like any other lane-local entity, and are renumbered at the phase-4 barrier.
 - **Splicing.** The expansion's `ParseTree` is walked by the same node-stack builder (§4.2), with the expansion's declarations parented to the attached declaration's context. Members introduced by a `member` macro join the nominal's member table. Peers join the enclosing scope.
 - **Determinism.** Discriminators come from the enclosing context's mangled name and the ordinal of the expansion within it, and are never from evaluation order. The plugin host's results are attached to their request, so plugin response order cannot leak into IDs (D6).
 

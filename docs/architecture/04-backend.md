@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [03](03-intermediate-representation.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [05](05-assembler.md), [11](11-generics-and-runtime-metadata.md), [14](14-measurement-methodology.md), [17](17-simd-and-vectorization.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [03](03-intermediate-representation.md), [06](06-linker.md), [07](07-debugging-and-sdi.md), [05](05-assembler.md), [11](11-generics-and-runtime-metadata.md), [14](14-measurement-methodology.md), [17](17-simd-and-vectorization.md), [18](18-data-catalog.md) |
 
 ## 1. Summary
 
@@ -68,7 +68,12 @@ Object.RelocatableObject (ELF64 or Mach-O section model) ──► Linker (06) o
 
 ### 4.3 LIR representation
 
-LIR is stored as columns (D8), not as an array of structs. A Swift struct of `{UInt16, UInt16, UInt16, UInt16, Int64, UInt16}` has a size of 18 but a **stride of 24** because of `Int64` alignment. Columns avoid that padding. Passes also touch different subsets of fields: liveness and register allocation read only opcodes and operands, while the encoder reads everything. Columns keep each pass's working set small.
+**Layout is an open choice** between SoA and AoS, tracked in [18](18-data-catalog.md) §5.3 and §6 and decided by measurement on the M0.5 vertical slice ([09](09-roadmap.md)).
+
+- **The case for SoA** (the layout shown below). A naive Swift struct of `{UInt16, UInt16, UInt16, UInt16, Int64, UInt16}` has a size of 18 but a **stride of 24** because of `Int64` alignment, and columns avoid that padding. Liveness touches only opcodes and operands.
+- **The case for AoS.** The two heaviest consumers, the register allocator and the encoder, read nearly every field of each instruction in order. With fields ordered for alignment (`imm` first), a 32-byte row costs half a cache line per instruction. That is one stream instead of seven, with no per-column address arithmetic.
+
+The SoA definition below is the starting point, not a decision. Either way, `LIRInstId` 0 is a nil row (a `.nil` opcode, no operands), per the nil-row rule ([18](18-data-catalog.md) §4).
 
 ```swift
 public struct LIRFunction: ~Copyable {
@@ -101,7 +106,7 @@ public struct Operand: BitwiseCopyable, Hashable {
 }
 ```
 
-- **Footprint:** 28 bytes of column data per instruction, with no padding, plus overflow operands for calls and parallel moves. This is honest accounting, not a minimum. Moving `imm` to a side table indexed only by instructions that need it is an open question (§6).
+- **Footprint (SoA hypothesis):** 28 bytes of column data per instruction, with no padding, plus overflow operands for calls and parallel moves. This is honest accounting, not a minimum. Moving `imm` to a side table indexed only by instructions that need it is an open question (§6).
 - **Virtual registers are 32-bit.** A 16-bit register field would cap a function at 65,536 values. Large generated C functions and fully inlined Swift code can exceed that.
 - **Memory operands** use `src1` as base, `src2` as index, scale and mode in `flags`, and displacement or symbol in `imm`. Symbol references set a flag so that `imm` is read as a `SymbolId` and the emitter records a relocation.
 
@@ -321,7 +326,7 @@ Branches to symbols outside the function always use the long form plus a relocat
 
 - **Graph-coloring allocation (Chaitin–Briggs, or LLVM's greedy allocator):** better code in high-pressure regions, but interference graphs are superlinear to build and update. Rejected for v1. The quality gap is to be measured, not assumed ([14](14-measurement-methodology.md)).
 - **SelectionDAG or GlobalISel-style selection:** more global matching, at much higher cost and complexity. Greedy tiling with the single-use rule covers the high-value patterns: addressing modes, compare-and-branch, and immediates.
-- **Array-of-structs LIR:** simpler to write, but wastes 6 bytes per instruction on padding (stride 24) and pulls cold fields into allocator passes.
+- **Array-of-structs LIR:** not rejected. A naive field order wastes 6 bytes per instruction on padding (stride 24), but an alignment-ordered 32-byte row matches the whole-row access of the encoder and register allocator. It is the leading alternative in [18](18-data-catalog.md) §6.
 - **Emitting assembly text and running the assembler on it:** avoided. The shared `Encode` tables give the same consistency guarantee without a text round trip.
 - **RISC-V linker relaxation in v1:** gives smaller code, but layout would depend on the linker, and the linker would need a delete-bytes relaxation engine. Deferred.
 

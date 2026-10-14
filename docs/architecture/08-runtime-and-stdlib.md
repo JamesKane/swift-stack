@@ -97,24 +97,34 @@ The runtime is written in Swift (Tier 0 profile, so it cannot depend on itself) 
 
 ### 5.1 OS-agnostic interface
 
-Async lowering in AIR ([03](03-intermediate-representation.md)) emits calls only to the task and job runtime (the `swift_task_*` entry-point families, [12 §6](12-standard-library-strategy.md)). That runtime enqueues work through a single executor interface, and OS-specific code exists only behind it:
+Async lowering in AIR ([03](03-intermediate-representation.md)) emits calls only to the task and job runtime. The **OS-agnostic interface is that set of runtime entry points**, the `swift_task_*` families in [12 §6](12-standard-library-strategy.md). Below them, the shared runtime enqueues work through a small executor backend, and OS-specific code exists only inside the backend:
+
+The interface is a fixed set of functions with **exactly one implementation per target**. The implementation is chosen when the runtime is compiled, by the target's OS, not at run time. There is no protocol and no witness-table dispatch on the enqueue/wake path:
 
 ```swift
-/// Implemented once per OS backend. All functions are thread-safe.
-public protocol ExecutorBackend: ~Copyable {
-    /// Make `job` runnable. May be called from any thread.
-    func enqueue(_ job: JobRef)
-    /// Block the calling worker until work, a timer, or an I/O event is ready.
-    /// Returns the ready jobs.
-    func wait(into ready: inout JobBatch, deadline: Deadline?)
-    /// Arrange for `job` to be enqueued at or after `deadline` (monotonic clock).
-    func enqueue(_ job: JobRef, at deadline: Deadline)
-    /// Register interest in an I/O source; `job` is enqueued when it becomes ready.
-    func watch(_ source: IOSource, _ interest: IOInterest, _ job: JobRef)
-    /// Wake one blocked worker (used after enqueue from a non-worker thread).
-    func wakeOne()
-}
+// Runtime/Tier1/Executor/Backend.swift — one file per OS, selected at build time.
+#if os(Todhchai)
+typealias ExecutorBackend = CroiPortBackend      // Backend+Croi.swift
+#elseif os(Linux)
+typealias ExecutorBackend = EpollBackend         // Backend+Epoll.swift
+#elseif os(FreeBSD) || os(macOS)
+typealias ExecutorBackend = KqueueBackend        // Backend+Kqueue.swift
+#endif
+
+// Every backend is a struct providing the same concrete functions. Shared code
+// calls them directly on `ExecutorBackend`, so each call is a static, inlinable call.
+//   mutating func enqueue(_ job: JobRef)                          // any thread
+//   mutating func wait(into ready: inout JobBatch, deadline: Deadline?)
+//   mutating func enqueue(_ job: JobRef, at deadline: Deadline)   // monotonic clock
+//   mutating func watch(_ source: IOSource, _ interest: IOInterest, _ job: JobRef)
+//   mutating func wakeOne()
 ```
+
+The required function set is checked by a compile-only conformance test per backend. That test is the only place a protocol is used, and it never appears on a runtime path. The `os(Todhchai)` spelling is still an open question ([12](12-standard-library-strategy.md)). Why compile-time selection:
+
+- a runtime only ever runs on one OS;
+- the wake path is the latency-critical part of the executor;
+- a static call keeps it free of indirect branches and lets it inline into the run loop ([00](00-overview-and-principles.md) Principle 8).
 
 The worker pool, global run queue, and actor scheduling are shared code above this interface. A backend is between roughly 300 and 800 lines of OS-specific code; this is a sizing estimate, not a measured figure.
 

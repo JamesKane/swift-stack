@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Draft |
-| **Depends on** | [00](00-overview-and-principles.md), [14](14-measurement-methodology.md), [16](16-macros.md), [17](17-simd-and-vectorization.md) |
+| **Depends on** | [00](00-overview-and-principles.md), [14](14-measurement-methodology.md), [16](16-macros.md), [17](17-simd-and-vectorization.md), [18](18-data-catalog.md) |
 | **Consumed by** | [02](02-semantic-analysis.md), [05](05-assembler.md), [10](10-semantic-ir-and-name-resolution.md) |
 
 ## 1. Summary
@@ -101,7 +101,8 @@ public struct TokenBuffer: ~Copyable {
 }
 ```
 
-- **Footprint.** 10 bytes per token across four separate columns. No column has padding. (An array-of-structs layout would have a stride of 12.)
+- **Footprint.** 10 bytes per token across four separate columns. No column has padding. (An array-of-structs layout would have a stride of 12.) This layout, like the other byte-per-row figures in this chapter, is an initial hypothesis tracked in [18](18-data-catalog.md) and revised from the M0.5 vertical slice ([09](09-roadmap.md)).
+- **Nil row.** `TokenId` 0 and `NodeId` 0 are nil rows with harmless defaults (kind `nil`, empty range), per the nil-row rule ([18](18-data-catalog.md) §4). Absent tokens and nodes are handle 0, not `Optional`.
 - **Token kinds.** Each language has its own `TokenKind` enum, because a unit is only ever Swift, C, or assembly ([05](05-assembler.md)).
   - Swift *contextual* keywords (`get`, `set`, `async`, `some`, …) are lexed as identifiers and recognized by the parser. This keeps each enum comfortably below 256 values.
 - **Locations of macro-expanded tokens.** For tokens produced by C macro expansion, `starts`/`ends` fall inside an `expansion` entry, and the spelling is recovered through that entry (§4.3). Tokens lexed from a Swift macro expansion buffer fall inside its `macroExpansion` entry, which links back to the expansion site ([16](16-macros.md) §5.3).
@@ -194,7 +195,7 @@ public struct ParseTree: ~Copyable {
 }
 ```
 
-- **Footprint.** 9 bytes per node as three columns.
+- **Footprint.** 9 bytes per node as three columns (hypothesis; [18](18-data-catalog.md) §5.1).
 - **Kind width.** If either grammar needs more than 256 `NodeKind` values, `kinds` widens to `UInt16`, giving 10 bytes per node (open question, §7).
 - **Error bit.** Setting aside bit 31 limits a subtree to 2³¹ nodes, which is far beyond the 4 GiB location budget.
 
