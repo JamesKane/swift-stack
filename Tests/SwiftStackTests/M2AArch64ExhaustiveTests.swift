@@ -100,6 +100,14 @@ enum A64Sweep {
         A64SysReg(op0: 3, op1: 1, crn: 11, crm: 2, op2: 5), A64SysReg(op0: 2, op1: 7, crn: 15, crm: 15, op2: 7),
     ]
 
+    /// `sys` operations llvm-mc 22 disassembles as an alias whatever the target features: the Armv9.4 `at s1e1a`,
+    /// `at s1e2a`, `at s1e3a` (FEAT_ATS1A) and the RME `apas`, which it assembles only with those features. The table
+    /// does not name them, so they print as generic `sys` (the same encoding).
+    static let llvmUnconditionalSysAliases: Set<A64SysReg> = [
+        A64SysReg(op0: 1, op1: 0, crn: 7, crm: 9, op2: 2), A64SysReg(op0: 1, op1: 4, crn: 7, crm: 9, op2: 2),
+        A64SysReg(op0: 1, op1: 6, crn: 7, crm: 9, op2: 2), A64SysReg(op0: 1, op1: 6, crn: 7, crm: 0, op2: 0),
+    ]
+
     static func forms(_ desc: A64InstrDesc) -> Forms {
         var f = Forms()
         let g = desc
@@ -241,6 +249,20 @@ enum A64Sweep {
             f.gprSlots = [\.rd]
             for op in A64SysMaintOp.allCases { add { $0.sysMaintOp = op; if !op.takesRegister { $0.rd = .xzr } } }
 
+        case .sysGeneric:
+            // Every op1/CRn/CRm/op2. An alias with a register operand is always the alias (`sysMaint`); one without is
+            // generic `sys` with Rt != 31 only.
+            f.gprSlots = [\.rd]
+            for op1: UInt8 in 0..<8 { for crn: UInt8 in 0..<16 { for crm: UInt8 in 0..<16 { for op2: UInt8 in 0..<8 {
+                let reg = A64SysReg(op0: 1, op1: op1, crn: crn, crm: crm, op2: op2)
+                if desc.id == .sysGeneric && llvmUnconditionalSysAliases.contains(reg) { continue }
+                if desc.id == .sysGeneric, let alias = A64SysMaintOp.from(op1: UInt32(op1), crn: UInt32(crn), crm: UInt32(crm), op2: UInt32(op2)) {
+                    if !alias.takesRegister { add { $0.sysReg = reg; $0.rd = A64GPR(rawValue: 5) } }
+                    continue
+                }
+                add { $0.sysReg = reg }
+            } } } }
+
         case .ldstUnsignedImm12:
             if let sw = desc.scalarWidth {
                 f.gprSlots = [\.rn]
@@ -274,9 +296,10 @@ enum A64Sweep {
             for is64 in gprWidths(desc) { for d: Int64 in [0, 4, -4, (1 << 20) - 4, -(1 << 20)] { add { $0.is64Bit = is64; $0.imm = d } } }
 
         case .ldpStpSigned, .ldpStpPre, .ldpStpPost:
+            // `ldpsw` (a fixed `scaleLog2`) has X registers and a 4-byte scale.
             f.gprSlots = [\.rd, \.rn, \.rm]
-            for is64 in [false, true] {
-                let s: Int64 = is64 ? 8 : 4
+            for is64 in desc.scaleLog2 == 255 ? [false, true] : [true] {
+                let s: Int64 = desc.scaleLog2 == 255 ? (is64 ? 8 : 4) : Int64(1) << Int64(desc.scaleLog2)
                 for k: Int64 in [-64, -1, 0, 1, 63] { add { $0.is64Bit = is64; $0.imm = k * s } }
             }
 
@@ -397,9 +420,32 @@ enum A64Sweep {
                 for idx in 0..<lanes { add { $0.arrangement = a; $0.index = idx } }
             }
 
-        case .simdScalarElem:
+        case .simdScalarElem, .simdScalarElemLong:
             f.vSlots = [\.vd, \.vn, \.vm]
             for w in widths(desc) { for idx in 0..<UInt8(16 >> w.rawValue) { add { $0.scalarWidth = w; $0.index = idx } } }
+
+        case .simdScalarThreeSame, .simdScalarThreeDiff, .simdScalarTwoRegMisc, .simdScalarCmpZero, .simdScalarNarrow:
+            let threeRegs = desc.format == .simdScalarThreeSame || desc.format == .simdScalarThreeDiff
+            f.vSlots = threeRegs ? [\.vd, \.vn, \.vm] : [\.vd, \.vn]
+            for w in widths(desc) { add { $0.scalarWidth = w } }
+
+        case .simdScalarShiftImm, .simdScalarShiftNarrow:
+            f.vSlots = [\.vd, \.vn]
+            for w in widths(desc) {
+                let esize = UInt8(8 << w.rawValue)
+                // Every shift amount (`#fbits` of the fixed-point conversions).
+                let amounts = A64Encoder.isLeftShiftImmediate(desc.id) ? Array(0..<esize) : Array(1...esize)
+                for amt in amounts { add { $0.scalarWidth = w; $0.amount = amt } }
+            }
+
+        case .simdShll:
+            f.vSlots = [\.vd, \.vn]
+            for a in arrangements(desc) { add { $0.arrangement = a } }
+
+        case .fpMovTopHalf:
+            f.gprSlots = desc.id == .fmovFpTopToGpr ? [\.rd] : [\.rn]
+            f.vSlots = desc.id == .fmovFpTopToGpr ? [\.vn] : [\.vd]
+            add { _ in }
 
         case .cryptoAes, .cryptoSha2:
             f.vSlots = [\.vd, \.vn]
@@ -519,6 +565,39 @@ enum A64Sweep {
 
         case .sveRdffr, .sveWrffr:
             for r in 0..<UInt8(16) { add { $0.pd = A64PReg(rawValue: r) } }
+
+        case .sveIndex:
+            // Every start/step immediate (or register) of every element width, and every vector register.
+            let startIsReg = desc.id == .sveIndexRI || desc.id == .sveIndexRR
+            let stepIsReg = desc.id == .sveIndexIR || desc.id == .sveIndexRR
+            f.gprSlots = (startIsReg ? [\.rn] : []) + (stepIsReg ? [\.rm] : [])
+            for w in widths(desc) {
+                for start: Int64 in startIsReg ? [0] : Array(-16...15) { for step: Int64 in stepIsReg ? [0] : Array(-16...15) {
+                    add { $0.is64Bit = w == .d; $0.scalarWidth = w; $0.imm = start; $0.imm2 = UInt8(truncatingIfNeeded: step) }
+                } }
+                for z in 0..<UInt8(32) { add { $0.is64Bit = w == .d; $0.scalarWidth = w; $0.zd = A64ZReg(rawValue: z); $0.imm2 = 1 } }
+            }
+
+        case .sveCnt:
+            f.gprSlots = [\.rd]
+            for pattern in 0..<UInt8(32) { for mul: UInt8 in [1, 2, 7, 16] { add { $0.imm2 = pattern; $0.amount = mul } } }
+
+        case .svePtrue:
+            for w in widths(desc) {
+                for pattern in 0..<UInt8(32) { add { $0.scalarWidth = w; $0.imm2 = pattern } }
+                for p in 0..<UInt8(16) { add { $0.scalarWidth = w; $0.pd = A64PReg(rawValue: p); $0.imm2 = A64SVEPattern.all } }
+            }
+
+        case .sveLastGpr, .sveLastScalar:
+            if desc.format == .sveLastGpr { f.gprSlots = [\.rd] } else { f.vSlots = [\.vd] }
+            for w in widths(desc) {
+                for pg in 0..<UInt8(8) { add { $0.is64Bit = w == .d; $0.scalarWidth = w; $0.pd = A64PReg(rawValue: pg); $0.zd = A64ZReg(rawValue: 2) } }
+                for z in 0..<UInt8(32) { add { $0.is64Bit = w == .d; $0.scalarWidth = w; $0.pd = A64PReg(rawValue: 1); $0.zd = A64ZReg(rawValue: z) } }
+            }
+
+        case .sveRdvl:
+            f.gprSlots = [\.rd]
+            for imm: Int64 in -32...31 { add { $0.imm = imm } }
         }
         return f
     }
@@ -547,7 +626,7 @@ enum A64Sweep {
         case .simdElem, .simdElemLong:
             // A by-element operand with `h` elements is in v0-v15 (the `M` bit is part of the lane).
             return i.arrangement.elementWidth != .h || i.vm.rawValue < 16
-        case .simdScalarElem:
+        case .simdScalarElem, .simdScalarElemLong:
             return i.scalarWidth != .h || i.vm.rawValue < 16
         default:
             return true
@@ -762,11 +841,12 @@ private func ownAssembleA64(_ lines: [String]) -> (bytes: [UInt8], errors: Int) 
 struct M2AArch64ExhaustiveTests {
     static var llvmMC: String? { ExternalTool.find("llvm-mc") }
     /// The features the table covers: base A64, LSE, RDM, RCpc, CRC32, FP16, Advanced SIMD with dot product and
-    /// the AES/SHA1/SHA256 crypto extension (the Q8B's Armv8.2-A set), the SVE subset, the PAC/BTI/PAN system
-    /// aliases (without `+pauth`/`+bti`/`+pan`, LLVM prints and accepts only the raw `hint`/`msr` forms), and what
-    /// `smc` (`+el3`) and the EL2/SME/RNDR system registers VectraOS's arm64 loader and kernel name require.
+    /// the AES/SHA1/SHA256 crypto extension (the Q8B's Armv8.2-A set, with `dc cvap` (`+ccpp`) and `at s1e1rp`/`s1e1wp`
+    /// (`+pan-rwv`)), the RCpc immediate-offset loads/stores (`+rcpc-immo`, Armv8.4), the SVE subset, the PAC/BTI/PAN
+    /// system aliases (without `+pauth`/`+bti`/`+pan`, LLVM prints and accepts only the raw `hint`/`msr` forms), and
+    /// what `smc` (`+el3`) and the EL2/SME/RNDR system registers VectraOS's arm64 loader and kernel name require.
     static let llvmArgs = ["--triple=aarch64", "-mattr=+lse,+rdm,+rcpc,+crc,+fp-armv8,+neon,+fullfp16,+dotprod,+aes,+sha2,+sve,"
-                           + "+pauth,+bti,+pan,+el3,+el2vmsa,+sme,+rand"]
+                           + "+pauth,+bti,+pan,+el3,+el2vmsa,+sme,+rand,+ccpp,+pan-rwv,+rcpc-immo"]
 
     @Test("Every AArch64 descriptor: all operand forms round-trip and match llvm-mc bit for bit",
           .enabled(if: M2AArch64ExhaustiveTests.llvmMC != nil))

@@ -2333,6 +2333,7 @@ public enum Assembler {
         includePaths: [String] = [],
         defines: [(name: String, value: String)] = [],
         riscvOptions: RVAsmOptions = RVAsmOptions(),
+        options: AsmOptions = AsmOptions(),
         sourceManager: SourceManager? = nil,
         diagnostics: inout DiagnosticBag
     ) throws -> RelocatableObject {
@@ -2342,10 +2343,12 @@ public enum Assembler {
         sourceMap.register(fileId)
         if path.hasSuffix(".S") {
             let text = preprocess(fileId: fileId, sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines, diagnostics: &diagnostics)
-            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions, diagnostics: &diagnostics)
+            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions,
+                                options: options, diagnostics: &diagnostics)
         }
         let text = String(decoding: sourceMap.bytes(of: fileId), as: UTF8.self)
-        return assembleText(text, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions, diagnostics: &diagnostics)
+        return assembleText(text, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions,
+                            options: options, diagnostics: &diagnostics)
     }
 
     /// Runs the `assembler-with-cpp` preprocessor: target-architecture predefined macros replace the host
@@ -2380,6 +2383,7 @@ public enum Assembler {
         includePaths: [String] = [],
         defines: [(name: String, value: String)] = [],
         riscvOptions: RVAsmOptions = RVAsmOptions(),
+        options: AsmOptions = AsmOptions(),
         sourceManager: SourceManager? = nil,
         diagnostics: inout DiagnosticBag
     ) -> RelocatableObject {
@@ -2389,9 +2393,11 @@ public enum Assembler {
         sourceMap.register(fileId)
         if runPreprocessor {
             let text = preprocess(fileId: fileId, sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines, diagnostics: &diagnostics)
-            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions, diagnostics: &diagnostics)
+            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions,
+                                options: options, diagnostics: &diagnostics)
         }
-        return assembleText(source, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions, diagnostics: &diagnostics)
+        return assembleText(source, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions,
+                            options: options, diagnostics: &diagnostics)
     }
 
     private static func assembleText(
@@ -2401,10 +2407,12 @@ public enum Assembler {
         sourceMap: AsmSourceMap,
         includePaths: [String],
         riscvOptions: RVAsmOptions,
+        options: AsmOptions,
         diagnostics: inout DiagnosticBag
     ) -> RelocatableObject {
         let session = AsmSession(arch: arch, sourceMap: sourceMap, includePaths: includePaths)
         session.rvOptions = riscvOptions
+        session.x86RelaxRelocations = options.x86RelaxRelocations
         if arch == .riscv64 { session.elfFlags = riscvOptions.elfFlags }
         if arch == .riscv64, let archAttribute = riscvOptions.targetArchAttribute {
             session.rvAttributes = [(5, .string(Array(archAttribute.utf8)))]
@@ -2428,6 +2436,10 @@ public enum Assembler {
         diagnostics.absorb(sessionDiagnostics)
         session.numericLabelNames = numericLabels.outputNames
         session.finishStatements()
+        if options.noExecStack {
+            // LLVM MC creates the section at the end of the input (after the source's own sections).
+            session.addNonExecutableStackNote()
+        }
         return session.buildRelocatableObject(diagnostics: &diagnostics)
     }
 }
@@ -2487,6 +2499,8 @@ internal final class AsmSession {
 
     // Per-architecture mutable state
     var x86CodeMode: X86CodeMode = .mode64
+    /// x86-64 `-mrelax-relocations`: relaxable GOT references use `R_X86_64_[REX_]GOTPCRELX`.
+    var x86RelaxRelocations = true
     var rvOptions = RVAsmOptions()
     var rvOptionStack: [RVAsmOptions] = []
     var pcrelHiCounter: Int = 0
@@ -2575,6 +2589,13 @@ internal final class AsmSession {
         sections.append(sec)
         sectionByName[name] = idx
         return idx
+    }
+
+    /// `-Wa,--noexecstack`: the empty `.note.GNU-stack` section (unless the source already has one).
+    func addNonExecutableStackNote() {
+        let name = ".note.GNU-stack"
+        let (kind, flags, alignLog2) = inferSectionProperties(name: name, parts: [name, "\"\"", "@progbits"])
+        getOrCreateSection(name: name, kind: kind, flags: flags, alignLog2: alignLog2)
     }
 
     /// LLVM MC's `switchSection`: the current section becomes the previous one (even when it is `idx`).
@@ -3418,16 +3439,17 @@ internal final class AsmSession {
     /// section, and a branch or linker-relaxable instruction earlier in the section, as LLVM MC 22 requires) is
     /// LLVM MC's `shouldInsertExtraNopBytesForCodeAlign`: the worst-case padding, `align` minus the smallest
     /// instruction, as NOPs plus an `R_RISCV_ALIGN` whose addend is that size, so the linker can trim it after
-    /// relaxing. The padding is emitted even where the offset is already aligned.
+    /// relaxing. The padding is emitted even where the offset is already aligned. LLVM MC 22 takes the smallest
+    /// instruction as 2 bytes whether or not C/Zca is enabled (`-march=rv64imaf`, `.option norvc`).
     func appendAlignment(alignBytes: Int, fillByte: UInt8?, maxBytes: Int) {
         let sec = currentSection
         sec.recordAlignment(alignBytes: alignBytes)
-        let minNop = rvOptions.rvcEnabled ? 2 : 4
+        let minNop = 2
         if arch == .riscv64 && rvOptions.relaxEnabled && sec.rvLinkerRelaxable && fillByte == nil && sec.flags.contains(.execInstr)
             && alignBytes > minNop {
             let pad = alignBytes - minNop
             var nops: [UInt8] = []
-            appendRISCVNops(&nops, count: pad, rvc: rvOptions.rvcEnabled)
+            appendRISCVNops(&nops, count: pad)
             sec.emitBytes(nops, fixups: [AsmInstFixup(offsetInInst: 0, kind: .riscv_align, symbol: "", addend: Int64(pad), width: 0)])
             return
         }
@@ -3435,15 +3457,16 @@ internal final class AsmSession {
     }
 
     /// RISC-V NOP padding as LLVM MC writes it (`RISCVAsmBackend::writeNopData`): a zero byte to reach an even
-    /// offset, then one `c.nop` (two zero bytes without C) if the count is 2 mod 4, then 4-byte `nop`s.
-    func appendRISCVNops(_ bytes: inout [UInt8], count: Int, rvc: Bool) {
+    /// offset, then one `c.nop` if the count is 2 mod 4, then 4-byte `nop`s. LLVM MC 22 writes the `c.nop` even
+    /// without C/Zca.
+    func appendRISCVNops(_ bytes: inout [UInt8], count: Int) {
         var rem = count
         if (rem & 1) != 0 {
             bytes.append(0)
             rem -= 1
         }
         if rem % 4 == 2 {
-            bytes.append(contentsOf: rvc ? [0x01, 0x00] : [0x00, 0x00])
+            bytes.append(contentsOf: [0x01, 0x00])
             rem -= 2
         }
         while rem >= 4 {
@@ -3621,7 +3644,7 @@ internal final class AsmSession {
                 case .label:
                     break
 
-                case .inst(let instBytes, let fixups, _):
+                case .inst(let instBytes, let fixups, let instLoc):
                     var patched = instBytes
                     var resolvedPCRelHi20 = false
                     for fix in fixups {
@@ -3687,6 +3710,9 @@ internal final class AsmSession {
                            let targetOff = localLabels[fix.symbol],
                            (symbolAttrs[fix.symbol]?.binding ?? .local) == .local {
                             let disp = targetOff + fix.addend - Int64(fragOffset)
+                            if fix.kind == .x86_64_pc8, Int8(exactly: disp - Int64(fix.offsetInInst)) == nil {
+                                diagnostics.report(.asmBranchOutOfRange, at: instLoc)
+                            }
                             patchSameSectionFixup(&patched, fixup: fix, displacementFromInstStart: disp, instLength: patched.count)
                             if fix.kind == .riscv_pcrel_hi20 {
                                 resolvedPCRelHi20 = true
@@ -4140,7 +4166,7 @@ internal final class AsmSession {
                 bytes.append(contentsOf: repeatElement(UInt8(0), count: rem))
             }
         case .riscv64:
-            appendRISCVNops(&bytes, count: count, rvc: rvOptions.rvcEnabled)
+            appendRISCVNops(&bytes, count: count)
         }
     }
 
@@ -4391,6 +4417,12 @@ internal final class AsmSession {
         instLength: Int
     ) {
         switch fixup.kind {
+        case .x86_64_pc8:
+            // rel8 of `loop`/`jrcxz`: the addend is -1, as for `R_X86_64_PC8` (the field is the last byte).
+            let off = fixup.offsetInInst
+            if off < bytes.count {
+                bytes[off] = UInt8(truncatingIfNeeded: disp - Int64(off))
+            }
         case .x86_64_pc32, .x86_64_plt32:
             // Note: X86TableEncoder subtracted `(instLength - offsetInInst)` into `fixup.addend`,
             // so subtracting `fixup.offsetInInst` yields `targetOff + rawAddend - (fragOffset + instLength)`.
@@ -4530,6 +4562,20 @@ internal final class AsmSession {
         } else {
             sectionTotalSizes[ehIdx] += size
         }
+    }
+}
+
+/// Target-independent and x86-64 assembler options a driver sets, as clang passes them to its integrated assembler.
+public struct AsmOptions: Sendable {
+    /// `-Wa,--noexecstack`: add an empty `.note.GNU-stack` section (LLVM's `-mnoexecstack`).
+    public var noExecStack: Bool
+    /// x86-64 `-Wa,-mrelax-relocations=yes|no` (yes by default): GOT loads the linker may relax are
+    /// `R_X86_64_[REX_]GOTPCRELX` rather than `R_X86_64_GOTPCREL`.
+    public var x86RelaxRelocations: Bool
+
+    public init(noExecStack: Bool = false, x86RelaxRelocations: Bool = true) {
+        self.noExecStack = noExecStack
+        self.x86RelaxRelocations = x86RelaxRelocations
     }
 }
 

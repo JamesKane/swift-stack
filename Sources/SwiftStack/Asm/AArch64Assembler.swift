@@ -88,6 +88,31 @@ internal enum A64Asm {
             let opcodes: [String: A64OpcodeId] = ["svc": .svc, "hvc": .hvc, "smc": .smc, "brk": .brk, "hlt": .hlt, "udf": .udf]
             if ops.count == 1, let imm = parseImmediateValue(ops[0], session: session) { emit(A64Instruction(opcode: opcodes[mnem]!, imm: imm)) }
             return
+        case "dcps1", "dcps2", "dcps3":
+            // The immediate is optional (default 0).
+            let op: A64OpcodeId = mnem == "dcps1" ? .dcps1 : (mnem == "dcps2" ? .dcps2 : .dcps3)
+            if ops.isEmpty {
+                emit(A64Instruction(opcode: op, imm: 0))
+            } else if ops.count == 1, let imm = parseImmediateValue(ops[0], session: session) {
+                emit(A64Instruction(opcode: op, imm: imm))
+            }
+            return
+        case "sys", "sysl":
+            // `sys #op1, Cn, Cm, #op2{, Xt}` (Rt = 31 when omitted); `sysl Xt, #op1, Cn, Cm, #op2`.
+            let isL = mnem == "sysl"
+            let fieldOps = isL ? Array(ops.dropFirst()) : Array(ops.prefix(4))
+            guard ops.count == (isL ? 5 : 4) || (!isL && ops.count == 5), fieldOps.count == 4,
+                  let op1 = parseImmediateValue(fieldOps[0], session: session), (0...7).contains(op1),
+                  let crn = Self.controlRegister(fieldOps[1]), let crm = Self.controlRegister(fieldOps[2]),
+                  let op2 = parseImmediateValue(fieldOps[3], session: session), (0...7).contains(op2) else { return }
+            var rt = A64GPR.xzr
+            if isL || ops.count == 5 {
+                guard case (let r, true)? = gpr(isL ? ops[0] : ops[4]) else { return }
+                rt = r
+            }
+            let reg = A64SysReg(op0: 1, op1: UInt8(op1), crn: crn, crm: crm, op2: UInt8(op2))
+            emit(A64Instruction(opcode: isL ? .sysl : .sysGeneric, rd: rt, sysReg: reg))
+            return
         default:
             break
         }
@@ -218,11 +243,79 @@ internal enum A64Asm {
             }
             return
         }
-        if mnem == "rdvl" || mnem == "rdsvl" {
+        if mnem == "rdvl" {
+            if ops.count == 2, case (let rd, true, false)? = A64GPR.parse(ops[0]), let imm = parseImmediateValue(ops[1], session: session) {
+                emit(A64Instruction(opcode: .sveRdvl, rd: rd, imm: imm))
+            }
+            return
+        }
+        if mnem == "rdsvl" {
+            // SME `rdsvl` (not in the shared table: no disassembly).
             if ops.count == 2, case (let rd, true)? = gpr(ops[0]), let imm = parseImmediateValue(ops[1], session: session), (-32...31).contains(imm) {
                 let imm6 = UInt32(bitPattern: Int32(imm)) & 0x3F
-                let word: UInt32 = (mnem == "rdvl" ? 0x04BF_5000 : 0x04BF_5800) | (imm6 << 5) | UInt32(rd.rawValue)
+                let word: UInt32 = 0x04BF_5800 | (imm6 << 5) | UInt32(rd.rawValue)
                 sec.emitBytes((0..<4).map { UInt8(truncatingIfNeeded: word >> (8 * $0)) }, loc: loc)
+            }
+            return
+        }
+        if mnem == "index" {
+            // `index zd.T, #imm|Rn, #imm|Rm`: registers are W, or X for 64-bit elements.
+            guard ops.count == 3, let (zd, w) = Self.sveVector(ops[0]) else { return }
+            func operand(_ text: String) -> (reg: A64GPR?, imm: Int64)? {
+                if let (r, is64, isSP) = A64GPR.parse(text) {
+                    guard !isSP, is64 == (w == .d) else { return nil }
+                    return (r, 0)
+                }
+                return parseImmediateValue(text, session: session).map { (nil, $0) }
+            }
+            guard let start = operand(ops[1]), let step = operand(ops[2]), (-128...127).contains(step.imm) else { return }
+            let op: A64OpcodeId
+            switch (start.reg != nil, step.reg != nil) {
+            case (false, false): op = .sveIndexII
+            case (true, false):  op = .sveIndexRI
+            case (false, true):  op = .sveIndexIR
+            case (true, true):   op = .sveIndexRR
+            }
+            emit(A64Instruction(opcode: op, is64Bit: w == .d, rn: start.reg ?? .x0, rm: step.reg ?? .x0, zd: zd, scalarWidth: w,
+                                imm: start.imm, imm2: UInt8(truncatingIfNeeded: step.imm)))
+            return
+        }
+        if let op = Self.sveCounts[mnem] {
+            // `cnt<T> Xd{, pattern{, mul #imm}}`
+            guard (1...3).contains(ops.count), case (let rd, true, false)? = A64GPR.parse(ops[0]) else { return }
+            var pattern = A64SVEPattern.all
+            var multiplier: Int64 = 1
+            if ops.count >= 2 {
+                guard let p = A64SVEPattern.parse(Substring(ops[1])) else { return }
+                pattern = p
+            }
+            if ops.count == 3 {
+                let (kind, rest) = splitFirstWord(ops[2])
+                guard kind.lowercased() == "mul", let m = parseImmediateValue(rest, session: session), (1...16).contains(m) else { return }
+                multiplier = m
+            }
+            emit(A64Instruction(opcode: op, rd: rd, amount: UInt8(multiplier), imm2: pattern))
+            return
+        }
+        if mnem == "ptrue" || mnem == "ptrues" {
+            guard ops.count == 1 || ops.count == 2, let (pd, w) = Self.svePredicate(ops[0]) else { return }
+            var pattern = A64SVEPattern.all
+            if ops.count == 2 {
+                guard let p = A64SVEPattern.parse(Substring(ops[1])) else { return }
+                pattern = p
+            }
+            emit(A64Instruction(opcode: mnem == "ptrue" ? .svePtrue : .svePtrues, pd: pd, scalarWidth: w, imm2: pattern))
+            return
+        }
+        if mnem == "lasta" || mnem == "lastb" {
+            // `last<a|b> Rd|Vd, Pg, zn.T`: the governing predicate is p0-p7, without an element suffix.
+            guard ops.count == 3, let (zn, w) = Self.sveVector(ops[2]), let pg = A64PReg.parse(Substring(ops[1])),
+                  !ops[1].contains("."), pg.rawValue < 8 else { return }
+            if let (rd, is64, isSP) = A64GPR.parse(ops[0]) {
+                guard !isSP, is64 == (w == .d) else { return }
+                emit(A64Instruction(opcode: mnem == "lasta" ? .sveLastaGpr : .sveLastbGpr, is64Bit: is64, rd: rd, zd: zn, pd: pg, scalarWidth: w))
+            } else if let (vd, sw, _) = A64VReg.parse(ops[0]), sw == w {
+                emit(A64Instruction(opcode: mnem == "lasta" ? .sveLastaScalar : .sveLastbScalar, vd: vd, zd: zn, pd: pg, scalarWidth: w))
             }
             return
         }
@@ -346,6 +439,42 @@ internal enum A64Asm {
     // MARK: - Helpers
 
     private static let maintKinds: [String: A64SysMaintKind] = ["tlbi": .tlbi, "ic": .ic, "dc": .dc, "at": .at]
+
+    private static let sveCounts: [String: A64OpcodeId] = ["cntb": .sveCntb, "cnth": .sveCnth, "cntw": .sveCntw, "cntd": .sveCntd]
+
+    /// `c0`..`c15` (the `CRn`/`CRm` operands of `sys`/`sysl`).
+    private static func controlRegister(_ text: String) -> UInt8? {
+        let lower = text.lowercased().trimmingCharacters(in: .whitespaces)
+        guard lower.hasPrefix("c"), let n = UInt8(lower.dropFirst()), n < 16 else { return nil }
+        return n
+    }
+
+    /// The element width of an SVE operand suffix (`.b`, `.h`, `.s`, `.d`).
+    private static func sveElementWidth(_ suffix: Substring) -> A64ScalarWidth? {
+        switch suffix.lowercased() {
+        case "b": return .b
+        case "h": return .h
+        case "s": return .s
+        case "d": return .d
+        default:  return nil
+        }
+    }
+
+    /// `zN.T`
+    private static func sveVector(_ text: String) -> (A64ZReg, A64ScalarWidth)? {
+        let t = text.trimmingCharacters(in: .whitespaces)
+        guard let dot = t.firstIndex(of: "."), let z = A64ZReg.parse(t[..<dot]),
+              let w = sveElementWidth(t[t.index(after: dot)...]) else { return nil }
+        return (z, w)
+    }
+
+    /// `pN.T`
+    private static func svePredicate(_ text: String) -> (A64PReg, A64ScalarWidth)? {
+        let t = text.trimmingCharacters(in: .whitespaces)
+        guard let dot = t.firstIndex(of: "."), let p = A64PReg.parse(t[..<dot]),
+              let w = sveElementWidth(t[t.index(after: dot)...]) else { return nil }
+        return (p, w)
+    }
 
     /// Mnemonics `parseBitfieldOrShiftOrMulOrCond` handles: an operand mismatch there is an invalid form of a
     /// known instruction (reported as such), not an unknown mnemonic.
@@ -792,7 +921,7 @@ internal enum A64Asm {
     // MARK: - Loads and Stores
 
     private static func isLoadStoreMnemonic(_ m: String) -> Bool {
-        gprLoadStores[m] != nil || exclusiveOps[m] != nil || ["ldp", "stp", "ldnp", "stnp", "prfm", "prfum", "rprfm"].contains(m)
+        gprLoadStores[m] != nil || exclusiveOps[m] != nil || ["ldp", "stp", "ldnp", "stnp", "ldpsw", "prfm", "prfum", "rprfm"].contains(m)
     }
 
     /// Register-width rules of the GPR load/store mnemonics.
@@ -846,6 +975,15 @@ internal enum A64Asm {
             "ldtrsb": T(x: (nil, nil, nil, nil, nil, .ldtrsb64), w: (nil, nil, nil, nil, nil, .ldtrsb32), width: .wOrX, scaleLog2: 0),
             "ldtrsh": T(x: (nil, nil, nil, nil, nil, .ldtrsh64), w: (nil, nil, nil, nil, nil, .ldtrsh32), width: .wOrX, scaleLog2: 1),
             "ldtrsw": same((nil, nil, nil, nil, nil, .ldtrsw), .x, 2),
+            "ldapur":   same((nil, nil, nil, nil, .ldapur, nil), .wOrX, nil),
+            "stlur":    same((nil, nil, nil, nil, .stlur, nil), .wOrX, nil),
+            "ldapurb":  same((nil, nil, nil, nil, .ldapurb, nil), .w, 0),
+            "stlurb":   same((nil, nil, nil, nil, .stlurb, nil), .w, 0),
+            "ldapurh":  same((nil, nil, nil, nil, .ldapurh, nil), .w, 1),
+            "stlurh":   same((nil, nil, nil, nil, .stlurh, nil), .w, 1),
+            "ldapursb": T(x: (nil, nil, nil, nil, .ldapursb64, nil), w: (nil, nil, nil, nil, .ldapursb32, nil), width: .wOrX, scaleLog2: 0),
+            "ldapursh": T(x: (nil, nil, nil, nil, .ldapursh64, nil), w: (nil, nil, nil, nil, .ldapursh32, nil), width: .wOrX, scaleLog2: 1),
+            "ldapursw": same((nil, nil, nil, nil, .ldapursw, nil), .x, 2),
         ]
     }()
 
@@ -888,7 +1026,14 @@ internal enum A64Asm {
             }
         }
 
-        // 2. Pair loads/stores (`ldp`, `stp`, non-temporal `ldnp`, `stnp`) of W/X or S/D/Q registers
+        // 2. Pair loads/stores (`ldp`, `stp`, non-temporal `ldnp`, `stnp`) of W/X or S/D/Q registers; `ldpsw` of X registers
+        if mnemonic == "ldpsw" {
+            guard ops.count >= 3, let mem = parseMemAddressing(ops: Array(ops.dropFirst(2)), session: session),
+                  mem.indexReg == nil, mem.symbolReloc == nil, case (let regs, true)? = sameWidthGPRs(ops.prefix(2)) else { return }
+            let op: A64OpcodeId = mem.indexing == .pre ? .ldpswPre : (mem.indexing == .post ? .ldpswPost : .ldpswSigned)
+            emit(A64Instruction(opcode: op, rd: regs[0], rn: mem.base, rm: regs[1], imm: mem.offset))
+            return
+        }
         if ["ldp", "stp", "ldnp", "stnp"].contains(mnemonic) {
             let isLoad = mnemonic.hasPrefix("ld")
             let nonTemporal = mnemonic.hasSuffix("np")
@@ -1294,7 +1439,9 @@ internal enum A64Asm {
              .simdTbl, .simdExt, .simdThreeLong, .simdThreeWide, .simdThreeNarrow, .simdDot, .simdElem, .simdElemLong,
              .simdDotElem, .simdLongPairwise, .simdFpCmpZero, .simdFpNarrow, .simdFpLong, .simdScalarTwoRegMiscFp,
              .simdScalarPairwise, .simdAcrossLanesLong, .simdAcrossLanesFp, .cryptoAes, .cryptoSha3, .cryptoSha2,
-             .simdScalarElem, .simdScalarFpCmpZero, .simdScalarThreeSameFp:
+             .simdScalarElem, .simdScalarFpCmpZero, .simdScalarThreeSameFp, .simdScalarThreeSame, .simdScalarTwoRegMisc,
+             .simdScalarCmpZero, .simdScalarNarrow, .simdScalarShiftImm, .simdScalarShiftNarrow, .simdScalarThreeDiff,
+             .simdScalarElemLong, .simdShll, .fpMovTopHalf:
             return true
         default:
             return false
@@ -1330,7 +1477,7 @@ internal enum A64Asm {
     private static func hasUpperHalfForm(_ format: A64InstrFormat) -> Bool {
         switch format {
         case .simdNarrow, .simdShiftLong, .simdShiftNarrow, .simdThreeLong, .simdThreeWide, .simdThreeNarrow,
-             .simdElemLong, .simdFpNarrow, .simdFpLong:
+             .simdElemLong, .simdFpNarrow, .simdFpLong, .simdShll:
             return true
         default:
             return false
@@ -1668,9 +1815,61 @@ internal enum A64Asm {
             guard ops.count == 3, let (regs, w) = scalars(2), case .other(let z) = ops[2], isFPZero(z) else { return nil }
             inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], scalarWidth: w)
 
-        case .simdScalarThreeSameFp:
+        case .simdScalarThreeSameFp, .simdScalarThreeSame:
             guard ops.count == 3, let (regs, w) = scalars(3) else { return nil }
             inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], vm: regs[2], scalarWidth: w)
+
+        case .simdScalarTwoRegMisc:
+            guard ops.count == 2, let (regs, w) = scalars(2) else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], scalarWidth: w)
+
+        case .simdScalarCmpZero, .simdScalarShiftImm:
+            guard ops.count == 3, let (regs, w) = scalars(2), let amount = immediate(ops[2]) else { return nil }
+            if desc.format == .simdScalarCmpZero {
+                guard amount == 0 else { return nil }
+            } else {
+                guard (0...64).contains(amount) else { return nil }
+            }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], scalarWidth: w, amount: UInt8(amount))
+
+        case .simdScalarNarrow, .simdScalarShiftNarrow:
+            // The destination is the narrow register, the source one twice as wide.
+            let shifted = desc.format == .simdScalarShiftNarrow
+            guard ops.count == (shifted ? 3 : 2), case .scalar(let vd, let w) = ops[0], case .scalar(let vn, let wide) = ops[1],
+                  wide.rawValue == w.rawValue + 1 else { return nil }
+            var amount: Int64 = 0
+            if shifted {
+                guard let a = immediate(ops[2]), (0...64).contains(a) else { return nil }
+                amount = a
+            }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, scalarWidth: w, amount: UInt8(amount))
+
+        case .simdScalarThreeDiff:
+            guard ops.count == 3, case .scalar(let vd, let wide) = ops[0], case .scalar(let vn, let w) = ops[1],
+                  case .scalar(let vm, let w2) = ops[2], w2 == w, wide.rawValue == w.rawValue + 1 else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, scalarWidth: w)
+
+        case .simdScalarElemLong:
+            guard ops.count == 3, case .scalar(let vd, let wide) = ops[0], case .scalar(let vn, let w) = ops[1],
+                  case .element(let vm, let ew, let idx) = ops[2], ew == w, wide.rawValue == w.rawValue + 1 else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, scalarWidth: w, index: idx)
+
+        case .simdShll:
+            guard ops.count == 3, case .vector(let vd, let dArr) = ops[0], case .vector(let vn, let nArr) = ops[1],
+                  nArr.widened == dArr, (nArr.qBit == 1) == form.upperHalf,
+                  let shift = immediate(ops[2]), shift == Int64(8 << nArr.elementWidth.rawValue) else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, arrangement: nArr)
+
+        case .fpMovTopHalf:
+            // `fmov Xd, Vn.d[1]` / `fmov Vd.d[1], Xn`
+            guard ops.count == 2 else { return nil }
+            if desc.id == .fmovFpTopToGpr {
+                guard case .gpr(let rd, true, false) = ops[0], case .element(let vn, .d, 1) = ops[1] else { return nil }
+                inst = A64Instruction(opcode: desc.id, rd: rd, vn: vn)
+            } else {
+                guard case .element(let vd, .d, 1) = ops[0], case .gpr(let rn, true, false) = ops[1] else { return nil }
+                inst = A64Instruction(opcode: desc.id, rn: rn, vd: vd)
+            }
 
         case .simdFpNarrow, .simdFpLong:
             guard ops.count == 2, case .vector(let vd, let dArr) = ops[0], case .vector(let vn, let nArr) = ops[1] else { return nil }

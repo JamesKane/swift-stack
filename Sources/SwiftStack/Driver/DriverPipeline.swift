@@ -31,6 +31,19 @@ public struct DriverOptions {
     public var includePaths: [String] = []
     public var defines: [(name: String, value: String)] = []
 
+    // Target options for the assembler (`DriverArguments.swift`), as clang's driver passes them to its integrated
+    // assembler. They change the object only for RISC-V (`riscvAssemblerOptions`) and through `assemblerOptions`.
+    /// The `--target=`/`-target` triple, if given.
+    public var targetTriple: String? = nil
+    public var march: String? = nil
+    public var mabi: String? = nil
+    /// The last of `-mrelax`/`-mno-relax`.
+    public var relax: Bool? = nil
+    /// The last of `-fPIC`/`-fpic`/`-fPIE`/`-fpie` and their `-fno-` forms.
+    public var pic: Bool? = nil
+    /// `-Wa,--noexecstack`, `-Wa,-mrelax-relocations=yes|no`.
+    public var assemblerOptions = AsmOptions()
+
     public init() {}
 }
 
@@ -603,6 +616,8 @@ public final class DriverPipeline {
             arch: options.targetArch,
             includePaths: options.includePaths,
             defines: options.defines,
+            riscvOptions: options.riscvAssemblerOptions,
+            options: options.assemblerOptions,
             sourceManager: sourceManager,
             diagnostics: &diagnostics
         )

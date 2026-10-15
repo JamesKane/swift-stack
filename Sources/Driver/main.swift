@@ -15,7 +15,15 @@ func printUsage() {
       --time-phases        Display execution time and throughput for each phase
       --bench              Run micro-benchmark repetitions for each phase
       --profile=<file>     Write execution trace to Chrome trace JSON file
-      --lang=<swift|c>     Explicitly set input language (default: inferred from extension)
+      --lang=<swift|c|asm> Explicitly set input language (default: inferred from extension)
+      -c                   Compile or assemble only (assembly input: write a relocatable object)
+      --target=<triple>    Target triple (also -target <triple>); --arch=<x86_64|aarch64|riscv64>
+      -I<dir>, -D<name>[=<value>]
+                           Include path and macro definition (C and .S input)
+      -march=<isa>, -mabi=<abi>, -mrelax, -mno-relax, -fPIC, -fPIE, -fno-pic
+                           Assembler target options, as clang passes them (RISC-V ISA, ABI, relaxation, PIC)
+      -Wa,--noexecstack, -Wa,-mrelax-relocations=<yes|no>
+                           Assembler options (non-executable stack note; x86-64 GOTPCRELX relocations)
       -v, --version        Print version and exit
       -h, --help           Print this help message and exit
     """)
@@ -34,82 +42,9 @@ func main() {
         exit(0)
     }
 
-    var options = DriverOptions()
-
-    var i = 1
-    while i < args.count {
-        let arg = args[i]
-        if arg == "-o" && i + 1 < args.count {
-            i += 1
-            options.outputBinaryPath = args[i]
-        } else if arg.hasPrefix("-o") {
-            options.outputBinaryPath = String(arg.dropFirst(2))
-        } else if arg == "--run" {
-            options.runBinary = true
-        } else if arg.hasPrefix("--dump=") {
-            let stage = String(arg.dropFirst("--dump=".count))
-            options.dumpStage = stage
-        } else if arg == "--stats" {
-            options.showStats = true
-        } else if arg == "--time-phases" {
-            options.timePhases = true
-        } else if arg == "--bench" || arg == "--repetition" {
-            options.benchRepetition = true
-        } else if arg.hasPrefix("--profile=") {
-            let file = String(arg.dropFirst("--profile=".count))
-            options.profilePath = file
-        } else if arg == "--lang=swift" {
-            options.language = .swift
-        } else if arg == "--lang=c" {
-            options.language = .c
-        } else if arg == "--lang=asm" {
-            options.language = .assembly
-        } else if arg == "-c" {
-            options.compileOnly = true
-        } else if arg.hasPrefix("--arch=") {
-            let a = String(arg.dropFirst("--arch=".count)).lowercased()
-            switch a {
-            case "x86_64", "amd64": options.targetArch = .x86_64
-            case "aarch64", "arm64": options.targetArch = .aarch64
-            case "riscv64", "rv64": options.targetArch = .riscv64
-            default: break
-            }
-        } else if arg == "-target" && i + 1 < args.count {
-            i += 1
-            let triple = args[i].lowercased()
-            if triple.hasPrefix("aarch64") || triple.hasPrefix("arm64") {
-                options.targetArch = .aarch64
-            } else if triple.hasPrefix("riscv64") || triple.hasPrefix("rv64") {
-                options.targetArch = .riscv64
-            } else {
-                options.targetArch = .x86_64
-            }
-        } else if arg == "-I" && i + 1 < args.count {
-            i += 1
-            options.includePaths.append(args[i])
-        } else if arg.hasPrefix("-I") {
-            options.includePaths.append(String(arg.dropFirst(2)))
-        } else if arg == "-D" && i + 1 < args.count {
-            i += 1
-            let def = args[i]
-            if let eq = def.firstIndex(of: "=") {
-                options.defines.append((name: String(def[..<eq]), value: String(def[def.index(after: eq)...])))
-            } else {
-                options.defines.append((name: def, value: "1"))
-            }
-        } else if arg.hasPrefix("-D") {
-            let def = String(arg.dropFirst(2))
-            if let eq = def.firstIndex(of: "=") {
-                options.defines.append((name: String(def[..<eq]), value: String(def[def.index(after: eq)...])))
-            } else {
-                options.defines.append((name: def, value: "1"))
-            }
-        } else if !arg.hasPrefix("-") {
-            options.inputFiles.append(arg)
-        } else {
-            FileHandle.standardError.write(Data("Warning: unrecognized option '\(arg)'\n".utf8))
-        }
-        i += 1
+    let (options, warnings) = DriverOptions.parse(args.dropFirst())
+    for warning in warnings {
+        FileHandle.standardError.write(Data("Warning: \(warning)\n".utf8))
     }
 
     let pipeline = DriverPipeline(options: options)

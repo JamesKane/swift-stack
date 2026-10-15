@@ -654,6 +654,7 @@ public enum X86MandatoryPrefix: UInt8, BitwiseCopyable, Sendable, Equatable, Has
     case pF3  = 2 // 0xF3, VEX pp = 2
     case pF2  = 3 // 0xF2, VEX pp = 3
     case p66F2 = 4 // 0x66 + 0xF2 (used by crc32w)
+    case p67   = 5 // 0x67 address-size prefix that selects the instruction (`jecxz`); legacy only
 
     @inlinable
     public var vexPP: UInt8 {
@@ -715,8 +716,10 @@ public enum X86OperandFormat: Sendable, Equatable, Hashable {
     case shiftByCl
     /// 3 operands `$imm, src_rm, dst_reg` (`imul $imm, r/m, reg`, `pshufd`, `vpshufd`).
     case immRmToReg(rmClass: X86RegClass, regClass: X86RegClass, immSize: X86OperandSize)
-    /// 3 operands `$imm, src_reg, dst_rm` (`vcvtps2ph $imm8, %xmm/%ymm, %xmm/m64`).
+    /// 3 operands `$imm, src_reg, dst_rm` (`vcvtps2ph $imm8, %xmm/%ymm, %xmm/m64`, `shld $imm8`).
     case immRegToRm(regClass: X86RegClass, rmClass: X86RegClass, immSize: X86OperandSize)
+    /// 3 operands `%cl, src_reg, dst_rm` (`shld`/`shrd` by `%cl`; the 2-operand form omits `%cl`).
+    case clRegToRm(regClass: X86RegClass, rmClass: X86RegClass)
     /// 3-operand VEX `src2_rm, src1_vvvv, dst_reg` (`vaddps`, `vpxor`, `vaesenc`, etc.).
     case vexRmVvvvReg(rmClass: X86RegClass, vvvvClass: X86RegClass, regClass: X86RegClass)
     /// 4-operand VEX `$imm8, src2_rm, src1_vvvv, dst_reg` (`vpclmulqdq`, `vshufps`, `vinsertf128`, `vpinsrd`).
@@ -739,6 +742,16 @@ public enum X86OperandFormat: Sendable, Equatable, Hashable {
     case relBranch(relSize: X86OperandSize)
     /// 1 immediate operand (`push $imm8/32`, `int $imm8`, `ret $imm16`).
     case immOnly(immSize: X86OperandSize)
+    /// 2 immediates `$imm16, $imm8` (`enter`).
+    case immWordImmByte
+    /// 1 fixed register operand encoded by the opcode alone (`push %fs` `0F A0`, `pop %gs` `0F A9`).
+    case fixedReg(X86Reg)
+    /// `movabs` between the accumulator and a 64-bit absolute address (`moffs`, `A0`..`A3`).
+    case moffsToAcc
+    case accToMoffs
+    /// String instruction (`movs`, `cmps`, `lods`, `stos`, `scas`, `ins`, `outs`, `xlat`): no operands, or the
+    /// implicit ones in AT&T order, which select a segment override on the source and 32-bit addressing.
+    case stringOp([X86StringOperand])
     /// Segment register moves (`mov %seg, r/m` `0x8C`, `mov r/m, %seg` `0x8E`).
     case segToRm
     case rmToSeg
@@ -752,6 +765,16 @@ public enum X86OperandFormat: Sendable, Equatable, Hashable {
     case ioAccToDx
     case ioImmToAcc
     case ioAccToImm
+}
+
+/// Implicit operand of a string instruction, as AT&T syntax spells it.
+@frozen
+public enum X86StringOperand: UInt8, BitwiseCopyable, Sendable, Equatable, Hashable {
+    case source      = 0 // `(%rsi)`: segment overridable (default `%ds`)
+    case destination = 1 // `%es:(%rdi)`: always `%es`
+    case accumulator = 2 // `%al` / `%ax` / `%eax` / `%rax` of the operand size
+    case port        = 3 // `%dx`
+    case table       = 4 // `(%rbx)` of `xlat`: segment overridable (default `%ds`)
 }
 
 /// Descriptor for a single x86-64 instruction encoding template.
@@ -895,6 +918,14 @@ public enum X86InstructionTable {
         // -----------------------------------------------------------------
         // 4.1 Data Movement: MOV, MOVABS, MOVZX, MOVSX, LEA, PUSH, POP, XCHG, CMPXCHG, BSWAP
         // -----------------------------------------------------------------
+
+        // MOVABS between the accumulator and a 64-bit absolute address (A0/A1 load, A2/A3 store). LLVM MC also
+        // selects it for `mov` when a numeric absolute address does not fit a sign-extended disp32; it is listed
+        // first so that rule applies before the ModR/M forms (which would truncate the address).
+        for (sz, _, w) in gprSizes {
+            list.append(X86InstrDesc(mnemonic: "movabs", aliases: ["mov"], operandSize: sz, opcode: sz == .byte ? 0xA0 : 0xA1, rexW: w, operandFormat: .moffsToAcc))
+            list.append(X86InstrDesc(mnemonic: "movabs", aliases: ["mov"], operandSize: sz, opcode: sz == .byte ? 0xA2 : 0xA3, rexW: w, operandFormat: .accToMoffs))
+        }
 
         // MOV reg -> r/m (0x88 / 0x89) — listed BEFORE r/m -> reg (0x8A / 0x8B) to match GNU `as`
         for (sz, rc, w) in gprSizes {
@@ -1143,18 +1174,29 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "push", aliases: ["pushw"], operandSize: .word, opcode: 0x50, operandFormat: .opcodePlusReg(.gpr16)))
         list.append(X86InstrDesc(mnemonic: "push", aliases: ["pushq"], operandSize: .qword, opcode: 0x6A, default64BitInMode64: true, operandFormat: .immOnly(immSize: .byte)))
         list.append(X86InstrDesc(mnemonic: "push", aliases: ["pushq"], operandSize: .qword, opcode: 0x68, default64BitInMode64: true, operandFormat: .immOnly(immSize: .dword)))
+        list.append(X86InstrDesc(mnemonic: "pushw", operandSize: .word, opcode: 0x6A, operandFormat: .immOnly(immSize: .byte)))
+        list.append(X86InstrDesc(mnemonic: "pushw", operandSize: .word, opcode: 0x68, operandFormat: .immOnly(immSize: .word)))
         list.append(X86InstrDesc(mnemonic: "push", aliases: ["pushq"], operandSize: .qword, opcode: 0xFF, modrmSlash: 6, default64BitInMode64: true, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(mnemonic: "push", aliases: ["pushw"], operandSize: .word, opcode: 0xFF, modrmSlash: 6, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(mnemonic: "pushfq", aliases: ["pushf"], operandSize: .qword, opcode: 0x9C, default64BitInMode64: true, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "pushfw", operandSize: .word, opcode: 0x9C, operandFormat: .implied))
 
         list.append(X86InstrDesc(mnemonic: "pop", aliases: ["popq"], operandSize: .qword, opcode: 0x58, default64BitInMode64: true, operandFormat: .opcodePlusReg(.gpr64)))
         list.append(X86InstrDesc(mnemonic: "pop", aliases: ["popw"], operandSize: .word, opcode: 0x58, operandFormat: .opcodePlusReg(.gpr16)))
         list.append(X86InstrDesc(mnemonic: "pop", aliases: ["popq"], operandSize: .qword, opcode: 0x8F, modrmSlash: 0, default64BitInMode64: true, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(mnemonic: "pop", aliases: ["popw"], operandSize: .word, opcode: 0x8F, modrmSlash: 0, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(mnemonic: "popfq", aliases: ["popf"], operandSize: .qword, opcode: 0x9D, default64BitInMode64: true, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "popfw", operandSize: .word, opcode: 0x9D, operandFormat: .implied))
+        // PUSH / POP %fs, %gs (0F A0/A1, 0F A8/A9); the other segment registers have no 64-bit-mode form.
+        for (seg, pushOp) in [(X86Reg.fs, UInt8(0xA0)), (.gs, 0xA8)] {
+            list.append(X86InstrDesc(mnemonic: "push", aliases: ["pushq"], operandSize: .qword, opcodeMap: .map0F, opcode: pushOp, default64BitInMode64: true, operandFormat: .fixedReg(seg)))
+            list.append(X86InstrDesc(mnemonic: "push", aliases: ["pushw"], operandSize: .word, opcodeMap: .map0F, opcode: pushOp, operandFormat: .fixedReg(seg)))
+            list.append(X86InstrDesc(mnemonic: "pop", aliases: ["popq"], operandSize: .qword, opcodeMap: .map0F, opcode: pushOp + 1, default64BitInMode64: true, operandFormat: .fixedReg(seg)))
+            list.append(X86InstrDesc(mnemonic: "pop", aliases: ["popw"], operandSize: .word, opcodeMap: .map0F, opcode: pushOp + 1, operandFormat: .fixedReg(seg)))
+        }
 
         // XCHG: accumulator short form (0x90 + r), then `%a, %b` with ModRM.reg = %b (as LLVM MC encodes it),
-        // then `%reg, mem`. CMPXCHG, CMPXCHG16B, BSWAP.
+        // then `%reg, mem`. CMPXCHG, XADD, CMPXCHG8B, CMPXCHG16B, BSWAP.
         for (sz, rc, w) in gprSizes where sz != .byte {
             list.append(X86InstrDesc(mnemonic: "xchg", operandSize: sz, opcode: 0x90, rexW: w, operandFormat: .opcodePlusRegWithAcc(rc)))
         }
@@ -1182,7 +1224,16 @@ public enum X86InstructionTable {
                 rexW: w,
                 operandFormat: .regToRm(regClass: rc, rmClass: rc)
             ))
+            list.append(X86InstrDesc(
+                mnemonic: "xadd",
+                operandSize: sz,
+                opcodeMap: .map0F,
+                opcode: sz == .byte ? 0xC0 : 0xC1,
+                rexW: w,
+                operandFormat: .regToRm(regClass: rc, rmClass: rc)
+            ))
         }
+        list.append(X86InstrDesc(mnemonic: "cmpxchg8b", opcodeMap: .map0F, opcode: 0xC7, modrmSlash: 1, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(
             mnemonic: "cmpxchg16b",
             operandSize: .qword,
@@ -1440,6 +1491,16 @@ public enum X86InstructionTable {
             }
         }
 
+        // SHLD / SHRD: by $imm8 (0F A4 / 0F AC) and by %cl (0F A5 / 0F AD)
+        for (name, op) in [("shld", UInt8(0xA4)), ("shrd", 0xAC)] {
+            for (sz, rc, w) in gprSizes where sz != .byte {
+                list.append(X86InstrDesc(mnemonic: name, operandSize: sz, opcodeMap: .map0F, opcode: op, rexW: w,
+                                         operandFormat: .immRegToRm(regClass: rc, rmClass: rc, immSize: .byte)))
+                list.append(X86InstrDesc(mnemonic: name, operandSize: sz, opcodeMap: .map0F, opcode: op + 1, rexW: w,
+                                         operandFormat: .clRegToRm(regClass: rc, rmClass: rc)))
+            }
+        }
+
         // BT, BTS, BTR, BTC (reg and imm8)
         let bitOps: [(name: String, regOp: UInt8, immSlash: UInt8)] = [
             ("bt",  0xA3, 4),
@@ -1499,6 +1560,17 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "jmp", aliases: ["jmpq"], operandSize: .qword, opcode: 0xFF, modrmSlash: 4, default64BitInMode64: true, operandFormat: .rm(.indirectRegOrMem)))
         list.append(X86InstrDesc(mnemonic: "ljmpl", aliases: ["ljmp"], operandSize: .dword, opcode: 0xFF, modrmSlash: 5, operandFormat: .rm(.indirectMemOnly)))
         list.append(X86InstrDesc(mnemonic: "ljmpw", operandSize: .word, opcode: 0xFF, modrmSlash: 5, operandFormat: .rm(.indirectMemOnly)))
+        list.append(X86InstrDesc(mnemonic: "ljmpq", operandSize: .qword, opcode: 0xFF, modrmSlash: 5, rexW: true, operandFormat: .rm(.indirectMemOnly)))
+        list.append(X86InstrDesc(mnemonic: "lcalll", aliases: ["lcall"], operandSize: .dword, opcode: 0xFF, modrmSlash: 3, operandFormat: .rm(.indirectMemOnly)))
+        list.append(X86InstrDesc(mnemonic: "lcallw", operandSize: .word, opcode: 0xFF, modrmSlash: 3, operandFormat: .rm(.indirectMemOnly)))
+        list.append(X86InstrDesc(mnemonic: "lcallq", operandSize: .qword, opcode: 0xFF, modrmSlash: 3, rexW: true, operandFormat: .rm(.indirectMemOnly)))
+
+        // LOOP / LOOPE / LOOPNE / JECXZ / JRCXZ: rel8 only (`jecxz` is `jrcxz` with the 0x67 address-size prefix)
+        list.append(X86InstrDesc(mnemonic: "loopne", aliases: ["loopnz"], opcode: 0xE0, default64BitInMode64: true, operandFormat: .relBranch(relSize: .byte)))
+        list.append(X86InstrDesc(mnemonic: "loope", aliases: ["loopz"], opcode: 0xE1, default64BitInMode64: true, operandFormat: .relBranch(relSize: .byte)))
+        list.append(X86InstrDesc(mnemonic: "loop", opcode: 0xE2, default64BitInMode64: true, operandFormat: .relBranch(relSize: .byte)))
+        list.append(X86InstrDesc(mnemonic: "jecxz", mandatoryPrefix: .p67, opcode: 0xE3, default64BitInMode64: true, operandFormat: .relBranch(relSize: .byte)))
+        list.append(X86InstrDesc(mnemonic: "jrcxz", opcode: 0xE3, default64BitInMode64: true, operandFormat: .relBranch(relSize: .byte)))
 
         list.append(X86InstrDesc(mnemonic: "call", aliases: ["callq"], opcode: 0xE8, default64BitInMode64: true, operandFormat: .relBranch(relSize: .dword)))
         list.append(X86InstrDesc(mnemonic: "call", aliases: ["callq"], operandSize: .qword, opcode: 0xFF, modrmSlash: 2, default64BitInMode64: true, operandFormat: .rm(.indirectRegOrMem)))
@@ -1507,6 +1579,14 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "ret", aliases: ["retq"], operandSize: .qword, opcode: 0xC2, default64BitInMode64: true, operandFormat: .immOnly(immSize: .word)))
         list.append(X86InstrDesc(mnemonic: "lretq", operandSize: .qword, opcode: 0xCB, rexW: true, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "lret", aliases: ["lretl"], operandSize: .dword, opcode: 0xCB, default64BitInMode64: true, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "lretq", operandSize: .qword, opcode: 0xCA, rexW: true, operandFormat: .immOnly(immSize: .word)))
+        list.append(X86InstrDesc(mnemonic: "lret", aliases: ["lretl"], operandSize: .dword, opcode: 0xCA, default64BitInMode64: true, operandFormat: .immOnly(immSize: .word)))
+        // 16-bit operand-size returns (0x66)
+        list.append(X86InstrDesc(mnemonic: "retw", operandSize: .word, opcode: 0xC3, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "retw", operandSize: .word, opcode: 0xC2, operandFormat: .immOnly(immSize: .word)))
+        list.append(X86InstrDesc(mnemonic: "lretw", operandSize: .word, opcode: 0xCB, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "lretw", operandSize: .word, opcode: 0xCA, operandFormat: .immOnly(immSize: .word)))
+        list.append(X86InstrDesc(mnemonic: "enter", opcode: 0xC8, default64BitInMode64: true, operandFormat: .immWordImmByte))
         list.append(X86InstrDesc(mnemonic: "leave", aliases: ["leaveq"], operandSize: .qword, opcode: 0xC9, default64BitInMode64: true, operandFormat: .implied))
 
         for ccEntry in conditionCodes {
@@ -1559,18 +1639,41 @@ public enum X86InstructionTable {
         // -----------------------------------------------------------------
         // 4.5 String & Flag Instructions
         // -----------------------------------------------------------------
-        list.append(X86InstrDesc(mnemonic: "movsb", operandSize: .byte, opcode: 0xA4, suppressOperandSizePrefix: true, operandFormat: .implied))
-        list.append(X86InstrDesc(mnemonic: "movsw", operandSize: .word, opcode: 0xA5, operandFormat: .implied))
-        list.append(X86InstrDesc(mnemonic: "movsl", aliases: ["movsd"], operandSize: .dword, opcode: 0xA5, operandFormat: .implied))
-        list.append(X86InstrDesc(mnemonic: "movsq", operandSize: .qword, opcode: 0xA5, rexW: true, operandFormat: .implied))
-
-        list.append(X86InstrDesc(mnemonic: "stosb", operandSize: .byte, opcode: 0xAA, suppressOperandSizePrefix: true, operandFormat: .implied))
-        list.append(X86InstrDesc(mnemonic: "stosw", operandSize: .word, opcode: 0xAB, operandFormat: .implied))
-        list.append(X86InstrDesc(mnemonic: "stosl", aliases: ["stosd"], operandSize: .dword, opcode: 0xAB, operandFormat: .implied))
-        list.append(X86InstrDesc(mnemonic: "stosq", operandSize: .qword, opcode: 0xAB, rexW: true, operandFormat: .implied))
+        // String instructions, in AT&T operand order. `lods`/`stos`/`scas` also take an unsuffixed spelling when
+        // the accumulator operand fixes the size; `movsd`/`stosd` are GNU spellings LLVM MC rejects.
+        let src = X86StringOperand.source, dst = X86StringOperand.destination, acc = X86StringOperand.accumulator
+        let strings: [(name: String, op: UInt8, operands: [X86StringOperand], sizes: [X86OperandSize], dAlias: Bool)] = [
+            ("movs", 0xA4, [src, dst], [.byte, .word, .dword, .qword], true),
+            ("cmps", 0xA6, [dst, src], [.byte, .word, .dword, .qword], false),
+            ("stos", 0xAA, [acc, dst], [.byte, .word, .dword, .qword], true),
+            ("lods", 0xAC, [src, acc], [.byte, .word, .dword, .qword], false),
+            ("scas", 0xAE, [dst, acc], [.byte, .word, .dword, .qword], false),
+            ("ins",  0x6C, [.port, dst], [.byte, .word, .dword], false),
+            ("outs", 0x6E, [src, .port], [.byte, .word, .dword], false),
+        ]
+        for str in strings {
+            for sz in str.sizes {
+                var aliases: [String] = []
+                if str.dAlias && sz == .dword { aliases.append(str.name + "d") }
+                if str.operands.contains(acc) { aliases.append(str.name) }
+                list.append(X86InstrDesc(
+                    mnemonic: str.name + sz.attSuffix,
+                    aliases: aliases,
+                    operandSize: sz,
+                    opcode: sz == .byte ? str.op : str.op + 1,
+                    rexW: sz == .qword,
+                    suppressOperandSizePrefix: sz == .byte,
+                    operandFormat: .stringOp(str.operands)
+                ))
+            }
+        }
+        list.append(X86InstrDesc(mnemonic: "xlatb", aliases: ["xlat"], opcode: 0xD7, operandFormat: .stringOp([.table])))
 
         list.append(X86InstrDesc(mnemonic: "cld", opcode: 0xFC, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "std", opcode: 0xFD, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "clc", opcode: 0xF8, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "stc", opcode: 0xF9, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "cmc", opcode: 0xF5, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "lahf", opcode: 0x9F, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "sahf", opcode: 0x9E, operandFormat: .implied))
 
@@ -1581,7 +1684,12 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "sysretq", operandSize: .qword, opcodeMap: .map0F, opcode: 0x07, rexW: true, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "sysretl", aliases: ["sysret"], operandSize: .dword, opcodeMap: .map0F, opcode: 0x07, suppressOperandSizePrefix: true, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "iretq", operandSize: .qword, opcode: 0xCF, rexW: true, operandFormat: .implied))
+        // `iretw` before `iret`, which ignores a 0x66 prefix when decoding.
+        list.append(X86InstrDesc(mnemonic: "iretw", operandSize: .word, opcode: 0xCF, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "iret", aliases: ["iretl"], operandSize: .dword, opcode: 0xCF, suppressOperandSizePrefix: true, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "sysenter", opcodeMap: .map0F, opcode: 0x34, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "sysexitq", operandSize: .qword, opcodeMap: .map0F, opcode: 0x35, rexW: true, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "sysexitl", aliases: ["sysexit"], operandSize: .dword, opcodeMap: .map0F, opcode: 0x35, suppressOperandSizePrefix: true, operandFormat: .implied))
 
         list.append(X86InstrDesc(mnemonic: "swapgs", opcodeMap: .map0F, opcode: 0x01, secondaryOpcode: 0xF8, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "rdtscp", opcodeMap: .map0F, opcode: 0x01, secondaryOpcode: 0xF9, operandFormat: .implied))
@@ -1606,6 +1714,32 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "str", operandSize: .dword, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 1, operandFormat: .rm(.gprOnly)))
         list.append(X86InstrDesc(mnemonic: "str", operandSize: .qword, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 1, rexW: true, operandFormat: .rm(.gprOnly)))
         list.append(X86InstrDesc(mnemonic: "ltr", aliases: ["ltrw"], operandSize: .word, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 3, suppressOperandSizePrefix: true, operandFormat: .rm(.gprOrMem)))
+        // SLDT / SMSW store like STR (16-bit memory without 0x66; 16/32/64-bit register); LLDT, LMSW, VERR, VERW
+        // take a 16-bit register or memory operand without 0x66.
+        for (name, op, slash) in [("sldt", UInt8(0x00), UInt8(0)), ("smsw", 0x01, 4)] {
+            list.append(X86InstrDesc(mnemonic: name, operandSize: .word, opcodeMap: .map0F, opcode: op, modrmSlash: slash, operandFormat: .rm(.gprOrMem), rmConstraint: .regOnly))
+            list.append(X86InstrDesc(mnemonic: name, operandSize: .word, opcodeMap: .map0F, opcode: op, modrmSlash: slash, suppressOperandSizePrefix: true, operandFormat: .rm(.gprOrMem), rmConstraint: .memOnly))
+            list.append(X86InstrDesc(mnemonic: name, operandSize: .dword, opcodeMap: .map0F, opcode: op, modrmSlash: slash, operandFormat: .rm(.gprOnly)))
+            list.append(X86InstrDesc(mnemonic: name, operandSize: .qword, opcodeMap: .map0F, opcode: op, modrmSlash: slash, rexW: true, operandFormat: .rm(.gprOnly)))
+        }
+        for (name, op, slash) in [("lldt", UInt8(0x00), UInt8(2)), ("verr", 0x00, 4), ("verw", 0x00, 5), ("lmsw", 0x01, 6)] {
+            let aliases = name.hasPrefix("ver") ? [] : [name + "w"]
+            list.append(X86InstrDesc(mnemonic: name, aliases: aliases, operandSize: .word, opcodeMap: .map0F, opcode: op, modrmSlash: slash, suppressOperandSizePrefix: true, operandFormat: .rm(.gprOrMem)))
+        }
+        // LAR / LSL (16-bit selector source), LSS / LFS / LGS (far pointer in memory)
+        for (sz, rc, w) in gprSizes where sz != .byte {
+            for (name, op) in [("lar", UInt8(0x02)), ("lsl", 0x03)] {
+                list.append(X86InstrDesc(mnemonic: name, operandSize: sz, opcodeMap: .map0F, opcode: op, rexW: w, operandFormat: .rmToReg(rmClass: .gpr16, regClass: rc)))
+            }
+            for (name, op) in [("lss", UInt8(0xB2)), ("lfs", 0xB4), ("lgs", 0xB5)] {
+                list.append(X86InstrDesc(mnemonic: name, operandSize: sz, opcodeMap: .map0F, opcode: op, rexW: w, operandFormat: .rmToReg(rmClass: rc, regClass: rc), rmConstraint: .memOnly))
+            }
+        }
+        list.append(X86InstrDesc(mnemonic: "clts", opcodeMap: .map0F, opcode: 0x06, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "invd", opcodeMap: .map0F, opcode: 0x08, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "rdpmc", opcodeMap: .map0F, opcode: 0x33, operandFormat: .implied))
+        // INVPCID (66 0F 38 82 /r: 128-bit descriptor in memory, type in a 64-bit register)
+        list.append(X86InstrDesc(mnemonic: "invpcid", opcodeMap: .map0F38, mandatoryPrefix: .p66, opcode: 0x82, operandFormat: .rmToReg(rmClass: .gpr64, regClass: .gpr64), rmConstraint: .memOnly))
 
         list.append(X86InstrDesc(mnemonic: "wrmsr", opcodeMap: .map0F, opcode: 0x30, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "rdtsc", opcodeMap: .map0F, opcode: 0x31, operandFormat: .implied))
@@ -1613,6 +1747,11 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "cpuid", opcodeMap: .map0F, opcode: 0xA2, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "wbinvd", opcodeMap: .map0F, opcode: 0x09, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "ud2", opcodeMap: .map0F, opcode: 0x0B, operandFormat: .implied))
+        for (sz, rc, w) in gprSizes where sz != .byte {
+            // UD1 (0F B9 /r) and the multi-byte NOP (0F 1F /0)
+            list.append(X86InstrDesc(mnemonic: "ud1", operandSize: sz, opcodeMap: .map0F, opcode: 0xB9, rexW: w, operandFormat: .rmToReg(rmClass: rc, regClass: rc)))
+            list.append(X86InstrDesc(mnemonic: "nop", operandSize: sz, opcodeMap: .map0F, opcode: 0x1F, modrmSlash: 0, rexW: w, operandFormat: .rm(.gprOrMem)))
+        }
 
         list.append(X86InstrDesc(mnemonic: "lfence", opcodeMap: .map0F, opcode: 0xAE, secondaryOpcode: 0xE8, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "mfence", opcodeMap: .map0F, opcode: 0xAE, secondaryOpcode: 0xF0, operandFormat: .implied))
@@ -1629,6 +1768,18 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "xrstor", opcodeMap: .map0F, opcode: 0xAE, modrmSlash: 5, default64BitInMode64: true, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(mnemonic: "xsaveopt64", operandSize: .qword, opcodeMap: .map0F, opcode: 0xAE, modrmSlash: 6, rexW: true, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(mnemonic: "xsaveopt", opcodeMap: .map0F, opcode: 0xAE, modrmSlash: 6, default64BitInMode64: true, operandFormat: .rm(.memOnly)))
+        // XRSTORS / XSAVEC / XSAVES (0F C7 /3, /4, /5)
+        for (name, slash) in [("xrstors", UInt8(3)), ("xsavec", 4), ("xsaves", 5)] {
+            list.append(X86InstrDesc(mnemonic: name + "64", operandSize: .qword, opcodeMap: .map0F, opcode: 0xC7, modrmSlash: slash, rexW: true, operandFormat: .rm(.memOnly)))
+            list.append(X86InstrDesc(mnemonic: name, opcodeMap: .map0F, opcode: 0xC7, modrmSlash: slash, default64BitInMode64: true, operandFormat: .rm(.memOnly)))
+        }
+        // FSGSBASE (F3 0F AE /0../3, register only) and RDPID (F3 0F C7 /7, 64-bit register only)
+        for (sz, _, w) in gprSizes where sz == .dword || sz == .qword {
+            for (name, slash) in [("rdfsbase", UInt8(0)), ("rdgsbase", 1), ("wrfsbase", 2), ("wrgsbase", 3)] {
+                list.append(X86InstrDesc(mnemonic: name, operandSize: sz, opcodeMap: .map0F, mandatoryPrefix: .pF3, opcode: 0xAE, modrmSlash: slash, rexW: w, operandFormat: .rm(.gprOnly)))
+            }
+        }
+        list.append(X86InstrDesc(mnemonic: "rdpid", operandSize: .qword, opcodeMap: .map0F, mandatoryPrefix: .pF3, opcode: 0xC7, modrmSlash: 7, operandFormat: .rm(.gprOnly)))
 
         for (sz, _, w) in gprSizes where sz != .byte {
             list.append(X86InstrDesc(mnemonic: "rdrand", operandSize: sz, opcodeMap: .map0F, opcode: 0xC7, modrmSlash: 6, rexW: w, operandFormat: .rm(.gprOnly)))
@@ -2159,6 +2310,12 @@ public struct X86TableEncoder: Sendable {
             inst.operands = [inst.operands[0], .reg(dstReg), .reg(dstReg)]
         }
 
+        // `shld %reg, r/m` / `shrd %reg, r/m` shift by an implicit `%cl` (LLVM MC accepts the 2-operand form)
+        if inst.mnemonic.hasPrefix("shld") || inst.mnemonic.hasPrefix("shrd"), inst.mnemonic.count <= 5,
+           inst.operands.count == 2, case .reg(let src) = inst.operands[0], src.isGPR {
+            inst.operands.insert(.reg(.cl), at: 0)
+        }
+
         // Expand SSE/AVX compare-predicate pseudo-ops (`cmpltps`, `vcmpeq_uqpd`) into `$imm8` form
         expandComparePredicate(&inst)
         return inst
@@ -2408,6 +2565,12 @@ public struct X86TableEncoder: Sendable {
                 } else if mode == .mode16 && index.regClass == .gpr32 {
                     addressSizeOverride = true
                 }
+            }
+
+            // A based, indexed or RIP-relative displacement must fit disp32 (LLVM MC rejects it otherwise); an
+            // absolute address is truncated to 32 bits, as LLVM MC does (`mov` then selects `movabs`).
+            if m.symbol == nil, m.base != nil || m.index != nil, Int32(exactly: m.disp) == nil {
+                return false
             }
 
             // 1. RIP-relative addressing: sym(%rip) or disp(%rip)
@@ -2688,6 +2851,11 @@ public struct X86TableEncoder: Sendable {
             guard try encodeRM(ops[2], regField: srcReg.low3, expectedClass: rmClass) else { return nil }
             guard encodeImm(ops[0], immSize: immSz, signExtendedTo: .byte) else { return nil }
 
+        case .clRegToRm(let regClass, let rmClass):
+            guard ops.count == 3, case .reg(.cl) = ops[0], case .reg(let srcReg) = ops[1], matchReg(srcReg, expected: regClass) else { return nil }
+            if srcReg.needsRexExtension { rexR = true }
+            guard try encodeRM(ops[2], regField: srcReg.low3, expectedClass: rmClass) else { return nil }
+
         case .vexRmVvvvReg(let rmClass, let vvvvClass, let regClass):
             guard ops.count == 3,
                   case .reg(let vReg) = ops[1], matchReg(vReg, expected: vvvvClass),
@@ -2785,8 +2953,64 @@ public struct X86TableEncoder: Sendable {
 
         case .immOnly(let immSz):
             guard ops.count == 1 else { return nil }
-            let targetSz: X86OperandSize = (desc.mnemonic == "push") ? .qword : immSz
+            let targetSz: X86OperandSize = desc.mnemonic == "push" ? .qword : (desc.mnemonic == "pushw" ? .word : immSz)
             guard encodeImm(ops[0], immSize: immSz, signExtendedTo: targetSz) else { return nil }
+
+        case .immWordImmByte:
+            guard ops.count == 2, encodeImm(ops[0], immSize: .word, signExtendedTo: .word),
+                  encodeImm(ops[1], immSize: .byte, signExtendedTo: .byte) else { return nil }
+
+        case .fixedReg(let fixed):
+            guard ops.count == 1, case .reg(let r) = ops[0], r == fixed else { return nil }
+
+        case .moffsToAcc, .accToMoffs:
+            let load = desc.operandFormat == .moffsToAcc
+            guard mode == .mode64, ops.count == 2, case .mem(let m) = ops[load ? 0 : 1], case .reg(let acc) = ops[load ? 1 : 0],
+                  acc == X86Reg.gpr(size: desc.operandSize, hw: 0), m.base == nil, m.index == nil else { return nil }
+            // `mov` takes this form only for a numeric address beyond a sign-extended disp32 (LLVM MC); `movabs` always.
+            if !inst.mnemonic.hasPrefix("movabs") {
+                guard m.symbol == nil, Int32(exactly: m.disp) == nil else { return nil }
+            }
+            segmentOverride = m.segment
+            appendInt64(m.symbol != nil ? 0 : m.disp, to: &immBytes)
+            if let sym = m.symbol {
+                immReloc = (.abs64, sym, m.disp)
+            }
+
+        case .stringOp(let kinds):
+            if ops.isEmpty {
+                // An unsuffixed spelling (`lods`) needs the accumulator operand to fix the size.
+                guard desc.operandSize == .unsized || inst.sizeSuffix != .unsized || inst.mnemonic != String(desc.mnemonic.dropLast()) else {
+                    return nil
+                }
+            } else {
+                guard mode == .mode64, ops.count == kinds.count else { return nil }
+                var addr32: Bool? = nil
+                for (op, kind) in zip(ops, kinds) {
+                    switch kind {
+                    case .accumulator:
+                        guard case .reg(let r) = op, r == X86Reg.gpr(size: desc.operandSize, hw: 0) else { return nil }
+                    case .port:
+                        guard case .reg(.dx) = op else { return nil }
+                    case .source, .destination, .table:
+                        guard case .mem(let m) = op, m.index == nil, m.symbol == nil, m.disp == 0, let base = m.base else { return nil }
+                        let hw: UInt8 = kind == .source ? 6 : (kind == .destination ? 7 : 3)
+                        let is32 = base.regClass == .gpr32
+                        guard base.hwEncoding == hw, is32 || base.regClass == .gpr64 else { return nil }
+                        // `xlat`'s operand only spells the instruction: LLVM MC ignores its segment and address size.
+                        if kind == .table { continue }
+                        guard addr32 == nil || addr32 == is32 else { return nil }
+                        addr32 = is32
+                        if kind == .destination {
+                            // `(%rdi)` is always `%es:`; no override is possible.
+                            guard m.segment == nil || m.segment == 0x26 else { return nil }
+                        } else if let seg = m.segment, seg != 0x3E {
+                            segmentOverride = seg
+                        }
+                    }
+                }
+                addressSizeOverride = addr32 == true
+            }
 
         case .segToRm:
             guard ops.count == 2, case .reg(let segReg) = ops[0], segReg.regClass == .seg else { return nil }
@@ -2859,10 +3083,16 @@ public struct X86TableEncoder: Sendable {
         var out: [UInt8] = []
         out.reserveCapacity(15)
 
-        // 1. Legacy prefixes in LLVM MC / GNU `as` order: rep, segment, address size, operand size, lock
+        // 1. Legacy prefixes in LLVM MC / GNU `as` order: rep, segment, address size, operand size, lock. A string
+        //    instruction has the address size before the segment, as LLVM MC emits it.
         if inst.repPrefix != .none { out.append(inst.repPrefix.rawValue) }
-        if let seg = segmentOverride { out.append(seg) }
-        if addressSizeOverride { out.append(0x67) }
+        if case .stringOp = desc.operandFormat {
+            if addressSizeOverride { out.append(0x67) }
+            if let seg = segmentOverride { out.append(seg) }
+        } else {
+            if let seg = segmentOverride { out.append(seg) }
+            if addressSizeOverride { out.append(0x67) }
+        }
 
         if desc.encodingKind == .vex {
             guard !inst.lockPrefix else { return nil }
@@ -2906,6 +3136,7 @@ public struct X86TableEncoder: Sendable {
             case .pF3:   out.append(0xF3)
             case .pF2:   out.append(0xF2)
             case .p66F2: out.append(0x66); out.append(0xF2)
+            case .p67:   out.append(0x67)
             }
 
             // REX prefix (in 64-bit mode)
@@ -3256,9 +3487,10 @@ public struct X86Disassembler: Sendable {
                 guard hasF3 && !hasF2 else { return nil }
             case .p66:
                 guard has66 && !hasF2 && !hasF3 else { return nil }
+            case .p67:
+                guard has67 && !hasF2 && !hasF3 else { return nil }
             case .none:
-                let isStringOp = (desc.opcodeMap == .primary && (opcodeByte == 0xA4 || opcodeByte == 0xA5 || opcodeByte == 0xAA || opcodeByte == 0xAB))
-                if isStringOp {
+                if case .stringOp = desc.operandFormat {
                     if hasF3 { repPrefix = .rep }
                     else if hasF2 { repPrefix = .repne }
                 } else {
@@ -3531,6 +3763,11 @@ public struct X86Disassembler: Sendable {
             let srcReg = makeReg(for: regClass, hw: regHw, hasRex: hasRex)
             operands = [.imm(immVal), .reg(srcReg), rmOp]
 
+        case .clRegToRm(let regClass, let rmClass):
+            guard let (regBits, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
+            let srcReg = makeReg(for: regClass, hw: (rexR ? 8 : 0) | regBits, hasRex: hasRex)
+            operands = [.reg(.cl), .reg(srcReg), rmOp]
+
         case .vexRmVvvvReg(let rmClass, let vvvvClass, let regClass):
             guard let (regBits, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
             let vReg = makeReg(for: vvvvClass, hw: vexVvvv, hasRex: true)
@@ -3591,6 +3828,39 @@ public struct X86Disassembler: Sendable {
         case .immOnly(let immSz):
             let immVal = try readImm(size: immSz)
             operands = [.imm(immVal)]
+
+        case .immWordImmByte:
+            let frame = Int64(UInt16(bitPattern: try readInt16(at: &cursor)))
+            let level = Int64(UInt8(bitPattern: try readInt8(at: &cursor)))
+            operands = [.imm(frame), .imm(level)]
+
+        case .fixedReg(let fixed):
+            operands = [.reg(fixed)]
+
+        case .moffsToAcc, .accToMoffs:
+            guard codeMode == .mode64, !has67 else { return nil }
+            let mem = X86Operand.mem(.absolute(disp: try readInt64(at: &cursor), segment: segmentOverride))
+            let acc = X86Operand.reg(X86Reg.gpr(size: desc.operandSize, hw: 0))
+            operands = desc.operandFormat == .moffsToAcc ? [mem, acc] : [acc, mem]
+
+        case .stringOp(let kinds):
+            // The implicit operands are printed only when a prefix changes them (segment override, 32-bit addressing).
+            if (segmentOverride != nil && segmentOverride != 0x3E) || has67 {
+                // `xlat` has no form that spells the prefixes (LLVM MC drops them), and a segment override needs a source.
+                guard codeMode == .mode64, !kinds.contains(.table), segmentOverride == nil || kinds.contains(.source) else { return nil }
+                func pointer(_ hw: UInt8, segment: UInt8?) -> X86Operand {
+                    .mem(X86Mem(segment: segment, base: has67 ? X86Reg.gpr32(hw) : X86Reg.gpr64(hw)))
+                }
+                operands = kinds.map { kind in
+                    switch kind {
+                    case .source:      return pointer(6, segment: segmentOverride)
+                    case .destination: return pointer(7, segment: 0x26)
+                    case .table:       return pointer(3, segment: segmentOverride)
+                    case .accumulator: return .reg(X86Reg.gpr(size: desc.operandSize, hw: 0))
+                    case .port:        return .reg(.dx)
+                    }
+                }
+            }
 
         case .segToRm:
             guard let (regBits, rmOp) = try decodeModRM(rmClass: desc.operandSize.gprClass) else { return nil }
@@ -3790,6 +4060,9 @@ extension X86InstructionTable {
             case .immRegToRm(let regClass, let rmClass, _):
                 ops = [.imm(2), .reg(sampleReg(regClass, index: 1)), .reg(sampleReg(rmClass, index: 2))]
 
+            case .clRegToRm(let regClass, let rmClass):
+                ops = [.reg(.cl), .reg(sampleReg(regClass, index: 1)), .reg(sampleReg(rmClass, index: 2))]
+
             case .vexRmVvvvReg(let rmClass, let vvvvClass, let regClass):
                 ops = [.reg(sampleReg(rmClass, index: 3)), .reg(sampleReg(vvvvClass, index: 2)), .reg(sampleReg(regClass, index: 1))]
 
@@ -3826,6 +4099,21 @@ extension X86InstructionTable {
             case .immOnly(let immSz):
                 let immVal: Int64 = (immSz == .byte) ? 12 : 0x1000
                 ops = [.imm(immVal)]
+
+            case .immWordImmByte:
+                ops = [.imm(0x20), .imm(1)]
+
+            case .fixedReg(let r):
+                ops = [.reg(r)]
+
+            case .moffsToAcc:
+                ops = [.mem(.absolute(disp: 0x1122_3344_5566_7788)), .reg(X86Reg.gpr(size: desc.operandSize, hw: 0))]
+
+            case .accToMoffs:
+                ops = [.reg(X86Reg.gpr(size: desc.operandSize, hw: 0)), .mem(.absolute(disp: 0x1122_3344_5566_7788))]
+
+            case .stringOp:
+                ops = []
 
             case .segToRm:
                 ops = [.reg(.ds), desc.rmConstraint == .memOnly ? .mem(sampleMem) : .reg(sampleReg(desc.operandSize.gprClass ?? .gpr32))]
@@ -3931,6 +4219,7 @@ extension X86InstrDesc {
     var hasImplicitSizeMnemonic: Bool {
         mnemonic.hasSuffix("64") || mnemonic == "cmpxchg8b" || mnemonic == "cmpxchg16b"
             || mnemonic == "movd" || mnemonic == "vmovd" || (mnemonic.hasPrefix("set") && operandSize == .byte)
+            || mnemonic == "verr" || mnemonic == "verw"
     }
 
     /// True if AT&T syntax needs a `b`/`w`/`l`/`q` suffix to fix the operand size of `operands`: no
@@ -3942,6 +4231,8 @@ extension X86InstrDesc {
         if X86InstructionTable.mnemonicCarriesSize(mnemonic, operandSize) || hasImplicitSizeMnemonic || operands.isEmpty {
             return false
         }
+        // String instructions are spelled with their size (`movsb`, `lodsq`).
+        if case .stringOp = operandFormat { return false }
         // `%cl` (shift count) and `%dx` (port) do not determine the operand size.
         let sizing: ArraySlice<X86Operand>
         switch operandFormat {
@@ -3972,6 +4263,7 @@ extension X86InstrDesc {
         switch mandatoryPrefix {
         case .none, .pF3, .pF2: return true
         case .p66, .p66F2:      return false
+        case .p67:              return true
         }
     }
 }
@@ -3989,6 +4281,7 @@ extension X86OperandFormat {
         case .shiftByCl:                           return (1, nil)
         case .immRmToReg(let rc, _, _):            return (1, rc)
         case .immRegToRm(_, let rc, _):            return (2, rc)
+        case .clRegToRm(_, let rc):                return (2, rc)
         case .vexRmVvvvReg(let rc, _, _):          return (0, rc)
         case .vexImmRmVvvvReg(let rc, _, _):       return (1, rc)
         case .vexVvvvRmReg(_, let rc, _):          return (1, rc)

@@ -133,6 +133,22 @@ struct M2AssemblerRegressionTests {
         #expect(Self.assemble("tzcnt %ecx, %edx\n", .x86_64).text == [0xF3, 0x0F, 0xBC, 0xD1])
     }
 
+    @Test("x86-64 displacements: based ones out of disp32 range are errors; `mov` of a 64-bit absolute address is `movabs`")
+    func x86DisplacementRange() {
+        // llvm-mc: "displacement 2147483648 is not within [-2147483648, 2147483647]".
+        #expect(Self.assemble("movl 0x80000000(%rax), %eax\n", .x86_64).errors == 1)
+        #expect(Self.assemble("movl -0x80000001(%rip), %eax\n", .x86_64).errors == 1)
+        #expect(Self.assemble("movl 0x80000000, %eax\n", .x86_64).text == [0xA1, 0, 0, 0, 0x80, 0, 0, 0, 0])
+        #expect(Self.assemble("movl 0x7fffffff, %eax\n", .x86_64).text == [0x8B, 0x04, 0x25, 0xFF, 0xFF, 0xFF, 0x7F])
+    }
+
+    @Test("x86-64 rel8-only branches: a target out of range is an error; a prefix alone on a line is its byte")
+    func x86Rel8BranchesAndPrefixes() {
+        #expect(Self.assemble("1: .fill 200, 1, 0x90\nloop 1b\n", .x86_64).errors == 1)
+        #expect(Self.assemble("jrcxz 1f\n.fill 127, 1, 0x90\n1: ret\n", .x86_64).errors == 0)
+        #expect(Self.assemble("rep\nmovsb\nlock\n", .x86_64).text == [0xF3, 0xA4, 0xF0])
+    }
+
     private static func le64(_ values: [Int64]) -> [UInt8] {
         values.flatMap { v in (0..<8).map { UInt8(truncatingIfNeeded: v >> (8 * $0)) } }
     }

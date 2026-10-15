@@ -35,6 +35,7 @@ enum X86Sweep {
         case imm([Int64])
         case fixed(X86Operand)
         case rel([Int64])
+        case moffs([X86Mem])
     }
 
     static func regs(_ rc: X86RegClass) -> [X86Reg] {
@@ -117,6 +118,39 @@ enum X86Sweep {
         X86Mem(base: .eax),                                  // 0x67 address size
         X86Mem(base: .r8d, index: .ecx, scale: 4, disp: 8)
     ]
+
+    /// 64-bit absolute addresses of `movabs` (`moffs`), with segment overrides.
+    static let moffsForms: [X86Mem] = [
+        .absolute(disp: 0x1122_3344_5566_7788), .absolute(disp: 0), .absolute(disp: -1), .absolute(disp: 0x8000_0000),
+        .absolute(disp: Int64.min), .absolute(disp: 0x10, segment: 0x64), .absolute(disp: 0x10, segment: 0x65),
+    ]
+
+    /// The explicit-operand forms of a string instruction: default registers, 32-bit addressing, and every
+    /// segment override of the source (`(%rsi)`, `xlat`'s `(%rbx)`); `%es:` on the destination is optional.
+    static func stringOperandLists(_ kinds: [X86StringOperand], size: X86OperandSize) -> [[X86Operand]] {
+        func operands(addr32: Bool, segment: UInt8?, explicitES: Bool) -> [X86Operand] {
+            kinds.map { kind in
+                func pointer(_ hw: UInt8, _ seg: UInt8?) -> X86Operand {
+                    .mem(X86Mem(segment: seg, base: addr32 ? X86Reg.gpr32(hw) : X86Reg.gpr64(hw)))
+                }
+                switch kind {
+                case .source:      return pointer(6, segment)
+                case .destination: return pointer(7, explicitES ? 0x26 : nil)
+                case .table:       return pointer(3, segment)
+                case .accumulator: return .reg(accumulator(size))
+                case .port:        return .reg(.dx)
+                }
+            }
+        }
+        var lists: [[X86Operand]] = []
+        for addr32 in [false, true] {
+            for explicitES in [false, true] { lists.append(operands(addr32: addr32, segment: nil, explicitES: explicitES)) }
+            if kinds.contains(.source) || kinds.contains(.table) {
+                for seg: UInt8 in [0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65] { lists.append(operands(addr32: addr32, segment: seg, explicitES: true)) }
+            }
+        }
+        return lists
+    }
 
     /// Memory operands for `.code16` descriptors (absolute and 32-bit addressing only).
     static let memForms16: [X86Mem] = [
@@ -229,6 +263,8 @@ enum X86Sweep {
             return [.imm(immValues(desc, immSize: immSz, target: target)), rm(rmClass), .reg(regClass)]
         case .immRegToRm(let regClass, let rmClass, let immSz):
             return [.imm(immValues(desc, immSize: immSz, target: .byte)), .reg(regClass), rm(rmClass)]
+        case .clRegToRm(let regClass, let rmClass):
+            return [.fixed(.reg(.cl)), .reg(regClass), rm(rmClass)]
         case .vexRmVvvvReg(let rmClass, let vvvvClass, let regClass):
             return [rm(rmClass), .reg(vvvvClass), .reg(regClass)]
         case .vexImmRmVvvvReg(let rmClass, let vvvvClass, let regClass):
@@ -251,8 +287,18 @@ enum X86Sweep {
             if relSz == .byte { return [.rel([16, 0, 1, 127, -128, -2])] }
             return [.rel([0x1000, -0x1000, 0x7FFF_FFFF, -0x8000_0000, 0x1234_5678])]
         case .immOnly(let immSz):
-            let target: X86OperandSize = (desc.mnemonic == "push") ? .qword : immSz
+            let target: X86OperandSize = desc.mnemonic == "push" ? .qword : (desc.mnemonic == "pushw" ? .word : immSz)
             return [.imm(immValues(desc, immSize: immSz, target: target))]
+        case .immWordImmByte:
+            return [.imm(imm16), .imm(imm8Unsigned)]
+        case .fixedReg(let r):
+            return [.fixed(.reg(r))]
+        case .moffsToAcc:
+            return [.moffs(moffsForms), .fixed(.reg(accumulator(desc.operandSize)))]
+        case .accToMoffs:
+            return [.fixed(.reg(accumulator(desc.operandSize))), .moffs(moffsForms)]
+        case .stringOp:
+            return []
         case .segToRm:
             return [.reg(.seg), rm(sizeGPR)]
         case .rmToSeg:
@@ -317,6 +363,8 @@ enum X86Sweep {
                 return op
             case .rel(let values):
                 return .relTarget(values[0])
+            case .moffs(let forms):
+                return .mem(forms[0])
             }
         }
         func defaults(extended: Bool) -> [X86Operand] {
@@ -339,6 +387,8 @@ enum X86Sweep {
                 for v in values { base[n] = .imm(v); operandLists.append(base) }
             case .rel(let values):
                 for v in values { base[n] = .relTarget(v); operandLists.append(base) }
+            case .moffs(let forms):
+                for m in forms { base[n] = .mem(m); operandLists.append(base) }
             default:
                 break
             }
@@ -383,6 +433,11 @@ enum X86Sweep {
                     operandLists.append(base)
                 }
             }
+        }
+
+        // 4. String instructions: also the explicit-operand forms.
+        if case .stringOp(let kinds) = desc.operandFormat, mode == .mode64 {
+            operandLists += stringOperandLists(kinds, size: desc.operandSize)
         }
 
         var seen = Set<[X86Operand]>()
@@ -481,11 +536,26 @@ private func gnuAssemble(_ lines: [String], gas: String) throws -> [[UInt8]?] {
 /// True if `gnu` differs from `ours` only in a way 05-assembler.md §4.11 documents (Swift-Stack follows
 /// LLVM MC there): GNU `as` does not swap commutable VEX sources to reach the 2-byte VEX prefix, puts the
 /// first `xchg` register operand in ModRM.reg, omits REX.W in `mov` to/from a segment register and in
-/// `str %r64`, and drops an explicit `%ds:` override that equals the default segment.
+/// `str`/`sldt`/`smsw`/`lar`/`lsl` with a 64-bit register, drops an explicit `%ds:` override that equals the
+/// default segment, puts a string instruction's segment override before 0x67, and emits the segment and address
+/// size of `xlat`'s operand (LLVM MC ignores them).
+/// True for the REX.W far-pointer forms (`lfsq`, `lgsq`, `lssq`, `lcallq`, `ljmpq`), which LLVM MC accepts and GNU
+/// `as` rejects (05-assembler.md §4.11, difference 6).
+private func isDocumentedGNURejection(_ desc: X86InstrDesc) -> Bool {
+    desc.rexW && ["lfs", "lgs", "lss", "lcallq", "ljmpq"].contains(desc.mnemonic)
+}
+
 private func isDocumentedGNUDifference(ours: [UInt8], gnu: [UInt8], desc: X86InstrDesc, mode: X86CodeMode, text: String) -> Bool {
     let disassembler = X86Disassembler()
-    if text.contains("%ds:"), ours.first == 0x3E, Array(ours.dropFirst()) == gnu {
-        return true
+    if text.contains("%ds:"), ours.first == 0x3E {
+        // Possibly together with one of the other differences.
+        let rest = Array(ours.dropFirst())
+        return rest == gnu || isDocumentedGNUDifference(ours: rest, gnu: gnu, desc: desc, mode: mode, text: text.replacingOccurrences(of: "%ds:", with: ""))
+    }
+    if case .stringOp = desc.operandFormat {
+        if desc.mnemonic == "xlatb" { return ours == [0xD7] && gnu.last == 0xD7 }
+        guard ours.count >= 2, ours[0] == 0x67 else { return false }
+        return [ours[1], ours[0]] + ours.dropFirst(2) == gnu
     }
     if desc.commutable || desc.mnemonic == "xchg" {
         guard let a = try? disassembler.disassembleOne(ours, at: 0, codeMode: mode).instruction,
@@ -499,7 +569,7 @@ private func isDocumentedGNUDifference(ours: [UInt8], gnu: [UInt8], desc: X86Ins
     let dropsRexW: Bool
     switch desc.operandFormat {
     case .segToRm, .rmToSeg: dropsRexW = desc.rexW
-    default:                 dropsRexW = desc.rexW && desc.mnemonic == "str"
+    default:                 dropsRexW = desc.rexW && ["str", "sldt", "smsw", "lar", "lsl"].contains(desc.mnemonic)
     }
     if dropsRexW, let rex = ours.firstIndex(where: { (0x48...0x4F).contains($0) }) {
         var expected = ours
@@ -647,7 +717,11 @@ struct M2X86ExhaustiveTests {
             let gnu = try gnuAssemble(group.map(\.text), gas: gas)
             for (o, g) in zip(group, gnu) {
                 guard let g else {
-                    failures.append("GNU as rejects: \(o.text)")
+                    if isDocumentedGNURejection(table[o.descriptorIndex!]) {
+                        gnuDocumented += 1
+                    } else {
+                        failures.append("GNU as rejects: \(o.text)")
+                    }
                     continue
                 }
                 let ours = o.bytes!

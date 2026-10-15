@@ -39,6 +39,16 @@ public enum X86Asm {
         "jg":   0xF, "jnle": 0xF,
     ]
 
+    /// Prefixes that LLVM MC also accepts as a statement of their own.
+    private static let standalonePrefixes: [String: UInt8] = [
+        "lock": 0xF0, "rep": 0xF3, "repe": 0xF3, "repz": 0xF3, "repne": 0xF2, "repnz": 0xF2, "data16": 0x66,
+    ]
+
+    /// Opcode byte of the branches that only have a rel8 form.
+    private static let rel8BranchOpcodes: [String: UInt8] = [
+        "loopne": 0xE0, "loopnz": 0xE0, "loope": 0xE1, "loopz": 0xE1, "loop": 0xE2, "jrcxz": 0xE3, "jecxz": 0xE3,
+    ]
+
     internal static func parseInstruction(
         mnemonic rawMnemonic: String,
         args rawArgs: String,
@@ -51,7 +61,12 @@ public enum X86Asm {
         var lockPrefix = false
         var repPrefix: X86RepPrefix = .none
 
-        // Handle inline prefixes (`lock`, `rep`, `repe`, `repz`, `repne`, `repnz`)
+        // Handle inline prefixes (`lock`, `rep`, `repe`, `repz`, `repne`, `repnz`). A prefix alone on a line
+        // (`rep; movsb`, `lock` before a `.byte` sequence) is emitted as its byte, as LLVM MC does; so is `data16`.
+        if args.isEmpty, let prefixByte = standalonePrefixes[mnem] {
+            session.currentSection.emitBytes([prefixByte], loc: loc)
+            return
+        }
         while true {
             if mnem == "lock" {
                 lockPrefix = true
@@ -112,6 +127,30 @@ public enum X86Asm {
                         .x86Branch(isConditional: true, condCode: cc, targetSymbol: sym, addend: addend),
                         loc: loc
                     )
+                    return
+                case .constant(let relVal):
+                    let inst = X86Instruction(mnemonic: mnem, operands: [.relTarget(relVal)], codeMode: session.x86CodeMode)
+                    if let enc = try? encoder.encode(inst) {
+                        session.currentSection.emitBytes(enc.bytes, loc: loc)
+                        return
+                    }
+                case .symbolDiff:
+                    break
+                }
+            }
+        }
+
+        // 1b. rel8-only branches (`loop`, `loope`, `loopne`, `jrcxz`, `jecxz`): a symbolic target is an 8-bit
+        //     PC-relative fixup (`R_X86_64_PC8` if unresolved), as in LLVM MC; they are never relaxed.
+        if let opcode = rel8BranchOpcodes[mnem], rawOperands.count == 1,
+           !rawOperands[0].hasPrefix("*"), !rawOperands[0].hasPrefix("%") {
+            if let exprVal = AsmExprEvaluator.evaluate(rawOperands[0], constants: session.constants) {
+                switch exprVal {
+                case .symbolOffset(let sym, let addend, _):
+                    let bytes: [UInt8] = mnem == "jecxz" ? [0x67, opcode, 0] : [opcode, 0]
+                    let fixup = AsmInstFixup(offsetInInst: bytes.count - 1, kind: .x86_64_pc8, symbol: sym, addend: addend - 1, width: 1,
+                                             resolveIfSameSection: true)
+                    session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
                     return
                 case .constant(let relVal):
                     let inst = X86Instruction(mnemonic: mnem, operands: [.relTarget(relVal)], codeMode: session.x86CodeMode)
@@ -226,7 +265,7 @@ public enum X86Asm {
                 } else {
                     let mod = symModifiers[rel.symbol] ?? .none
                     var mappedKind = mapRelocKind(rel.kind, modifier: mod)
-                    if mappedKind == .x86_64_gotpcrel, let relaxable = relaxableGOTLoadKind(mnemonic: mnem, operands: parsedOperands, bytes: encoded.bytes) {
+                    if mappedKind == .x86_64_gotpcrel, session.x86RelaxRelocations, let relaxable = relaxableGOTLoadKind(mnemonic: mnem, operands: parsedOperands, bytes: encoded.bytes) {
                         mappedKind = relaxable
                     }
                     let resolveSameSec = (mappedKind == .x86_64_pc32)
@@ -264,7 +303,9 @@ public enum X86Asm {
             if case .mem = op { return true }
             return false
         }
-        let base = ["l", "q"].contains(mnemonic.suffix(1)) && mnemonic.count > 2 ? String(mnemonic.dropLast()) : mnemonic
+        let relaxableBases: Set<String> = ["mov", "lea", "adc", "add", "and", "cmp", "or", "sbb", "sub", "xor", "test", "call", "jmp"]
+        // An `l`/`q` size suffix is stripped only when that leaves one of the bases (`call` keeps its `l`).
+        let base = !relaxableBases.contains(mnemonic) && ["l", "q"].contains(mnemonic.suffix(1)) ? String(mnemonic.dropLast()) : mnemonic
         let relaxable: Bool
         switch base {
         case "mov", "lea", "adc", "add", "and", "cmp", "or", "sbb", "sub", "xor":

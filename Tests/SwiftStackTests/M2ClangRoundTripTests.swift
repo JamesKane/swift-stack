@@ -95,35 +95,12 @@ struct M2ClangRoundTripTests {
         let assemble = try ExternalTool.run(clang, ["--target=\(file.triple)"] + file.assemblerFlags + ["-c", asm, "-o", ref])
         try #require(assemble.status == 0, "clang -c failed: \(assemble.stderr)")
 
-        func check() throws {
-            var diags = DiagnosticBag()
-            let sm = SourceManager()
-            let obj = try Assembler.assembleFile(path: asm, arch: file.arch, riscvOptions: DifferentialAssembly.riscvOptions(for: file.assemblerFlags),
-                                                 sourceManager: sm, diagnostics: &diags)
-            #expect(diags.errorCount == 0, Comment(rawValue: DiagnosticRenderer.render(diagnostics: diags, sourceManager: sm)))
-            let diffs = ExactObjectComparison.differences(ours: try TestELF(bytes: ELFObjectWriter.write(obj)), oracle: try TestELF(path: ref))
-            #expect(diffs.isEmpty, Comment(rawValue: "\(file.testDescription):\n  " + diffs.prefix(30).joined(separator: "\n  ")))
-        }
-        if let gap = Self.knownEncoderGap(file) {
-            withKnownIssue(Comment(rawValue: gap)) { try check() }
-        } else {
-            try check()
-        }
-    }
-
-    /// Files whose clang output uses instructions the shared `Encode` tables do not have yet (the assembler reports
-    /// them as invalid instructions). Recorded as known issues, so a fix shows up as an unexpected pass.
-    static func knownEncoderGap(_ file: ClangRoundTripFile) -> String? {
-        let opt = file.compileFlags.last ?? ""
-        switch (file.arch, URL(fileURLWithPath: file.source).lastPathComponent, opt) {
-        case (.x86_64, "int128.c", _), (.x86_64, "vdso.c", _):
-            return "x86-64 `shld`/`shrd` are not in the X86 encoder table"
-        case (.x86_64, "usertest.c", "-O0"):
-            return "x86-64 `xadd` is not in the X86 encoder table"
-        case (.aarch64, "usertest.c", _):
-            return "SVE `index`/`cntd`/`ptrue`/`lastb` (usertest.c inline assembly) are not in the A64 encoder table"
-        default:
-            return nil
-        }
+        var diags = DiagnosticBag()
+        let sm = SourceManager()
+        let obj = try Assembler.assembleFile(path: asm, arch: file.arch, riscvOptions: DifferentialAssembly.riscvOptions(for: file.assemblerFlags),
+                                             sourceManager: sm, diagnostics: &diags)
+        #expect(diags.errorCount == 0, Comment(rawValue: DiagnosticRenderer.render(diagnostics: diags, sourceManager: sm)))
+        let diffs = ExactObjectComparison.differences(ours: try TestELF(bytes: ELFObjectWriter.write(obj)), oracle: try TestELF(path: ref))
+        #expect(diffs.isEmpty, Comment(rawValue: "\(file.testDescription):\n  " + diffs.prefix(30).joined(separator: "\n  ")))
     }
 }
