@@ -31,7 +31,7 @@ All three target architectures use a single static instruction descriptor table 
 ### 1.2 Relocatable Object Model & ELF64 Reader/Writer (`Sources/SwiftStack/Object/`)
 
 - **`RelocatableObject.swift`**:
-  - `~Copyable` Structure-of-Arrays (`SectionColumn`, `SymbolColumn`, `RelocationColumn`) produced by the assembler (`Asm`). The M0.5 code generator still emits through `Encode/X86Encoder` and `Linker/StaticELFWriter`; moving `Codegen` onto `X86Codec` and `RelocatableObject` is M3 work.
+  - `~Copyable` Structure-of-Arrays (`SectionColumn`, `SymbolColumn`, `RelocationColumn`) produced by the assembler (`Asm`). The M0.5 code generator now encodes every instruction through `X86TableEncoder` (`Codegen/X86CodeEmitter.swift`; the hand-rolled `Encode/X86Encoder` is gone) but still links through `Linker/StaticELFWriter`; moving it onto `RelocatableObject` is M3 work.
   - Closed `ObjectArch` (`x86_64`, `aarch64`, `riscv64`) and `ObjectFormat` (`elf64`) enums.
 - **`ELFObjectIO.swift`**:
   - `ELFObjectWriter`: Deterministic (`D6`) ELF64 `ET_REL` serializer with canonical section ordering, local-before-global `SHT_SYMTAB` partitioning (`sh_info` = first global index), per-code-section `.rela<sec>` tables, and architecture `e_flags` (`EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE` on RV64).

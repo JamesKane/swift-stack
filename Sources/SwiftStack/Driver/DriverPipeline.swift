@@ -340,7 +340,7 @@ public final class DriverPipeline {
             Profiler.shared.timeBlock(name: "Phase 5: Codegen", category: "codegen") {
                 var selector = InstructionSelector()
                 let regAlloc = LinearScanRegAlloc()
-                var encoder = X86Encoder()
+                var encoder = X86CodeEmitter()
 
                 var calleeMap: [UInt32: String] = [
                     1: "write",
