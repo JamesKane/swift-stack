@@ -40,16 +40,22 @@ enum AsmCorpora {
 
     /// Stand-ins for the build outputs `kernel/userprogram.S` embeds with `.incbin` (the user test program,
     /// the vDSO, the Swift test programs and userboot). Both assemblers read the same files, so their
-    /// contents only need to be fixed and distinct.
-    static let incbinDir = FileManager.default.temporaryDirectory.appendingPathComponent("ss_vectraos_incbin").path
+    /// contents only need to be fixed and distinct. They are written once per process, into a per-process
+    /// directory: the parameterized tests run in parallel and must never see a file being rewritten.
+    static let incbinDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ss_vectraos_incbin_\(ProcessInfo.processInfo.processIdentifier)").path
     static let incbinMacros = ["CROI_USER_PROGRAM", "CROI_VDSO", "CROI_SWIFT_TEST", "CROI_SWIFT_TEST_EXEC", "CROI_USERBOOT"]
 
-    static func prepareIncbinStandIns() throws {
+    private static let incbinStandIns: Result<Void, any Error> = Result {
         try FileManager.default.createDirectory(atPath: incbinDir, withIntermediateDirectories: true)
         for (i, name) in incbinMacros.enumerated() {
             let bytes = (0..<(37 * (i + 1))).map { UInt8(truncatingIfNeeded: $0 * 7 + i) }
-            try Data(bytes).write(to: URL(fileURLWithPath: "\(incbinDir)/\(name).bin"))
+            try Data(bytes).write(to: URL(fileURLWithPath: "\(incbinDir)/\(name).bin"), options: .atomic)
         }
+    }
+
+    static func prepareIncbinStandIns() throws {
+        try incbinStandIns.get()
     }
 
     /// The VectraOS assembly (all 26 `.S` files), each assembled for its architecture with the flags its CMake
