@@ -47,6 +47,17 @@ public enum X86OperandSize: UInt8, BitwiseCopyable, Sendable, Equatable, Hashabl
         }
     }
 
+    /// General-purpose register class of this size, if any.
+    public var gprClass: X86RegClass? {
+        switch self {
+        case .byte:  return .gpr8
+        case .word:  return .gpr16
+        case .dword: return .gpr32
+        case .qword: return .gpr64
+        default:     return nil
+        }
+    }
+
     public init?(attSuffix: Character) {
         switch attSuffix {
         case "b", "B": self = .byte
@@ -533,7 +544,7 @@ public struct X86Instruction: Sendable, Equatable, Hashable, CustomStringConvert
         case .repne: prefixStr += "repne "
         }
         let fullMnemonic: String
-        if sizeSuffix != .unsized && !mnemonic.hasSuffix(sizeSuffix.attSuffix) {
+        if sizeSuffix != .unsized && !X86InstructionTable.mnemonicCarriesSize(mnemonic, sizeSuffix) {
             fullMnemonic = mnemonic + sizeSuffix.attSuffix
         } else {
             fullMnemonic = mnemonic
@@ -667,6 +678,16 @@ public enum X86RMKind: UInt8, BitwiseCopyable, Sendable, Equatable, Hashable {
     case indirectMemOnly  = 4
 }
 
+/// Restriction on the ModR/M `r/m` operand of an otherwise register-or-memory format. It separates
+/// encodings that share an opcode (`movhlps` reg-only vs `movlps` mem-only, `0F 12`), and rejects forms
+/// the hardware does not define (`movntdq` reg, `pmovmskb` mem).
+@frozen
+public enum X86RMConstraint: UInt8, BitwiseCopyable, Sendable, Equatable, Hashable {
+    case any     = 0
+    case regOnly = 1 // ModR/M.mod == 3
+    case memOnly = 2 // ModR/M.mod != 3
+}
+
 /// Operand encoding template for an `X86InstrDesc`.
 @frozen
 public enum X86OperandFormat: Sendable, Equatable, Hashable {
@@ -674,6 +695,8 @@ public enum X86OperandFormat: Sendable, Equatable, Hashable {
     case implied
     /// 1 register encoded in `opcode + (reg & 7)` (`push %reg`, `pop %reg`, `bswap %reg`).
     case opcodePlusReg(X86RegClass)
+    /// 2 registers `%reg, %acc` (either order) encoded in `opcode + (reg & 7)` (`xchg %ebx, %eax` = 0x93).
+    case opcodePlusRegWithAcc(X86RegClass)
     /// 2 operands `$imm, %reg` encoded in `opcode + (reg & 7)` + `imm` (`mov $imm, %reg`).
     case immToOpcodePlusReg(X86RegClass, immSize: X86OperandSize)
     /// 1 `r/m` operand with `/digit` in `ModRM.reg` (`inc`, `dec`, `not`, `neg`, `idiv`, `lgdt`, `setcc`, `jmp *r/m`).
@@ -696,8 +719,22 @@ public enum X86OperandFormat: Sendable, Equatable, Hashable {
     case immRegToRm(regClass: X86RegClass, rmClass: X86RegClass, immSize: X86OperandSize)
     /// 3-operand VEX `src2_rm, src1_vvvv, dst_reg` (`vaddps`, `vpxor`, `vaesenc`, etc.).
     case vexRmVvvvReg(rmClass: X86RegClass, vvvvClass: X86RegClass, regClass: X86RegClass)
-    /// 4-operand VEX `$imm8, src2_rm, src1_vvvv, dst_reg` (`vpclmulqdq`).
+    /// 4-operand VEX `$imm8, src2_rm, src1_vvvv, dst_reg` (`vpclmulqdq`, `vshufps`, `vinsertf128`, `vpinsrd`).
     case vexImmRmVvvvReg(rmClass: X86RegClass, vvvvClass: X86RegClass, regClass: X86RegClass)
+    /// 3-operand VEX `src2_vvvv, src1_rm, dst_reg` (BMI `bextr`, `bzhi`, `sarx`, `shlx`, `shrx`).
+    case vexVvvvRmReg(vvvvClass: X86RegClass, rmClass: X86RegClass, regClass: X86RegClass)
+    /// 2-operand VEX `src_rm, dst_vvvv` with `/digit` in `ModRM.reg` (`blsr`, `blsi`, `blsmsk`).
+    case vexRmToVvvv(rmClass: X86RegClass, vvvvClass: X86RegClass)
+    /// 3-operand VEX `$imm8, src_rm, dst_vvvv` with `/digit` in `ModRM.reg` (`vpsrlw $imm`, `vpslldq`).
+    case vexImmRmToVvvv(rmClass: X86RegClass, vvvvClass: X86RegClass)
+    /// 3-operand VEX `src_reg, src1_vvvv, dst_rm` (`vmaskmovps` store, `vmovss` register store form).
+    case vexRegVvvvToRm(regClass: X86RegClass, vvvvClass: X86RegClass, rmClass: X86RegClass)
+    /// 4-operand VEX `src3_is4, src2_rm, src1_vvvv, dst_reg`; `src3` is in `imm8[7:4]` (`vblendvps`, `vpblendvb`).
+    case vexIs4RmVvvvReg(rmClass: X86RegClass, vvvvClass: X86RegClass, regClass: X86RegClass)
+    /// 3-operand VEX gather `mask_vvvv, vsib_mem, dst_reg`; the memory index is a vector register (`vgatherdps`).
+    case vexVsib(vvvvClass: X86RegClass, indexClass: X86RegClass, regClass: X86RegClass)
+    /// 3-operand legacy `%xmm0, src_rm, dst_reg` with an implicit `%xmm0` (`blendvps`, `pblendvb`, `sha256rnds2`).
+    case xmm0RmToReg(rmClass: X86RegClass, regClass: X86RegClass)
     /// 1 relative branch target (`rel8` or `rel32`).
     case relBranch(relSize: X86OperandSize)
     /// 1 immediate operand (`push $imm8/32`, `int $imm8`, `ret $imm16`).
@@ -734,6 +771,14 @@ public struct X86InstrDesc: Sendable, Equatable, Hashable {
     public let default64BitInMode64: Bool
     public let suppressOperandSizePrefix: Bool
     public let operandFormat: X86OperandFormat
+    /// Restriction on the `r/m` operand (register-only or memory-only forms).
+    public let rmConstraint: X86RMConstraint
+    /// VEX source operands may be swapped to move an extended register out of `r/m` and allow the
+    /// 2-byte VEX prefix, as LLVM MC does for commutable map-0F instructions (05-assembler.md §4.11).
+    public let commutable: Bool
+    /// AT&T spelling required when the `r/m` operand is memory and the plain mnemonic would be
+    /// ambiguous (`vcvtpd2psx` / `vcvtpd2psy`). It is also accepted for register forms.
+    public let memMnemonic: String?
 
     public init(
         mnemonic: String,
@@ -749,8 +794,14 @@ public struct X86InstrDesc: Sendable, Equatable, Hashable {
         vexL: UInt8 = 0,
         default64BitInMode64: Bool = false,
         suppressOperandSizePrefix: Bool = false,
-        operandFormat: X86OperandFormat
+        operandFormat: X86OperandFormat,
+        rmConstraint: X86RMConstraint = .any,
+        commutable: Bool = false,
+        memMnemonic: String? = nil
     ) {
+        self.rmConstraint = rmConstraint
+        self.commutable = commutable
+        self.memMnemonic = memMnemonic
         self.mnemonic = mnemonic
         self.aliases = aliases
         self.operandSize = operandSize
@@ -793,22 +844,37 @@ public enum X86InstructionTable {
         (0xF, "g",  ["nle"])
     ]
 
+    /// True if `mnemonic` already ends in the AT&T suffix for `size` (`movzbl`, `crc32q`, `ljmpw`, `lgdtl`),
+    /// as opposed to a base name that happens to end in that letter (`sbb`, `sub`, `shl`, `imul`).
+    public static func mnemonicCarriesSize(_ mnemonic: String, _ size: X86OperandSize) -> Bool {
+        let suffix = size.attSuffix
+        guard !suffix.isEmpty, mnemonic.hasSuffix(suffix) else { return false }
+        return mnemonicMap[String(mnemonic.dropLast())] != nil
+    }
+
     /// All instruction descriptors in priority order.
     public static let descriptors: [X86InstrDesc] = buildDescriptors()
 
     /// Lookup table mapping lowercase mnemonic (and sized/alias variants) to indices into `descriptors`.
+    /// Each list is in ascending (table preference) order without duplicates.
     public static let mnemonicMap: [String: [Int]] = {
         var map: [String: [Int]] = [:]
+        func add(_ name: String, _ idx: Int) {
+            if map[name]?.last != idx { map[name, default: []].append(idx) }
+        }
         for (idx, desc) in descriptors.enumerated() {
-            map[desc.mnemonic, default: []].append(idx)
+            add(desc.mnemonic, idx)
             if desc.operandSize != .unsized {
                 let suffixed = desc.mnemonic + desc.operandSize.attSuffix
                 if suffixed != desc.mnemonic {
-                    map[suffixed, default: []].append(idx)
+                    add(suffixed, idx)
                 }
             }
             for alias in desc.aliases {
-                map[alias, default: []].append(idx)
+                add(alias, idx)
+            }
+            if let memMnem = desc.memMnemonic {
+                add(memMnem, idx)
             }
         }
         return map
@@ -915,21 +981,17 @@ public enum X86InstructionTable {
             operandFormat: .immToRm(rmClass: .gpr32, immSize: .dword)
         ))
 
-        // MOV segment, control, debug registers
-        list.append(X86InstrDesc(
-            mnemonic: "mov",
-            aliases: ["movw", "movl", "movq"],
-            opcode: 0x8C,
-            suppressOperandSizePrefix: true,
-            operandFormat: .segToRm
-        ))
-        list.append(X86InstrDesc(
-            mnemonic: "mov",
-            aliases: ["movw", "movl", "movq"],
-            opcode: 0x8E,
-            suppressOperandSizePrefix: true,
-            operandFormat: .rmToSeg
-        ))
+        // MOV segment registers. Sreg -> r16 takes 0x66, but Sreg -> m16 and r16/m16 -> Sreg do not
+        // (LLVM MC and GNU `as` both omit it, since the operation is 16-bit regardless).
+        list.append(X86InstrDesc(mnemonic: "mov", operandSize: .word, opcode: 0x8C, operandFormat: .segToRm, rmConstraint: .regOnly))
+        list.append(X86InstrDesc(mnemonic: "mov", operandSize: .word, opcode: 0x8C, suppressOperandSizePrefix: true, operandFormat: .segToRm, rmConstraint: .memOnly))
+        list.append(X86InstrDesc(mnemonic: "mov", operandSize: .dword, opcode: 0x8C, operandFormat: .segToRm, rmConstraint: .regOnly))
+        list.append(X86InstrDesc(mnemonic: "mov", operandSize: .qword, opcode: 0x8C, rexW: true, operandFormat: .segToRm, rmConstraint: .regOnly))
+        list.append(X86InstrDesc(mnemonic: "mov", operandSize: .word, opcode: 0x8E, suppressOperandSizePrefix: true, operandFormat: .rmToSeg))
+        list.append(X86InstrDesc(mnemonic: "mov", operandSize: .dword, opcode: 0x8E, operandFormat: .rmToSeg, rmConstraint: .regOnly))
+        list.append(X86InstrDesc(mnemonic: "mov", operandSize: .qword, opcode: 0x8E, rexW: true, operandFormat: .rmToSeg, rmConstraint: .regOnly))
+
+        // MOV control and debug registers
         list.append(X86InstrDesc(
             mnemonic: "mov",
             aliases: ["movq", "movl"],
@@ -1072,9 +1134,9 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "cqto", aliases: ["cqo"], operandSize: .qword, opcode: 0x99, rexW: true, operandFormat: .implied))
 
         // LEA (0x8D /r)
-        list.append(X86InstrDesc(mnemonic: "lea", operandSize: .qword, opcode: 0x8D, rexW: true, operandFormat: .rmToReg(rmClass: .gpr64, regClass: .gpr64)))
-        list.append(X86InstrDesc(mnemonic: "lea", operandSize: .dword, opcode: 0x8D, operandFormat: .rmToReg(rmClass: .gpr32, regClass: .gpr32)))
-        list.append(X86InstrDesc(mnemonic: "lea", operandSize: .word, opcode: 0x8D, operandFormat: .rmToReg(rmClass: .gpr16, regClass: .gpr16)))
+        list.append(X86InstrDesc(mnemonic: "lea", operandSize: .qword, opcode: 0x8D, rexW: true, operandFormat: .rmToReg(rmClass: .gpr64, regClass: .gpr64), rmConstraint: .memOnly))
+        list.append(X86InstrDesc(mnemonic: "lea", operandSize: .dword, opcode: 0x8D, operandFormat: .rmToReg(rmClass: .gpr32, regClass: .gpr32), rmConstraint: .memOnly))
+        list.append(X86InstrDesc(mnemonic: "lea", operandSize: .word, opcode: 0x8D, operandFormat: .rmToReg(rmClass: .gpr16, regClass: .gpr16), rmConstraint: .memOnly))
 
         // PUSH / POP / PUSHFQ / POPFQ
         list.append(X86InstrDesc(mnemonic: "push", aliases: ["pushq"], operandSize: .qword, opcode: 0x50, default64BitInMode64: true, operandFormat: .opcodePlusReg(.gpr64)))
@@ -1091,14 +1153,26 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "pop", aliases: ["popw"], operandSize: .word, opcode: 0x8F, modrmSlash: 0, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(mnemonic: "popfq", aliases: ["popf"], operandSize: .qword, opcode: 0x9D, default64BitInMode64: true, operandFormat: .implied))
 
-        // XCHG, CMPXCHG, CMPXCHG16B, BSWAP
+        // XCHG: accumulator short form (0x90 + r), then `%a, %b` with ModRM.reg = %b (as LLVM MC encodes it),
+        // then `%reg, mem`. CMPXCHG, CMPXCHG16B, BSWAP.
+        for (sz, rc, w) in gprSizes where sz != .byte {
+            list.append(X86InstrDesc(mnemonic: "xchg", operandSize: sz, opcode: 0x90, rexW: w, operandFormat: .opcodePlusRegWithAcc(rc)))
+        }
         for (sz, rc, w) in gprSizes {
             list.append(X86InstrDesc(
                 mnemonic: "xchg",
                 operandSize: sz,
                 opcode: sz == .byte ? 0x86 : 0x87,
                 rexW: w,
-                operandFormat: .regToRm(regClass: rc, rmClass: rc)
+                operandFormat: .rmToReg(rmClass: rc, regClass: rc)
+            ))
+            list.append(X86InstrDesc(
+                mnemonic: "xchg",
+                operandSize: sz,
+                opcode: sz == .byte ? 0x86 : 0x87,
+                rexW: w,
+                operandFormat: .regToRm(regClass: rc, rmClass: rc),
+                rmConstraint: .memOnly
             ))
             list.append(X86InstrDesc(
                 mnemonic: "cmpxchg",
@@ -1527,7 +1601,10 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "lidt", aliases: ["lidtq", "lidtl"], opcodeMap: .map0F, opcode: 0x01, modrmSlash: 3, default64BitInMode64: true, operandFormat: .rm(.memOnly)))
         list.append(X86InstrDesc(mnemonic: "invlpg", opcodeMap: .map0F, opcode: 0x01, modrmSlash: 7, default64BitInMode64: true, operandFormat: .rm(.memOnly)))
 
-        list.append(X86InstrDesc(mnemonic: "str", aliases: ["strw"], operandSize: .word, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 1, operandFormat: .rm(.gprOrMem)))
+        list.append(X86InstrDesc(mnemonic: "str", operandSize: .word, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 1, operandFormat: .rm(.gprOrMem), rmConstraint: .regOnly))
+        list.append(X86InstrDesc(mnemonic: "str", operandSize: .word, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 1, suppressOperandSizePrefix: true, operandFormat: .rm(.gprOrMem), rmConstraint: .memOnly))
+        list.append(X86InstrDesc(mnemonic: "str", operandSize: .dword, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 1, operandFormat: .rm(.gprOnly)))
+        list.append(X86InstrDesc(mnemonic: "str", operandSize: .qword, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 1, rexW: true, operandFormat: .rm(.gprOnly)))
         list.append(X86InstrDesc(mnemonic: "ltr", aliases: ["ltrw"], operandSize: .word, opcodeMap: .map0F, opcode: 0x00, modrmSlash: 3, suppressOperandSizePrefix: true, operandFormat: .rm(.gprOrMem)))
 
         list.append(X86InstrDesc(mnemonic: "wrmsr", opcodeMap: .map0F, opcode: 0x30, operandFormat: .implied))
@@ -1559,6 +1636,8 @@ public enum X86InstructionTable {
         }
 
         list.append(X86InstrDesc(mnemonic: "pause", mandatoryPrefix: .pF3, opcode: 0x90, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "endbr64", opcodeMap: .map0F, mandatoryPrefix: .pF3, opcode: 0x1E, secondaryOpcode: 0xFA, operandFormat: .implied))
+        list.append(X86InstrDesc(mnemonic: "endbr32", opcodeMap: .map0F, mandatoryPrefix: .pF3, opcode: 0x1E, secondaryOpcode: 0xFB, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "nop", opcode: 0x90, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "int3", opcode: 0xCC, operandFormat: .implied))
         list.append(X86InstrDesc(mnemonic: "int", opcode: 0xCD, operandFormat: .immOnly(immSize: .byte)))
@@ -1589,10 +1668,105 @@ public enum X86InstructionTable {
         list.append(X86InstrDesc(mnemonic: "crc32q", aliases: ["crc32"], operandSize: .qword, opcodeMap: .map0F38, mandatoryPrefix: .pF2, opcode: 0xF1, rexW: true, operandFormat: .rmToReg(rmClass: .gpr64, regClass: .gpr64)))
 
         // -----------------------------------------------------------------
-        // 4.7 SSE & AVX (VEX) Vector / Scalar Instructions (04-backend.md §4.9)
+        // 4.7 GPR extensions: BMI1, BMI2, ADX, MOVBE, cache control
         // -----------------------------------------------------------------
+        let gpr3264: [(X86OperandSize, X86RegClass, Bool)] = [(.dword, .gpr32, false), (.qword, .gpr64, true)]
+        for (sz, rc, w) in gpr3264 {
+            func bmi(_ name: String, _ pfx: X86MandatoryPrefix, map: X86OpcodeMap = .map0F38, _ op: UInt8, slash: UInt8? = nil, _ format: X86OperandFormat) {
+                list.append(X86InstrDesc(mnemonic: name, operandSize: sz, encodingKind: .vex, opcodeMap: map, mandatoryPrefix: pfx, opcode: op, modrmSlash: slash, rexW: w, operandFormat: format))
+            }
+            // BMI1
+            bmi("andn",   .none, 0xF2, .vexRmVvvvReg(rmClass: rc, vvvvClass: rc, regClass: rc))
+            bmi("bextr",  .none, 0xF7, .vexVvvvRmReg(vvvvClass: rc, rmClass: rc, regClass: rc))
+            bmi("blsr",   .none, 0xF3, slash: 1, .vexRmToVvvv(rmClass: rc, vvvvClass: rc))
+            bmi("blsmsk", .none, 0xF3, slash: 2, .vexRmToVvvv(rmClass: rc, vvvvClass: rc))
+            bmi("blsi",   .none, 0xF3, slash: 3, .vexRmToVvvv(rmClass: rc, vvvvClass: rc))
+            // BMI2
+            bmi("bzhi",   .none, 0xF5, .vexVvvvRmReg(vvvvClass: rc, rmClass: rc, regClass: rc))
+            bmi("pdep",   .pF2,  0xF5, .vexRmVvvvReg(rmClass: rc, vvvvClass: rc, regClass: rc))
+            bmi("pext",   .pF3,  0xF5, .vexRmVvvvReg(rmClass: rc, vvvvClass: rc, regClass: rc))
+            bmi("mulx",   .pF2,  0xF6, .vexRmVvvvReg(rmClass: rc, vvvvClass: rc, regClass: rc))
+            bmi("sarx",   .pF3,  0xF7, .vexVvvvRmReg(vvvvClass: rc, rmClass: rc, regClass: rc))
+            bmi("shlx",   .p66,  0xF7, .vexVvvvRmReg(vvvvClass: rc, rmClass: rc, regClass: rc))
+            bmi("shrx",   .pF2,  0xF7, .vexVvvvRmReg(vvvvClass: rc, rmClass: rc, regClass: rc))
+            bmi("rorx",   .pF2, map: .map0F3A, 0xF0, .immRmToReg(rmClass: rc, regClass: rc, immSize: .byte))
+            // ADX
+            list.append(X86InstrDesc(mnemonic: "adcx", operandSize: sz, opcodeMap: .map0F38, mandatoryPrefix: .p66, opcode: 0xF6, rexW: w, operandFormat: .rmToReg(rmClass: rc, regClass: rc)))
+            list.append(X86InstrDesc(mnemonic: "adox", operandSize: sz, opcodeMap: .map0F38, mandatoryPrefix: .pF3, opcode: 0xF6, rexW: w, operandFormat: .rmToReg(rmClass: rc, regClass: rc)))
+            // MOVNTI
+            list.append(X86InstrDesc(mnemonic: "movnti", operandSize: sz, opcodeMap: .map0F, opcode: 0xC3, rexW: w, operandFormat: .regToRm(regClass: rc, rmClass: rc), rmConstraint: .memOnly))
+        }
+        // MOVBE (memory only; load 0F 38 F0, store 0F 38 F1)
+        for (sz, rc, w) in gprSizes where sz != .byte {
+            list.append(X86InstrDesc(mnemonic: "movbe", operandSize: sz, opcodeMap: .map0F38, opcode: 0xF0, rexW: w, operandFormat: .rmToReg(rmClass: rc, regClass: rc), rmConstraint: .memOnly))
+            list.append(X86InstrDesc(mnemonic: "movbe", operandSize: sz, opcodeMap: .map0F38, opcode: 0xF1, rexW: w, operandFormat: .regToRm(regClass: rc, rmClass: rc), rmConstraint: .memOnly))
+        }
+        // Prefetch, cache-line flush/write-back, MXCSR
+        for (name, op, slash) in [("prefetchnta", UInt8(0x18), UInt8(0)), ("prefetcht0", 0x18, 1), ("prefetcht1", 0x18, 2), ("prefetcht2", 0x18, 3), ("prefetchw", 0x0D, 1)] {
+            list.append(X86InstrDesc(mnemonic: name, opcodeMap: .map0F, opcode: op, modrmSlash: slash, operandFormat: .rm(.memOnly)))
+        }
+        list.append(X86InstrDesc(mnemonic: "clflushopt", opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0xAE, modrmSlash: 7, operandFormat: .rm(.memOnly)))
+        list.append(X86InstrDesc(mnemonic: "clwb", opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0xAE, modrmSlash: 6, operandFormat: .rm(.memOnly)))
+        list.append(X86InstrDesc(mnemonic: "ldmxcsr", opcodeMap: .map0F, opcode: 0xAE, modrmSlash: 2, operandFormat: .rm(.memOnly)))
+        list.append(X86InstrDesc(mnemonic: "stmxcsr", opcodeMap: .map0F, opcode: 0xAE, modrmSlash: 3, operandFormat: .rm(.memOnly)))
+        list.append(X86InstrDesc(mnemonic: "vldmxcsr", encodingKind: .vex, opcodeMap: .map0F, opcode: 0xAE, modrmSlash: 2, operandFormat: .rm(.memOnly)))
+        list.append(X86InstrDesc(mnemonic: "vstmxcsr", encodingKind: .vex, opcodeMap: .map0F, opcode: 0xAE, modrmSlash: 3, operandFormat: .rm(.memOnly)))
 
-        // Vector Moves: load (r/m -> reg) and store (reg -> r/m)
+        // -----------------------------------------------------------------
+        // 4.8 SSE..SSE4.2, AVX, AVX2, FMA, F16C, AES, PCLMUL, SHA (04-backend.md §4.9, 17 §2)
+        // -----------------------------------------------------------------
+        // Each SIMD instruction has up to three forms: legacy SSE (`xmm`, destructive 2-operand), VEX.128
+        // (`v` prefix, non-destructive 3-operand) and VEX.256 (`ymm`; AVX for FP, AVX2 for integer).
+        let X = X86RegClass.xmm
+        let Y = X86RegClass.ymm
+
+        func sse(_ name: String, _ map: X86OpcodeMap, _ pfx: X86MandatoryPrefix, _ op: UInt8, w: Bool = false,
+                 size: X86OperandSize = .xmm128, slash: UInt8? = nil, rm: X86RMConstraint = .any,
+                 aliases: [String] = [], _ format: X86OperandFormat) {
+            list.append(X86InstrDesc(mnemonic: name, aliases: aliases, operandSize: size, opcodeMap: map, mandatoryPrefix: pfx,
+                                     opcode: op, modrmSlash: slash, rexW: w, operandFormat: format, rmConstraint: rm))
+        }
+        func vex(_ name: String, _ map: X86OpcodeMap, _ pfx: X86MandatoryPrefix, _ op: UInt8, l: UInt8 = 0, w: Bool = false,
+                 size: X86OperandSize? = nil, slash: UInt8? = nil, rm: X86RMConstraint = .any, commutable: Bool = false,
+                 aliases: [String] = [], memMnemonic: String? = nil, _ format: X86OperandFormat) {
+            list.append(X86InstrDesc(mnemonic: name, aliases: aliases, operandSize: size ?? (l == 1 ? .ymm256 : .xmm128),
+                                     encodingKind: .vex, opcodeMap: map, mandatoryPrefix: pfx, opcode: op, modrmSlash: slash,
+                                     rexW: w, vexL: l, operandFormat: format, rmConstraint: rm, commutable: commutable,
+                                     memMnemonic: memMnemonic))
+        }
+
+        /// `op xmm/m, xmm` + `vop xmm/m, xmm, xmm` [+ `vop ymm/m, ymm, ymm`].
+        func binary(_ name: String, _ map: X86OpcodeMap, _ pfx: X86MandatoryPrefix, _ op: UInt8, legacy: Bool = true,
+                    ymm: Bool = true, w: Bool = false, rm: X86RMConstraint = .any, commutable: Bool = false, ymmRm: X86RegClass = .ymm) {
+            if legacy { sse(name, map, pfx, op, rm: rm, .rmToReg(rmClass: X, regClass: X)) }
+            vex("v" + name, map, pfx, op, w: w, rm: rm, commutable: commutable, .vexRmVvvvReg(rmClass: X, vvvvClass: X, regClass: X))
+            if ymm { vex("v" + name, map, pfx, op, l: 1, w: w, rm: rm, commutable: commutable, .vexRmVvvvReg(rmClass: ymmRm, vvvvClass: Y, regClass: Y)) }
+        }
+        /// `op xmm/m, xmm` + `vop xmm/m, xmm` [+ `vop ymm/m (or xmm/m), ymm (or xmm)`].
+        func unary(_ name: String, _ map: X86OpcodeMap, _ pfx: X86MandatoryPrefix, _ op: UInt8, legacy: Bool = true,
+                   v128: Bool = true, ymm: Bool = true, w: Bool = false, rm: X86RMConstraint = .any,
+                   ymmRm: X86RegClass = .ymm, ymmReg: X86RegClass = .ymm, memMnemonics: (String, String)? = nil) {
+            if legacy { sse(name, map, pfx, op, rm: rm, .rmToReg(rmClass: X, regClass: X)) }
+            if v128 { vex("v" + name, map, pfx, op, w: w, rm: rm, memMnemonic: memMnemonics?.0, .rmToReg(rmClass: X, regClass: X)) }
+            if ymm { vex("v" + name, map, pfx, op, l: 1, w: w, rm: rm, memMnemonic: memMnemonics?.1, .rmToReg(rmClass: ymmRm, regClass: ymmReg)) }
+        }
+        /// `op $imm8, xmm/m, xmm` + `vop $imm8, xmm/m, xmm` [+ `vop $imm8, ymm/m, ymm`].
+        func unaryImm(_ name: String, _ map: X86OpcodeMap, _ pfx: X86MandatoryPrefix, _ op: UInt8, legacy: Bool = true,
+                      v128: Bool = true, ymm: Bool = true, w: Bool = false) {
+            if legacy { sse(name, map, pfx, op, .immRmToReg(rmClass: X, regClass: X, immSize: .byte)) }
+            if v128 { vex("v" + name, map, pfx, op, w: w, .immRmToReg(rmClass: X, regClass: X, immSize: .byte)) }
+            if ymm { vex("v" + name, map, pfx, op, l: 1, w: w, .immRmToReg(rmClass: Y, regClass: Y, immSize: .byte)) }
+        }
+        /// `op $imm8, xmm/m, xmm` + `vop $imm8, xmm/m, xmm, xmm` [+ `vop $imm8, ymm/m, ymm, ymm`].
+        func binaryImm(_ name: String, _ map: X86OpcodeMap, _ pfx: X86MandatoryPrefix, _ op: UInt8, legacy: Bool = true,
+                       v128: Bool = true, ymm: Bool = true, w: Bool = false, commutable: Bool = false, ymmRm: X86RegClass = .ymm) {
+            if legacy { sse(name, map, pfx, op, .immRmToReg(rmClass: X, regClass: X, immSize: .byte)) }
+            if v128 { vex("v" + name, map, pfx, op, w: w, commutable: commutable, .vexImmRmVvvvReg(rmClass: X, vvvvClass: X, regClass: X)) }
+            if ymm { vex("v" + name, map, pfx, op, l: 1, w: w, commutable: commutable, .vexImmRmVvvvReg(rmClass: ymmRm, vvvvClass: Y, regClass: Y)) }
+        }
+
+        // Vector moves: load (r/m -> reg) is listed before store (reg -> r/m); for register-to-register
+        // moves the encoder takes the store direction only to avoid a 3-byte VEX prefix.
         let vecMoves: [(name: String, prefix: X86MandatoryPrefix, loadOp: UInt8, storeOp: UInt8)] = [
             ("movaps", .none, 0x28, 0x29),
             ("movups", .none, 0x10, 0x11),
@@ -1602,223 +1776,338 @@ public enum X86InstructionTable {
             ("movdqu", .pF3,  0x6F, 0x7F)
         ]
         for vm in vecMoves {
-            // Legacy SSE (128-bit XMM)
-            list.append(X86InstrDesc(mnemonic: vm.name, operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: vm.prefix, opcode: vm.loadOp, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: vm.name, operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: vm.prefix, opcode: vm.storeOp, operandFormat: .regToRm(regClass: .xmm, rmClass: .xmm)))
-            // VEX 128-bit (XMM) and 256-bit (YMM)
-            let vName = "v" + vm.name
-            list.append(X86InstrDesc(mnemonic: vName, operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: vm.prefix, opcode: vm.loadOp, vexL: 0, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: vName, operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: vm.prefix, opcode: vm.storeOp, vexL: 0, operandFormat: .regToRm(regClass: .xmm, rmClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: vName, operandSize: .ymm256, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: vm.prefix, opcode: vm.loadOp, vexL: 1, operandFormat: .rmToReg(rmClass: .ymm, regClass: .ymm)))
-            list.append(X86InstrDesc(mnemonic: vName, operandSize: .ymm256, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: vm.prefix, opcode: vm.storeOp, vexL: 1, operandFormat: .regToRm(regClass: .ymm, rmClass: .ymm)))
+            sse(vm.name, .map0F, vm.prefix, vm.loadOp, .rmToReg(rmClass: X, regClass: X))
+            sse(vm.name, .map0F, vm.prefix, vm.storeOp, .regToRm(regClass: X, rmClass: X))
+            vex("v" + vm.name, .map0F, vm.prefix, vm.loadOp, .rmToReg(rmClass: X, regClass: X))
+            vex("v" + vm.name, .map0F, vm.prefix, vm.storeOp, .regToRm(regClass: X, rmClass: X))
+            vex("v" + vm.name, .map0F, vm.prefix, vm.loadOp, l: 1, .rmToReg(rmClass: Y, regClass: Y))
+            vex("v" + vm.name, .map0F, vm.prefix, vm.storeOp, l: 1, .regToRm(regClass: Y, rmClass: Y))
         }
 
-        // Scalar FP Moves: movss/vmovss, movsd/vmovsd
+        // Scalar FP moves: movss/vmovss, movsd/vmovsd. VEX register forms take three operands (merge into the
+        // upper lanes of src1); VEX memory forms take two.
         for (scName, scPref) in [("movss", X86MandatoryPrefix.pF3), ("movsd", X86MandatoryPrefix.pF2)] {
-            list.append(X86InstrDesc(mnemonic: scName, operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: scPref, opcode: 0x10, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: scName, operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: scPref, opcode: 0x11, operandFormat: .regToRm(regClass: .xmm, rmClass: .xmm)))
-            let vScName = "v" + scName
-            list.append(X86InstrDesc(mnemonic: vScName, operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: scPref, opcode: 0x10, vexL: 0, operandFormat: .vexRmVvvvReg(rmClass: .xmm, vvvvClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: vScName, operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: scPref, opcode: 0x10, vexL: 0, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: vScName, operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: scPref, opcode: 0x11, vexL: 0, operandFormat: .regToRm(regClass: .xmm, rmClass: .xmm)))
+            sse(scName, .map0F, scPref, 0x10, .rmToReg(rmClass: X, regClass: X))
+            sse(scName, .map0F, scPref, 0x11, .regToRm(regClass: X, rmClass: X))
+            vex("v" + scName, .map0F, scPref, 0x10, rm: .regOnly, .vexRmVvvvReg(rmClass: X, vvvvClass: X, regClass: X))
+            vex("v" + scName, .map0F, scPref, 0x10, rm: .memOnly, .rmToReg(rmClass: X, regClass: X))
+            vex("v" + scName, .map0F, scPref, 0x11, rm: .memOnly, .regToRm(regClass: X, rmClass: X))
+            vex("v" + scName, .map0F, scPref, 0x11, rm: .regOnly, .vexRegVvvvToRm(regClass: X, vvvvClass: X, rmClass: X))
         }
 
         // MOVD / VMOVD and MOVQ / VMOVQ (GPR <-> XMM and XMM <-> XMM)
-        list.append(X86InstrDesc(mnemonic: "movd", operandSize: .dword, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x6E, operandFormat: .rmToReg(rmClass: .gpr32, regClass: .xmm)))
-        list.append(X86InstrDesc(mnemonic: "movd", operandSize: .dword, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x7E, operandFormat: .regToRm(regClass: .xmm, rmClass: .gpr32)))
-        list.append(X86InstrDesc(mnemonic: "vmovd", operandSize: .dword, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x6E, vexL: 0, operandFormat: .rmToReg(rmClass: .gpr32, regClass: .xmm)))
-        list.append(X86InstrDesc(mnemonic: "vmovd", operandSize: .dword, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x7E, vexL: 0, operandFormat: .regToRm(regClass: .xmm, rmClass: .gpr32)))
+        sse("movd", .map0F, .p66, 0x6E, size: .dword, .rmToReg(rmClass: .gpr32, regClass: X))
+        sse("movd", .map0F, .p66, 0x7E, size: .dword, .regToRm(regClass: X, rmClass: .gpr32))
+        vex("vmovd", .map0F, .p66, 0x6E, size: .dword, .rmToReg(rmClass: .gpr32, regClass: X))
+        vex("vmovd", .map0F, .p66, 0x7E, size: .dword, .regToRm(regClass: X, rmClass: .gpr32))
+        sse("movq", .map0F, .p66, 0x6E, w: true, size: .qword, rm: .regOnly, aliases: ["mov"], .rmToReg(rmClass: .gpr64, regClass: X))
+        sse("movq", .map0F, .p66, 0x7E, w: true, size: .qword, rm: .regOnly, aliases: ["mov"], .regToRm(regClass: X, rmClass: .gpr64))
+        sse("movq", .map0F, .pF3, 0x7E, .rmToReg(rmClass: X, regClass: X))
+        sse("movq", .map0F, .p66, 0xD6, .regToRm(regClass: X, rmClass: X))
+        vex("vmovq", .map0F, .p66, 0x6E, w: true, size: .qword, rm: .regOnly, .rmToReg(rmClass: .gpr64, regClass: X))
+        vex("vmovq", .map0F, .p66, 0x7E, w: true, size: .qword, rm: .regOnly, .regToRm(regClass: X, rmClass: .gpr64))
+        vex("vmovq", .map0F, .pF3, 0x7E, .rmToReg(rmClass: X, regClass: X))
+        vex("vmovq", .map0F, .p66, 0xD6, .regToRm(regClass: X, rmClass: X))
 
-        list.append(X86InstrDesc(mnemonic: "movq", aliases: ["mov"], operandSize: .qword, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x6E, rexW: true, operandFormat: .rmToReg(rmClass: .gpr64, regClass: .xmm)))
-        list.append(X86InstrDesc(mnemonic: "movq", aliases: ["mov"], operandSize: .qword, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x7E, rexW: true, operandFormat: .regToRm(regClass: .xmm, rmClass: .gpr64)))
-        list.append(X86InstrDesc(mnemonic: "movq", operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: .pF3, opcode: 0x7E, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-        list.append(X86InstrDesc(mnemonic: "movq", operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0xD6, operandFormat: .regToRm(regClass: .xmm, rmClass: .xmm)))
+        // Half-register moves: movlps/movhps/movlpd/movhpd (memory only) and movhlps/movlhps (registers only)
+        for (name, pfx, op) in [("movlps", X86MandatoryPrefix.none, UInt8(0x12)), ("movhps", .none, 0x16), ("movlpd", .p66, 0x12), ("movhpd", .p66, 0x16)] {
+            sse(name, .map0F, pfx, op, rm: .memOnly, .rmToReg(rmClass: X, regClass: X))
+            sse(name, .map0F, pfx, op + 1, rm: .memOnly, .regToRm(regClass: X, rmClass: X))
+            vex("v" + name, .map0F, pfx, op, rm: .memOnly, .vexRmVvvvReg(rmClass: X, vvvvClass: X, regClass: X))
+            vex("v" + name, .map0F, pfx, op + 1, rm: .memOnly, .regToRm(regClass: X, rmClass: X))
+        }
+        for (name, op) in [("movhlps", UInt8(0x12)), ("movlhps", 0x16)] {
+            sse(name, .map0F, .none, op, rm: .regOnly, .rmToReg(rmClass: X, regClass: X))
+            vex("v" + name, .map0F, .none, op, rm: .regOnly, .vexRmVvvvReg(rmClass: X, vvvvClass: X, regClass: X))
+        }
+        unary("movddup", .map0F, .pF2, 0x12)
+        unary("movsldup", .map0F, .pF3, 0x12)
+        unary("movshdup", .map0F, .pF3, 0x16)
+        unary("lddqu", .map0F, .pF2, 0xF0, rm: .memOnly)
+        unary("movntdqa", .map0F38, .p66, 0x2A, rm: .memOnly)
+        // Non-temporal stores
+        for (name, pfx, op) in [("movntps", X86MandatoryPrefix.none, UInt8(0x2B)), ("movntpd", .p66, 0x2B), ("movntdq", .p66, 0xE7)] {
+            sse(name, .map0F, pfx, op, rm: .memOnly, .regToRm(regClass: X, rmClass: X))
+            vex("v" + name, .map0F, pfx, op, rm: .memOnly, .regToRm(regClass: X, rmClass: X))
+            vex("v" + name, .map0F, pfx, op, l: 1, rm: .memOnly, .regToRm(regClass: Y, rmClass: Y))
+        }
+        // Sign-mask extraction (registers only)
+        for (name, pfx, op) in [("movmskps", X86MandatoryPrefix.none, UInt8(0x50)), ("movmskpd", .p66, 0x50), ("pmovmskb", .p66, 0xD7)] {
+            sse(name, .map0F, pfx, op, size: .dword, rm: .regOnly, .rmToReg(rmClass: X, regClass: .gpr32))
+            vex("v" + name, .map0F, pfx, op, size: .dword, rm: .regOnly, .rmToReg(rmClass: X, regClass: .gpr32))
+            vex("v" + name, .map0F, pfx, op, l: 1, size: .dword, rm: .regOnly, .rmToReg(rmClass: Y, regClass: .gpr32))
+        }
+        sse("maskmovdqu", .map0F, .p66, 0xF7, rm: .regOnly, .rmToReg(rmClass: X, regClass: X))
+        vex("vmaskmovdqu", .map0F, .p66, 0xF7, rm: .regOnly, .rmToReg(rmClass: X, regClass: X))
+        // AVX masked loads (src1_vvvv = mask) and stores
+        for (name, load, store, w) in [("vmaskmovps", UInt8(0x2C), UInt8(0x2E), false), ("vmaskmovpd", 0x2D, 0x2F, false),
+                                       ("vpmaskmovd", 0x8C, 0x8E, false), ("vpmaskmovq", 0x8C, 0x8E, true)] {
+            for (l, rc) in [(UInt8(0), X), (1, Y)] {
+                vex(name, .map0F38, .p66, load, l: l, w: w, rm: .memOnly, .vexRmVvvvReg(rmClass: rc, vvvvClass: rc, regClass: rc))
+                vex(name, .map0F38, .p66, store, l: l, w: w, rm: .memOnly, .vexRegVvvvToRm(regClass: rc, vvvvClass: rc, rmClass: rc))
+            }
+        }
 
-        list.append(X86InstrDesc(mnemonic: "vmovq", operandSize: .qword, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x6E, rexW: true, vexL: 0, operandFormat: .rmToReg(rmClass: .gpr64, regClass: .xmm)))
-        list.append(X86InstrDesc(mnemonic: "vmovq", operandSize: .qword, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x7E, rexW: true, vexL: 0, operandFormat: .regToRm(regClass: .xmm, rmClass: .gpr64)))
-        list.append(X86InstrDesc(mnemonic: "vmovq", operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .pF3, opcode: 0x7E, vexL: 0, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-        list.append(X86InstrDesc(mnemonic: "vmovq", operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0xD6, vexL: 0, operandFormat: .regToRm(regClass: .xmm, rmClass: .xmm)))
-
-        // Packed Binary SSE / VEX (128-bit XMM & 256-bit YMM)
-        let packedBinOps: [(name: String, map: X86OpcodeMap, prefix: X86MandatoryPrefix, op: UInt8)] = [
-            ("addps",    .map0F,   .none, 0x58),
-            ("subps",    .map0F,   .none, 0x5C),
-            ("mulps",    .map0F,   .none, 0x59),
-            ("divps",    .map0F,   .none, 0x5E),
-            ("addpd",    .map0F,   .p66,  0x58),
-            ("subpd",    .map0F,   .p66,  0x5C),
-            ("mulpd",    .map0F,   .p66,  0x59),
-            ("divpd",    .map0F,   .p66,  0x5E),
-            ("maxps",    .map0F,   .none, 0x5F),
-            ("minps",    .map0F,   .none, 0x5D),
-            ("andps",    .map0F,   .none, 0x54),
-            ("orps",     .map0F,   .none, 0x56),
-            ("xorps",    .map0F,   .none, 0x57),
-            ("pxor",     .map0F,   .p66,  0xEF),
-            ("por",      .map0F,   .p66,  0xEB),
-            ("pand",     .map0F,   .p66,  0xDB),
-            ("pandn",    .map0F,   .p66,  0xDF),
-            ("paddb",    .map0F,   .p66,  0xFC),
-            ("paddw",    .map0F,   .p66,  0xFD),
-            ("paddd",    .map0F,   .p66,  0xFE),
-            ("paddq",    .map0F,   .p66,  0xD4),
-            ("psubb",    .map0F,   .p66,  0xF8),
-            ("psubw",    .map0F,   .p66,  0xF9),
-            ("psubd",    .map0F,   .p66,  0xFA),
-            ("psubq",    .map0F,   .p66,  0xFB),
-            ("pmullw",   .map0F,   .p66,  0xD5),
-            ("pmulld",   .map0F38, .p66,  0x40),
-            ("pshufb",   .map0F38, .p66,  0x00),
-            ("pcmpeqb",  .map0F,   .p66,  0x74),
-            ("pcmpeqd",  .map0F,   .p66,  0x76),
-            ("pcmpgtb",  .map0F,   .p66,  0x64),
-            ("pcmpgtd",  .map0F,   .p66,  0x66)
+        // Packed FP arithmetic and logic (`ps` no prefix, `pd` 0x66); commutable per LLVM MC.
+        let packedFP: [(name: String, op: UInt8, commutable: Bool)] = [
+            ("add", 0x58, true), ("mul", 0x59, true), ("sub", 0x5C, false), ("min", 0x5D, false),
+            ("div", 0x5E, false), ("max", 0x5F, false), ("and", 0x54, true), ("andn", 0x55, false),
+            ("or", 0x56, true), ("xor", 0x57, true), ("unpckl", 0x14, false), ("unpckh", 0x15, false)
         ]
-        for pb in packedBinOps {
-            // Legacy SSE (2-operand XMM)
-            list.append(X86InstrDesc(
-                mnemonic: pb.name,
-                operandSize: .xmm128,
-                opcodeMap: pb.map,
-                mandatoryPrefix: pb.prefix,
-                opcode: pb.op,
-                operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)
-            ))
-            // VEX 128-bit (3-operand XMM) & 256-bit (3-operand YMM)
-            let vName = "v" + pb.name
-            list.append(X86InstrDesc(
-                mnemonic: vName,
-                operandSize: .xmm128,
-                encodingKind: .vex,
-                opcodeMap: pb.map,
-                mandatoryPrefix: pb.prefix,
-                opcode: pb.op,
-                vexL: 0,
-                operandFormat: .vexRmVvvvReg(rmClass: .xmm, vvvvClass: .xmm, regClass: .xmm)
-            ))
-            list.append(X86InstrDesc(
-                mnemonic: vName,
-                operandSize: .ymm256,
-                encodingKind: .vex,
-                opcodeMap: pb.map,
-                mandatoryPrefix: pb.prefix,
-                opcode: pb.op,
-                vexL: 1,
-                operandFormat: .vexRmVvvvReg(rmClass: .ymm, vvvvClass: .ymm, regClass: .ymm)
-            ))
+        for fp in packedFP {
+            binary(fp.name + "ps", .map0F, .none, fp.op, commutable: fp.commutable)
+            binary(fp.name + "pd", .map0F, .p66, fp.op, commutable: fp.commutable)
         }
-
-        // Scalar Binary FP SSE (2-op) / VEX (3-op)
-        let scalarBinOps: [(name: String, prefix: X86MandatoryPrefix, op: UInt8)] = [
-            ("addss",  .pF3, 0x58),
-            ("subss",  .pF3, 0x5C),
-            ("mulss",  .pF3, 0x59),
-            ("divss",  .pF3, 0x5E),
-            ("addsd",  .pF2, 0x58),
-            ("subsd",  .pF2, 0x5C),
-            ("mulsd",  .pF2, 0x59),
-            ("divsd",  .pF2, 0x5E),
-            ("sqrtss", .pF3, 0x51),
-            ("sqrtsd", .pF2, 0x51),
-            ("cvtss2sd", .pF3, 0x5A),
-            ("cvtsd2ss", .pF2, 0x5A)
+        for (name, pfx, op) in [("addsubps", X86MandatoryPrefix.pF2, UInt8(0xD0)), ("addsubpd", .p66, 0xD0),
+                                ("haddps", .pF2, 0x7C), ("haddpd", .p66, 0x7C), ("hsubps", .pF2, 0x7D), ("hsubpd", .p66, 0x7D)] {
+            binary(name, .map0F, pfx, op)
+        }
+        // Scalar FP arithmetic (SSE 2-operand, VEX 3-operand merging into src1)
+        let scalarFP: [(name: String, op: UInt8)] = [
+            ("add", 0x58), ("mul", 0x59), ("sub", 0x5C), ("min", 0x5D), ("div", 0x5E), ("max", 0x5F), ("sqrt", 0x51)
         ]
-        for sb in scalarBinOps {
-            list.append(X86InstrDesc(
-                mnemonic: sb.name,
-                operandSize: .xmm128,
-                opcodeMap: .map0F,
-                mandatoryPrefix: sb.prefix,
-                opcode: sb.op,
-                operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)
-            ))
-            list.append(X86InstrDesc(
-                mnemonic: "v" + sb.name,
-                operandSize: .xmm128,
-                encodingKind: .vex,
-                opcodeMap: .map0F,
-                mandatoryPrefix: sb.prefix,
-                opcode: sb.op,
-                vexL: 0,
-                operandFormat: .vexRmVvvvReg(rmClass: .xmm, vvvvClass: .xmm, regClass: .xmm)
-            ))
+        for sc in scalarFP {
+            binary(sc.name + "ss", .map0F, .pF3, sc.op, ymm: false)
+            binary(sc.name + "sd", .map0F, .pF2, sc.op, ymm: false)
+        }
+        binary("rsqrtss", .map0F, .pF3, 0x52, ymm: false)
+        binary("rcpss", .map0F, .pF3, 0x53, ymm: false)
+        binary("cvtss2sd", .map0F, .pF3, 0x5A, ymm: false)
+        binary("cvtsd2ss", .map0F, .pF2, 0x5A, ymm: false)
+        // Packed FP unary
+        unary("sqrtps", .map0F, .none, 0x51)
+        unary("sqrtpd", .map0F, .p66, 0x51)
+        unary("rsqrtps", .map0F, .none, 0x52)
+        unary("rcpps", .map0F, .none, 0x53)
+        // FP compares: `cmpps $pred` (pseudo-ops `cmpltps` etc. are expanded by the encoder), `(u)comiss`
+        binaryImm("cmpps", .map0F, .none, 0xC2, commutable: true)
+        binaryImm("cmppd", .map0F, .p66, 0xC2, commutable: true)
+        binaryImm("cmpss", .map0F, .pF3, 0xC2, ymm: false)
+        binaryImm("cmpsd", .map0F, .pF2, 0xC2, ymm: false)
+        unary("ucomiss", .map0F, .none, 0x2E, ymm: false)
+        unary("ucomisd", .map0F, .p66, 0x2E, ymm: false)
+        unary("comiss", .map0F, .none, 0x2F, ymm: false)
+        unary("comisd", .map0F, .p66, 0x2F, ymm: false)
+        // FP shuffles, blends, rounding, dot products
+        binaryImm("shufps", .map0F, .none, 0xC6)
+        binaryImm("shufpd", .map0F, .p66, 0xC6)
+        binaryImm("blendps", .map0F3A, .p66, 0x0C)
+        binaryImm("blendpd", .map0F3A, .p66, 0x0D)
+        unaryImm("roundps", .map0F3A, .p66, 0x08)
+        unaryImm("roundpd", .map0F3A, .p66, 0x09)
+        binaryImm("roundss", .map0F3A, .p66, 0x0A, ymm: false)
+        binaryImm("roundsd", .map0F3A, .p66, 0x0B, ymm: false)
+        binaryImm("dpps", .map0F3A, .p66, 0x40)
+        binaryImm("dppd", .map0F3A, .p66, 0x41, ymm: false)
+        binaryImm("insertps", .map0F3A, .p66, 0x21, ymm: false)
+        sse("extractps", .map0F3A, .p66, 0x17, .immRegToRm(regClass: X, rmClass: .gpr32, immSize: .byte))
+        vex("vextractps", .map0F3A, .p66, 0x17, .immRegToRm(regClass: X, rmClass: .gpr32, immSize: .byte))
+        // Variable blends: SSE4.1 with implicit %xmm0, AVX with the selector in imm8[7:4]
+        for (name, sseOp, vexOp) in [("blendvps", UInt8(0x14), UInt8(0x4A)), ("blendvpd", 0x15, 0x4B), ("pblendvb", 0x10, 0x4C)] {
+            sse(name, .map0F38, .p66, sseOp, .xmm0RmToReg(rmClass: X, regClass: X))
+            vex("v" + name, .map0F3A, .p66, vexOp, .vexIs4RmVvvvReg(rmClass: X, vvvvClass: X, regClass: X))
+            vex("v" + name, .map0F3A, .p66, vexOp, l: 1, .vexIs4RmVvvvReg(rmClass: Y, vvvvClass: Y, regClass: Y))
         }
 
-        // Unary Packed SQRT: sqrtps/vsqrtps, sqrtpd/vsqrtpd (2-operand in both SSE and VEX)
-        for (sqName, sqPref) in [("sqrtps", X86MandatoryPrefix.none), ("sqrtpd", X86MandatoryPrefix.p66)] {
-            list.append(X86InstrDesc(mnemonic: sqName, operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: sqPref, opcode: 0x51, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: "v" + sqName, operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: sqPref, opcode: 0x51, vexL: 0, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: "v" + sqName, operandSize: .ymm256, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: sqPref, opcode: 0x51, vexL: 1, operandFormat: .rmToReg(rmClass: .ymm, regClass: .ymm)))
-        }
-
-        // UCOMISS / VUCOMISS, UCOMISD / VUCOMISD (2-operand in both SSE and VEX)
-        for (ucName, ucPref) in [("ucomiss", X86MandatoryPrefix.none), ("ucomisd", X86MandatoryPrefix.p66)] {
-            list.append(X86InstrDesc(mnemonic: ucName, operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: ucPref, opcode: 0x2E, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: "v" + ucName, operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: ucPref, opcode: 0x2E, vexL: 0, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-        }
-
-        // PSHUFD / VPSHUFD ($imm8, r/m, dst)
-        list.append(X86InstrDesc(mnemonic: "pshufd", operandSize: .xmm128, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x70, operandFormat: .immRmToReg(rmClass: .xmm, regClass: .xmm, immSize: .byte)))
-        list.append(X86InstrDesc(mnemonic: "vpshufd", operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x70, vexL: 0, operandFormat: .immRmToReg(rmClass: .xmm, regClass: .xmm, immSize: .byte)))
-        list.append(X86InstrDesc(mnemonic: "vpshufd", operandSize: .ymm256, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .p66, opcode: 0x70, vexL: 1, operandFormat: .immRmToReg(rmClass: .ymm, regClass: .ymm, immSize: .byte)))
-
+        // FP conversions
+        unary("cvtdq2ps", .map0F, .none, 0x5B)
+        unary("cvtps2dq", .map0F, .p66, 0x5B)
+        unary("cvttps2dq", .map0F, .pF3, 0x5B)
+        unary("cvtps2pd", .map0F, .none, 0x5A, ymmRm: X)
+        unary("cvtdq2pd", .map0F, .pF3, 0xE6, ymmRm: X)
+        unary("cvtpd2ps", .map0F, .p66, 0x5A, ymmReg: X, memMnemonics: ("vcvtpd2psx", "vcvtpd2psy"))
+        unary("cvtpd2dq", .map0F, .pF2, 0xE6, ymmReg: X, memMnemonics: ("vcvtpd2dqx", "vcvtpd2dqy"))
+        unary("cvttpd2dq", .map0F, .p66, 0xE6, ymmReg: X, memMnemonics: ("vcvttpd2dqx", "vcvttpd2dqy"))
         // CVTSI2SS / VCVTSI2SS, CVTSI2SD / VCVTSI2SD (32-bit and 64-bit GPR/mem)
         for (cvName, cvPref) in [("cvtsi2ss", X86MandatoryPrefix.pF3), ("cvtsi2sd", X86MandatoryPrefix.pF2)] {
-            list.append(X86InstrDesc(mnemonic: cvName, aliases: [cvName + "l"], operandSize: .dword, opcodeMap: .map0F, mandatoryPrefix: cvPref, opcode: 0x2A, operandFormat: .rmToReg(rmClass: .gpr32, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: cvName, aliases: [cvName + "q"], operandSize: .qword, opcodeMap: .map0F, mandatoryPrefix: cvPref, opcode: 0x2A, rexW: true, operandFormat: .rmToReg(rmClass: .gpr64, regClass: .xmm)))
-            let vCvName = "v" + cvName
-            list.append(X86InstrDesc(mnemonic: vCvName, aliases: [vCvName + "l"], operandSize: .dword, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: cvPref, opcode: 0x2A, rexW: false, vexL: 0, operandFormat: .vexRmVvvvReg(rmClass: .gpr32, vvvvClass: .xmm, regClass: .xmm)))
-            list.append(X86InstrDesc(mnemonic: vCvName, aliases: [vCvName + "q"], operandSize: .qword, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: cvPref, opcode: 0x2A, rexW: true, vexL: 0, operandFormat: .vexRmVvvvReg(rmClass: .gpr64, vvvvClass: .xmm, regClass: .xmm)))
+            sse(cvName, .map0F, cvPref, 0x2A, size: .dword, aliases: [cvName + "l"], .rmToReg(rmClass: .gpr32, regClass: X))
+            sse(cvName, .map0F, cvPref, 0x2A, w: true, size: .qword, aliases: [cvName + "q"], .rmToReg(rmClass: .gpr64, regClass: X))
+            vex("v" + cvName, .map0F, cvPref, 0x2A, size: .dword, aliases: ["v" + cvName + "l"], .vexRmVvvvReg(rmClass: .gpr32, vvvvClass: X, regClass: X))
+            vex("v" + cvName, .map0F, cvPref, 0x2A, w: true, size: .qword, aliases: ["v" + cvName + "q"], .vexRmVvvvReg(rmClass: .gpr64, vvvvClass: X, regClass: X))
+        }
+        // CVT(T)SS2SI / CVT(T)SD2SI (to 32-bit or 64-bit GPR)
+        for (ctName, ctPref, op) in [("cvttss2si", X86MandatoryPrefix.pF3, UInt8(0x2C)), ("cvttsd2si", .pF2, 0x2C),
+                                     ("cvtss2si", .pF3, 0x2D), ("cvtsd2si", .pF2, 0x2D)] {
+            sse(ctName, .map0F, ctPref, op, size: .dword, aliases: [ctName + "l"], .rmToReg(rmClass: X, regClass: .gpr32))
+            sse(ctName, .map0F, ctPref, op, w: true, size: .qword, aliases: [ctName + "q"], .rmToReg(rmClass: X, regClass: .gpr64))
+            vex("v" + ctName, .map0F, ctPref, op, size: .dword, aliases: ["v" + ctName + "l"], .rmToReg(rmClass: X, regClass: .gpr32))
+            vex("v" + ctName, .map0F, ctPref, op, w: true, size: .qword, aliases: ["v" + ctName + "q"], .rmToReg(rmClass: X, regClass: .gpr64))
+        }
+        // F16C: vcvtph2ps, vcvtps2ph
+        vex("vcvtph2ps", .map0F38, .p66, 0x13, .rmToReg(rmClass: X, regClass: X))
+        vex("vcvtph2ps", .map0F38, .p66, 0x13, l: 1, .rmToReg(rmClass: X, regClass: Y))
+        vex("vcvtps2ph", .map0F3A, .p66, 0x1D, .immRegToRm(regClass: X, rmClass: X, immSize: .byte))
+        vex("vcvtps2ph", .map0F3A, .p66, 0x1D, l: 1, .immRegToRm(regClass: Y, rmClass: X, immSize: .byte))
+
+        // Packed integer arithmetic, logic, compares, packs and unpacks (66 0F / 66 0F 38)
+        let packedInt: [(name: String, map: X86OpcodeMap, op: UInt8, commutable: Bool)] = [
+            ("punpcklbw", .map0F, 0x60, false), ("punpcklwd", .map0F, 0x61, false), ("punpckldq", .map0F, 0x62, false),
+            ("packsswb", .map0F, 0x63, false), ("pcmpgtb", .map0F, 0x64, false), ("pcmpgtw", .map0F, 0x65, false),
+            ("pcmpgtd", .map0F, 0x66, false), ("packuswb", .map0F, 0x67, false), ("punpckhbw", .map0F, 0x68, false),
+            ("punpckhwd", .map0F, 0x69, false), ("punpckhdq", .map0F, 0x6A, false), ("packssdw", .map0F, 0x6B, false),
+            ("punpcklqdq", .map0F, 0x6C, false), ("punpckhqdq", .map0F, 0x6D, false),
+            ("pcmpeqb", .map0F, 0x74, true), ("pcmpeqw", .map0F, 0x75, true), ("pcmpeqd", .map0F, 0x76, true),
+            ("paddq", .map0F, 0xD4, true), ("pmullw", .map0F, 0xD5, true), ("psubusb", .map0F, 0xD8, false),
+            ("psubusw", .map0F, 0xD9, false), ("pminub", .map0F, 0xDA, true), ("pand", .map0F, 0xDB, true),
+            ("paddusb", .map0F, 0xDC, true), ("paddusw", .map0F, 0xDD, true), ("pmaxub", .map0F, 0xDE, true),
+            ("pandn", .map0F, 0xDF, false), ("pavgb", .map0F, 0xE0, true), ("pavgw", .map0F, 0xE3, true),
+            ("pmulhuw", .map0F, 0xE4, true), ("pmulhw", .map0F, 0xE5, true), ("psubsb", .map0F, 0xE8, false),
+            ("psubsw", .map0F, 0xE9, false), ("pminsw", .map0F, 0xEA, true), ("por", .map0F, 0xEB, true),
+            ("paddsb", .map0F, 0xEC, true), ("paddsw", .map0F, 0xED, true), ("pmaxsw", .map0F, 0xEE, true),
+            ("pxor", .map0F, 0xEF, true), ("pmuludq", .map0F, 0xF4, true), ("pmaddwd", .map0F, 0xF5, true),
+            ("psadbw", .map0F, 0xF6, true), ("psubb", .map0F, 0xF8, false), ("psubw", .map0F, 0xF9, false),
+            ("psubd", .map0F, 0xFA, false), ("psubq", .map0F, 0xFB, false), ("paddb", .map0F, 0xFC, true),
+            ("paddw", .map0F, 0xFD, true), ("paddd", .map0F, 0xFE, true),
+            ("pshufb", .map0F38, 0x00, false), ("phaddw", .map0F38, 0x01, false), ("phaddd", .map0F38, 0x02, false),
+            ("phaddsw", .map0F38, 0x03, false), ("pmaddubsw", .map0F38, 0x04, false), ("phsubw", .map0F38, 0x05, false),
+            ("phsubd", .map0F38, 0x06, false), ("phsubsw", .map0F38, 0x07, false), ("psignb", .map0F38, 0x08, false),
+            ("psignw", .map0F38, 0x09, false), ("psignd", .map0F38, 0x0A, false), ("pmulhrsw", .map0F38, 0x0B, false),
+            ("pmuldq", .map0F38, 0x28, false), ("pcmpeqq", .map0F38, 0x29, false), ("packusdw", .map0F38, 0x2B, false),
+            ("pcmpgtq", .map0F38, 0x37, false), ("pminsb", .map0F38, 0x38, false), ("pminsd", .map0F38, 0x39, false),
+            ("pminuw", .map0F38, 0x3A, false), ("pminud", .map0F38, 0x3B, false), ("pmaxsb", .map0F38, 0x3C, false),
+            ("pmaxsd", .map0F38, 0x3D, false), ("pmaxuw", .map0F38, 0x3E, false), ("pmaxud", .map0F38, 0x3F, false),
+            ("pmulld", .map0F38, 0x40, false)
+        ]
+        for pi in packedInt {
+            binary(pi.name, pi.map, .p66, pi.op, commutable: pi.commutable)
+        }
+        // Shifts by an xmm count (the VEX.256 forms still take the count in an xmm register)
+        for (name, op) in [("psrlw", UInt8(0xD1)), ("psrld", 0xD2), ("psrlq", 0xD3), ("psraw", 0xE1), ("psrad", 0xE2),
+                           ("psllw", 0xF1), ("pslld", 0xF2), ("psllq", 0xF3)] {
+            binary(name, .map0F, .p66, op, ymmRm: X)
+        }
+        // Shifts by an immediate (66 0F 71..73 /digit ib; the VEX destination is in vvvv)
+        for (name, op, slash) in [("psrlw", UInt8(0x71), UInt8(2)), ("psraw", 0x71, 4), ("psllw", 0x71, 6),
+                                  ("psrld", 0x72, 2), ("psrad", 0x72, 4), ("pslld", 0x72, 6),
+                                  ("psrlq", 0x73, 2), ("psrldq", 0x73, 3), ("psllq", 0x73, 6), ("pslldq", 0x73, 7)] {
+            sse(name, .map0F, .p66, op, slash: slash, rm: .regOnly, .immToRm(rmClass: X, immSize: .byte))
+            vex("v" + name, .map0F, .p66, op, slash: slash, rm: .regOnly, .vexImmRmToVvvv(rmClass: X, vvvvClass: X))
+            vex("v" + name, .map0F, .p66, op, l: 1, slash: slash, rm: .regOnly, .vexImmRmToVvvv(rmClass: Y, vvvvClass: Y))
+        }
+        // AVX2 per-element variable shifts
+        for (name, op, w) in [("psrlvd", UInt8(0x45), false), ("psrlvq", 0x45, true), ("psravd", 0x46, false),
+                              ("psllvd", 0x47, false), ("psllvq", 0x47, true)] {
+            binary(name, .map0F38, .p66, op, legacy: false, w: w)
+        }
+        // Packed integer unary: absolute value, sign/zero extension, test, horizontal minimum
+        for (name, op) in [("pabsb", UInt8(0x1C)), ("pabsw", 0x1D), ("pabsd", 0x1E)] {
+            unary(name, .map0F38, .p66, op)
+        }
+        for (name, op) in [("pmovsxbw", UInt8(0x20)), ("pmovsxbd", 0x21), ("pmovsxbq", 0x22), ("pmovsxwd", 0x23),
+                           ("pmovsxwq", 0x24), ("pmovsxdq", 0x25), ("pmovzxbw", 0x30), ("pmovzxbd", 0x31),
+                           ("pmovzxbq", 0x32), ("pmovzxwd", 0x33), ("pmovzxwq", 0x34), ("pmovzxdq", 0x35)] {
+            unary(name, .map0F38, .p66, op, ymmRm: X)
+        }
+        unary("ptest", .map0F38, .p66, 0x17)
+        unary("testps", .map0F38, .p66, 0x0E, legacy: false)
+        unary("testpd", .map0F38, .p66, 0x0F, legacy: false)
+        unary("phminposuw", .map0F38, .p66, 0x41, ymm: false)
+        // Integer shuffles, aligns, blends
+        unaryImm("pshufd", .map0F, .p66, 0x70)
+        unaryImm("pshufhw", .map0F, .pF3, 0x70)
+        unaryImm("pshuflw", .map0F, .pF2, 0x70)
+        binaryImm("palignr", .map0F3A, .p66, 0x0F)
+        binaryImm("pblendw", .map0F3A, .p66, 0x0E)
+        binaryImm("mpsadbw", .map0F3A, .p66, 0x42)
+        binaryImm("pblendd", .map0F3A, .p66, 0x02, legacy: false)
+        // SSE4.2 string compares
+        for (name, op) in [("pcmpestrm", UInt8(0x60)), ("pcmpestri", 0x61), ("pcmpistrm", 0x62), ("pcmpistri", 0x63)] {
+            unaryImm(name, .map0F3A, .p66, op, ymm: false)
+        }
+        // Element insert / extract
+        for (name, op, rc, w) in [("pextrb", UInt8(0x14), X86RegClass.gpr32, false), ("pextrd", 0x16, .gpr32, false), ("pextrq", 0x16, .gpr64, true)] {
+            sse(name, .map0F3A, .p66, op, w: w, .immRegToRm(regClass: X, rmClass: rc, immSize: .byte))
+            vex("v" + name, .map0F3A, .p66, op, w: w, .immRegToRm(regClass: X, rmClass: rc, immSize: .byte))
+        }
+        sse("pextrw", .map0F, .p66, 0xC5, rm: .regOnly, .immRmToReg(rmClass: X, regClass: .gpr32, immSize: .byte))
+        sse("pextrw", .map0F3A, .p66, 0x15, rm: .memOnly, .immRegToRm(regClass: X, rmClass: .gpr32, immSize: .byte))
+        vex("vpextrw", .map0F, .p66, 0xC5, rm: .regOnly, .immRmToReg(rmClass: X, regClass: .gpr32, immSize: .byte))
+        vex("vpextrw", .map0F3A, .p66, 0x15, rm: .memOnly, .immRegToRm(regClass: X, rmClass: .gpr32, immSize: .byte))
+        for (name, map, op, rc, w) in [("pinsrb", X86OpcodeMap.map0F3A, UInt8(0x20), X86RegClass.gpr32, false), ("pinsrw", .map0F, 0xC4, .gpr32, false),
+                                       ("pinsrd", .map0F3A, 0x22, .gpr32, false), ("pinsrq", .map0F3A, 0x22, .gpr64, true)] {
+            sse(name, map, .p66, op, w: w, .immRmToReg(rmClass: rc, regClass: X, immSize: .byte))
+            vex("v" + name, map, .p66, op, w: w, .vexImmRmVvvvReg(rmClass: rc, vvvvClass: X, regClass: X))
         }
 
-        // CVTTSS2SI / VCVTTSS2SI, CVTTSD2SI / VCVTTSD2SI (to 32-bit or 64-bit GPR)
-        for (ctName, ctPref) in [("cvttss2si", X86MandatoryPrefix.pF3), ("cvttsd2si", X86MandatoryPrefix.pF2)] {
-            list.append(X86InstrDesc(mnemonic: ctName, aliases: [ctName + "l"], operandSize: .dword, opcodeMap: .map0F, mandatoryPrefix: ctPref, opcode: 0x2C, operandFormat: .rmToReg(rmClass: .xmm, regClass: .gpr32)))
-            list.append(X86InstrDesc(mnemonic: ctName, aliases: [ctName + "q"], operandSize: .qword, opcodeMap: .map0F, mandatoryPrefix: ctPref, opcode: 0x2C, rexW: true, operandFormat: .rmToReg(rmClass: .xmm, regClass: .gpr64)))
-            let vCtName = "v" + ctName
-            list.append(X86InstrDesc(mnemonic: vCtName, aliases: [vCtName + "l"], operandSize: .dword, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: ctPref, opcode: 0x2C, rexW: false, vexL: 0, operandFormat: .rmToReg(rmClass: .xmm, regClass: .gpr32)))
-            list.append(X86InstrDesc(mnemonic: vCtName, aliases: [vCtName + "q"], operandSize: .qword, encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: ctPref, opcode: 0x2C, rexW: true, vexL: 0, operandFormat: .rmToReg(rmClass: .xmm, regClass: .gpr64)))
+        // AVX / AVX2 lane and element permutes, broadcasts, 128-bit lane insert/extract
+        vex("vbroadcastss", .map0F38, .p66, 0x18, .rmToReg(rmClass: X, regClass: X))
+        vex("vbroadcastss", .map0F38, .p66, 0x18, l: 1, .rmToReg(rmClass: X, regClass: Y))
+        vex("vbroadcastsd", .map0F38, .p66, 0x19, l: 1, .rmToReg(rmClass: X, regClass: Y))
+        vex("vbroadcastf128", .map0F38, .p66, 0x1A, l: 1, rm: .memOnly, .rmToReg(rmClass: X, regClass: Y))
+        vex("vbroadcasti128", .map0F38, .p66, 0x5A, l: 1, rm: .memOnly, .rmToReg(rmClass: X, regClass: Y))
+        for (name, op) in [("vpbroadcastb", UInt8(0x78)), ("vpbroadcastw", 0x79), ("vpbroadcastd", 0x58), ("vpbroadcastq", 0x59)] {
+            vex(name, .map0F38, .p66, op, .rmToReg(rmClass: X, regClass: X))
+            vex(name, .map0F38, .p66, op, l: 1, .rmToReg(rmClass: X, regClass: Y))
+        }
+        for (name, op) in [("vinsertf128", UInt8(0x18)), ("vinserti128", 0x38)] {
+            vex(name, .map0F3A, .p66, op, l: 1, .vexImmRmVvvvReg(rmClass: X, vvvvClass: Y, regClass: Y))
+        }
+        for (name, op) in [("vextractf128", UInt8(0x19)), ("vextracti128", 0x39)] {
+            vex(name, .map0F3A, .p66, op, l: 1, .immRegToRm(regClass: Y, rmClass: X, immSize: .byte))
+        }
+        for (name, op) in [("vperm2f128", UInt8(0x06)), ("vperm2i128", 0x46)] {
+            vex(name, .map0F3A, .p66, op, l: 1, .vexImmRmVvvvReg(rmClass: Y, vvvvClass: Y, regClass: Y))
+        }
+        vex("vpermq", .map0F3A, .p66, 0x00, l: 1, w: true, .immRmToReg(rmClass: Y, regClass: Y, immSize: .byte))
+        vex("vpermpd", .map0F3A, .p66, 0x01, l: 1, w: true, .immRmToReg(rmClass: Y, regClass: Y, immSize: .byte))
+        vex("vpermd", .map0F38, .p66, 0x36, l: 1, .vexRmVvvvReg(rmClass: Y, vvvvClass: Y, regClass: Y))
+        vex("vpermps", .map0F38, .p66, 0x16, l: 1, .vexRmVvvvReg(rmClass: Y, vvvvClass: Y, regClass: Y))
+        binary("permilps", .map0F38, .p66, 0x0C, legacy: false)
+        binary("permilpd", .map0F38, .p66, 0x0D, legacy: false)
+        unaryImm("permilps", .map0F3A, .p66, 0x04, legacy: false)
+        unaryImm("permilpd", .map0F3A, .p66, 0x05, legacy: false)
+
+        // AVX2 gathers: `mask_vvvv, vsib, dst`. Index width follows d/q; data width follows ps/pd (dd/dq).
+        let gathers: [(name: String, op: UInt8, w: Bool, qIndex: Bool)] = [
+            ("vgatherdps", 0x92, false, false), ("vgatherdpd", 0x92, true, false),
+            ("vgatherqps", 0x93, false, true), ("vgatherqpd", 0x93, true, true),
+            ("vpgatherdd", 0x90, false, false), ("vpgatherdq", 0x90, true, false),
+            ("vpgatherqd", 0x91, false, true), ("vpgatherqq", 0x91, true, true)
+        ]
+        for g in gathers {
+            vex(g.name, .map0F38, .p66, g.op, w: g.w, .vexVsib(vvvvClass: X, indexClass: X, regClass: X))
+            // 256-bit: 32-bit data with 64-bit indices only fills an xmm; 64-bit data with 32-bit indices reads an xmm of indices.
+            let dataClass: X86RegClass = (g.qIndex && !g.w) ? X : Y
+            let indexClass: X86RegClass = (!g.qIndex && g.w) ? X : Y
+            vex(g.name, .map0F38, .p66, g.op, l: 1, w: g.w, .vexVsib(vvvvClass: dataClass, indexClass: indexClass, regClass: dataClass))
+        }
+
+        // FMA3: 132/213/231 operand orders; packed `ps`/`pd` (W0/W1) and scalar `ss`/`sd`
+        let fmaOps: [(name: String, base: UInt8, scalar: Bool)] = [
+            ("vfmaddsub", 0x96, false), ("vfmsubadd", 0x97, false), ("vfmadd", 0x98, true),
+            ("vfmsub", 0x9A, true), ("vfnmadd", 0x9C, true), ("vfnmsub", 0x9E, true)
+        ]
+        for fma in fmaOps {
+            for (order, delta) in [("132", UInt8(0x00)), ("213", 0x10), ("231", 0x20)] {
+                for (t, w) in [("ps", false), ("pd", true)] {
+                    binary(String((fma.name + order + t).dropFirst()), .map0F38, .p66, fma.base + delta, legacy: false, w: w)
+                }
+                if fma.scalar {
+                    for (t, w) in [("ss", false), ("sd", true)] {
+                        binary(String((fma.name + order + t).dropFirst()), .map0F38, .p66, fma.base + delta + 1, legacy: false, ymm: false, w: w)
+                    }
+                }
+            }
         }
 
         // VZEROUPPER, VZEROALL
-        list.append(X86InstrDesc(mnemonic: "vzeroupper", encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .none, opcode: 0x77, vexL: 0, operandFormat: .implied))
-        list.append(X86InstrDesc(mnemonic: "vzeroall", encodingKind: .vex, opcodeMap: .map0F, mandatoryPrefix: .none, opcode: 0x77, vexL: 1, operandFormat: .implied))
+        vex("vzeroupper", .map0F, .none, 0x77, size: .unsized, .implied)
+        vex("vzeroall", .map0F, .none, 0x77, l: 1, size: .unsized, .implied)
 
-        // AES-NI (VEX) & PCLMULQDQ (VEX) & F16C (VEX)
-        let aesOps: [(name: String, op: UInt8)] = [
-            ("vaesenc",     0xDC),
-            ("vaesenclast", 0xDD),
-            ("vaesdec",     0xDE),
-            ("vaesdeclast", 0xDF)
-        ]
-        for aes in aesOps {
-            list.append(X86InstrDesc(
-                mnemonic: aes.name,
-                operandSize: .xmm128,
-                encodingKind: .vex,
-                opcodeMap: .map0F38,
-                mandatoryPrefix: .p66,
-                opcode: aes.op,
-                vexL: 0,
-                operandFormat: .vexRmVvvvReg(rmClass: .xmm, vvvvClass: .xmm, regClass: .xmm)
-            ))
+        // AES-NI, PCLMULQDQ (SSE and VEX.128)
+        for (name, op) in [("aesenc", UInt8(0xDC)), ("aesenclast", 0xDD), ("aesdec", 0xDE), ("aesdeclast", 0xDF)] {
+            binary(name, .map0F38, .p66, op, ymm: false)
         }
-        list.append(X86InstrDesc(
-            mnemonic: "vpclmulqdq",
-            operandSize: .xmm128,
-            encodingKind: .vex,
-            opcodeMap: .map0F3A,
-            mandatoryPrefix: .p66,
-            opcode: 0x44,
-            vexL: 0,
-            operandFormat: .vexImmRmVvvvReg(rmClass: .xmm, vvvvClass: .xmm, regClass: .xmm)
-        ))
+        unary("aesimc", .map0F38, .p66, 0xDB, ymm: false)
+        unaryImm("aeskeygenassist", .map0F3A, .p66, 0xDF, ymm: false)
+        binaryImm("pclmulqdq", .map0F3A, .p66, 0x44, ymm: false)
 
-        // F16C: vcvtph2ps, vcvtps2ph
-        list.append(X86InstrDesc(mnemonic: "vcvtph2ps", operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F38, mandatoryPrefix: .p66, opcode: 0x13, vexL: 0, operandFormat: .rmToReg(rmClass: .xmm, regClass: .xmm)))
-        list.append(X86InstrDesc(mnemonic: "vcvtph2ps", operandSize: .ymm256, encodingKind: .vex, opcodeMap: .map0F38, mandatoryPrefix: .p66, opcode: 0x13, vexL: 1, operandFormat: .rmToReg(rmClass: .xmm, regClass: .ymm)))
-        list.append(X86InstrDesc(mnemonic: "vcvtps2ph", operandSize: .xmm128, encodingKind: .vex, opcodeMap: .map0F3A, mandatoryPrefix: .p66, opcode: 0x1D, vexL: 0, operandFormat: .immRegToRm(regClass: .xmm, rmClass: .xmm, immSize: .byte)))
-        list.append(X86InstrDesc(mnemonic: "vcvtps2ph", operandSize: .ymm256, encodingKind: .vex, opcodeMap: .map0F3A, mandatoryPrefix: .p66, opcode: 0x1D, vexL: 1, operandFormat: .immRegToRm(regClass: .ymm, rmClass: .xmm, immSize: .byte)))
+        // SHA (legacy encoding only)
+        sse("sha1rnds4", .map0F3A, .none, 0xCC, .immRmToReg(rmClass: X, regClass: X, immSize: .byte))
+        for (name, op) in [("sha1nexte", UInt8(0xC8)), ("sha1msg1", 0xC9), ("sha1msg2", 0xCA), ("sha256msg1", 0xCC), ("sha256msg2", 0xCD)] {
+            sse(name, .map0F38, .none, op, .rmToReg(rmClass: X, regClass: X))
+        }
+        sse("sha256rnds2", .map0F38, .none, 0xCB, .xmm0RmToReg(rmClass: X, regClass: X))
 
         return list
     }
@@ -1833,6 +2122,17 @@ public struct X86TableEncoder: Sendable {
 
     /// Encodes a single `X86Instruction`.
     public func encode(_ instruction: X86Instruction) throws -> X86EncodedInstruction {
+        try encodeWithDescriptor(instruction).encoded
+    }
+
+    /// Encodes `instruction` and also returns the index of the `X86InstructionTable.descriptors` entry
+    /// that produced the bytes (used by the exhaustive table sweep to account for coverage).
+    public func encodeWithDescriptor(_ instruction: X86Instruction) throws -> (encoded: X86EncodedInstruction, descriptorIndex: Int) {
+        try encodeSelecting(Self.normalized(instruction))
+    }
+
+    /// Splits inline prefixes out of the mnemonic and expands assembler shorthands into table forms.
+    private static func normalized(_ instruction: X86Instruction) -> X86Instruction {
         var inst = instruction
         // Extract inline "rep ", "repne ", "lock " prefixes if passed in mnemonic string
         while true {
@@ -1859,16 +2159,95 @@ public struct X86TableEncoder: Sendable {
             inst.operands = [inst.operands[0], .reg(dstReg), .reg(dstReg)]
         }
 
-        // Resolve candidate descriptors
-        let (candidates, explicitSize) = try resolveCandidates(for: inst)
-        for descIdx in candidates {
-            let desc = X86InstructionTable.descriptors[descIdx]
-            if let encoded = try tryEncode(inst: inst, desc: desc, explicitSize: explicitSize) {
-                return encoded
-            }
-        }
+        // Expand SSE/AVX compare-predicate pseudo-ops (`cmpltps`, `vcmpeq_uqpd`) into `$imm8` form
+        expandComparePredicate(&inst)
+        return inst
+    }
 
+    /// Tries candidate descriptors in table order and returns the first encoding. A VEX encoding that needs
+    /// the 3-byte prefix only because an extended register sits in `r/m` is replaced by an equivalent 2-byte
+    /// form where one exists: the register-to-`r/m` "store" direction of a register move, or swapped sources
+    /// of a commutable instruction. This is LLVM MC's `optimizeInstFromVEX3ToVEX2`; GNU `as` only does
+    /// the move half without `-O2` (05-assembler.md §4.11).
+    private func encodeSelecting(_ inst: X86Instruction) throws -> (encoded: X86EncodedInstruction, descriptorIndex: Int) {
+        let (candidates, explicitSize) = try resolveCandidates(for: inst)
+        for (pos, descIdx) in candidates.enumerated() {
+            let desc = X86InstructionTable.descriptors[descIdx]
+            guard let encoded = try tryEncode(inst: inst, desc: desc, explicitSize: explicitSize) else { continue }
+            guard desc.encodingKind == .vex, Self.isAvoidableVex3(encoded, desc: desc) else { return (encoded, descIdx) }
+            if desc.commutable, let swapped = Self.commuted(inst, desc: desc),
+               let alt = try tryEncode(inst: swapped, desc: desc, explicitSize: explicitSize),
+               alt.bytes.count < encoded.bytes.count {
+                return (alt, descIdx)
+            }
+            for altIdx in candidates[(pos + 1)...] where X86InstructionTable.descriptors[altIdx].encodingKind == .vex {
+                if let alt = try tryEncode(inst: inst, desc: X86InstructionTable.descriptors[altIdx], explicitSize: explicitSize),
+                   alt.bytes.count < encoded.bytes.count {
+                    return (alt, altIdx)
+                }
+            }
+            return (encoded, descIdx)
+        }
         throw X86CodecError.invalidOperands(mnemonic: inst.mnemonic, operands: inst.operands)
+    }
+
+    /// True for a 3-byte VEX encoding of a map-0F, W0 instruction whose only reason for the 3-byte form is
+    /// VEX.B (an extended register in `r/m`); VEX.R is also available in the 2-byte form.
+    private static func isAvoidableVex3(_ encoded: X86EncodedInstruction, desc: X86InstrDesc) -> Bool {
+        guard desc.opcodeMap == .map0F, !desc.rexW else { return false }
+        let bytes = encoded.bytes
+        guard let c4 = bytes.firstIndex(of: 0xC4), c4 + 1 < bytes.count else { return false }
+        let b1 = bytes[c4 + 1]
+        let x = (b1 & 0x40) == 0, b = (b1 & 0x20) == 0
+        return b && !x
+    }
+
+    /// The instruction with its two VEX sources swapped, if `desc` allows it for these operands.
+    private static func commuted(_ inst: X86Instruction, desc: X86InstrDesc) -> X86Instruction? {
+        var ops = inst.operands
+        switch desc.operandFormat {
+        case .vexRmVvvvReg:
+            guard ops.count == 3 else { return nil }
+            guard case .reg = ops[0], case .reg(let v) = ops[1], !v.needsRexExtension else { return nil }
+            ops.swapAt(0, 1)
+        case .vexImmRmVvvvReg:
+            // `vcmpps`: only the symmetric predicates (EQ, UNORD, NEQ, ORD and their variants) commute.
+            guard ops.count == 4, case .imm(let pred, nil) = ops[0], [0, 3, 4, 7].contains(pred & 7) else { return nil }
+            guard case .reg = ops[1], case .reg(let v) = ops[2], !v.needsRexExtension else { return nil }
+            ops.swapAt(1, 2)
+        default:
+            return nil
+        }
+        var out = inst
+        out.operands = ops
+        return out
+    }
+
+    /// Compare predicates of `cmpps` & co. (`0..7` for SSE, `0..31` for AVX).
+    private static let comparePredicates: [String: Int64] = {
+        let names = ["eq", "lt", "le", "unord", "neq", "nlt", "nle", "ord",
+                     "eq_uq", "nge", "ngt", "false", "neq_oq", "ge", "gt", "true",
+                     "eq_os", "lt_oq", "le_oq", "unord_s", "neq_us", "nlt_uq", "nle_uq", "ord_s",
+                     "eq_us", "nge_uq", "ngt_uq", "false_os", "neq_os", "ge_oq", "gt_oq", "true_us"]
+        var map: [String: Int64] = [:]
+        for (i, n) in names.enumerated() { map[n] = Int64(i) }
+        // Explicit spellings of the default ordered/signaling variants of predicates 0-7.
+        for (i, n) in ["eq_oq", "lt_os", "le_os", "unord_q", "neq_uq", "nlt_us", "nle_us", "ord_q"].enumerated() { map[n] = Int64(i) }
+        return map
+    }()
+
+    /// Rewrites `cmp<pred>{ps,pd,ss,sd}` / `vcmp<pred>…` into `cmp…` with an explicit `$imm8` predicate.
+    private static func expandComparePredicate(_ inst: inout X86Instruction) {
+        let m = inst.mnemonic
+        let isVex = m.hasPrefix("vcmp")
+        guard isVex || m.hasPrefix("cmp"), m.count > 5 else { return }
+        let typeSuffix = String(m.suffix(2))
+        guard typeSuffix == "ps" || typeSuffix == "pd" || typeSuffix == "ss" || typeSuffix == "sd" else { return }
+        let predName = String(m.dropFirst(isVex ? 4 : 3).dropLast(2))
+        guard !predName.isEmpty, let pred = comparePredicates[predName], isVex || pred < 8 else { return }
+        if inst.operands.first.map({ if case .imm = $0 { return true } else { return false } }) == true { return }
+        inst.mnemonic = (isVex ? "vcmp" : "cmp") + typeSuffix
+        inst.operands.insert(.imm(pred), at: 0)
     }
 
     private func resolveCandidates(for inst: X86Instruction) throws -> ([Int], X86OperandSize) {
@@ -1885,16 +2264,17 @@ public struct X86TableEncoder: Sendable {
                     return d.operandSize == suffixSize && (d.mnemonic == base || d.aliases.contains(base))
                 }
                 if !matchingBase.isEmpty {
-                    // Also include any direct entries for `mnem` (e.g. `movslq`, `sysretq`, `iretq`, `lgdtl`)
+                    // Also include any direct entries for `mnem` (e.g. `movslq`, `sysretq`, `iretq`, `lgdtl`).
+                    // Candidates stay in table order, which is the encoding preference order.
                     if let direct = X86InstructionTable.mnemonicMap[mnem] {
-                        var combined = matchingBase
-                        for dIdx in direct where !combined.contains(dIdx) {
+                        var combined = Set(matchingBase)
+                        for dIdx in direct {
                             let d = X86InstructionTable.descriptors[dIdx]
                             if d.operandSize == suffixSize || d.operandSize == .unsized || d.mnemonic == mnem {
-                                combined.insert(dIdx, at: 0)
+                                combined.insert(dIdx)
                             }
                         }
-                        return (combined, suffixSize)
+                        return (combined.sorted(), suffixSize)
                     }
                     return (matchingBase, suffixSize)
                 }
@@ -1914,8 +2294,9 @@ public struct X86TableEncoder: Sendable {
         explicitSize: X86OperandSize
     ) throws -> X86EncodedInstruction? {
         if explicitSize != .unsized && desc.operandSize != .unsized && desc.operandSize != explicitSize {
-            // Allow crc32q/crc32b/movzbl etc. when mnemonic explicitly matches desc.mnemonic
-            if desc.mnemonic != inst.mnemonic && !desc.aliases.contains(inst.mnemonic) {
+            // A size implied by a mnemonic's last letter (`movq`, `crc32b`) does not exclude a descriptor
+            // spelled exactly that way (`movq %xmm0, %xmm1`); an explicit `sizeSuffix` always does.
+            if inst.sizeSuffix != .unsized || (desc.mnemonic != inst.mnemonic && !desc.aliases.contains(inst.mnemonic)) {
                 return nil
             }
         }
@@ -1923,7 +2304,12 @@ public struct X86TableEncoder: Sendable {
         let ops = inst.operands
         let mode = inst.codeMode
 
-        let rexW = desc.rexW
+        // `vcvtpd2ps (%rax), %xmm0` is ambiguous (128- or 256-bit source): memory needs `vcvtpd2psx`/`…y`.
+        if desc.memMnemonic != nil && inst.mnemonic == desc.mnemonic && ops.contains(where: \.isMemory) {
+            return nil
+        }
+
+        var rexW = desc.rexW
         var rexR = false
         var rexX = false
         var rexB = false
@@ -1951,7 +2337,19 @@ public struct X86TableEncoder: Sendable {
         }
 
         // Helper to encode an r/m operand into ModR/M + SIB + disp
-        func encodeRM(_ operand: X86Operand, regField: UInt8, expectedClass: X86RegClass?, rmKind: X86RMKind = .gprOrMem) throws -> Bool {
+        func encodeRM(
+            _ operand: X86Operand,
+            regField: UInt8,
+            expectedClass: X86RegClass?,
+            rmKind: X86RMKind = .gprOrMem,
+            vsibIndex: X86RegClass? = nil
+        ) throws -> Bool {
+            if case .reg = operand, desc.rmConstraint == .memOnly { return false }
+            if case .mem = operand, desc.rmConstraint == .regOnly { return false }
+            if let vsib = vsibIndex {
+                guard case .mem(let m) = operand, let idx = m.index, idx.regClass == vsib, m.base != .rip else { return false }
+                return try encodeMemory(m, regField: regField, vsib: true)
+            }
             switch operand {
             case .reg(let r):
                 guard rmKind == .gprOrMem || rmKind == .gprOnly else { return false }
@@ -1984,7 +2382,7 @@ public struct X86TableEncoder: Sendable {
             }
         }
 
-        func encodeMemory(_ m: X86Mem, regField: UInt8) throws -> Bool {
+        func encodeMemory(_ m: X86Mem, regField: UInt8, vsib: Bool = false) throws -> Bool {
             hasModRM = true
             if let seg = m.segment {
                 segmentOverride = seg
@@ -1992,13 +2390,15 @@ public struct X86TableEncoder: Sendable {
 
             // Check address size override
             if let base = m.base, base != .rip {
+                guard base.isGPR else { return false }
                 if mode == .mode64 && base.regClass == .gpr32 {
                     addressSizeOverride = true
                 } else if mode == .mode16 && base.regClass == .gpr32 {
                     addressSizeOverride = true
                 }
             }
-            if let index = m.index {
+            if let index = m.index, !vsib {
+                guard index.isGPR else { return false }
                 if index.low3 == 4 && !index.needsRexExtension {
                     // %rsp / %esp cannot be an index register in SIB
                     throw X86CodecError.invalidMemoryAddressing(m)
@@ -2110,7 +2510,7 @@ public struct X86TableEncoder: Sendable {
             switch immSize {
             case .byte:
                 guard sym == nil else { return false }
-                if targetSize != .byte {
+                if targetSize != .byte && !desc.imm8IsZeroExtended {
                     // Sign-extended 8-bit immediate (e.g. 0x83, 0x6B, push $imm8): must fit in Int8 [-128, 127]
                     // Also check 32-bit truncated value in .mode32/.mode16 if needed
                     let fitsSigned8: Bool
@@ -2181,6 +2581,21 @@ public struct X86TableEncoder: Sendable {
             opcodeByte = desc.opcode + r.low3
             if r.needsRexExtension { rexB = true }
             if r.requiresRexByte { needsMandatoryRex = true }
+
+        case .opcodePlusRegWithAcc(let rc):
+            guard ops.count == 2, case .reg(let a) = ops[0], case .reg(let b) = ops[1],
+                  matchReg(a, expected: rc), matchReg(b, expected: rc) else { return nil }
+            let acc = X86Reg.gpr(size: desc.operandSize, hw: 0)
+            guard a == acc || b == acc else { return nil }
+            let r = (b == acc) ? a : b
+            if r == acc {
+                // 0x90 is `nop`: `xchg %eax, %eax` (which zero-extends) needs 0x87; LLVM MC folds
+                // `xchg %rax, %rax` to a plain 0x90.
+                guard desc.operandSize != .dword else { return nil }
+                if desc.operandSize == .qword { rexW = false }
+            }
+            opcodeByte = desc.opcode + r.low3
+            if r.needsRexExtension { rexB = true }
 
         case .immToOpcodePlusReg(let rc, let immSz):
             guard ops.count == 2, case .reg(let r) = ops[1], matchReg(r, expected: rc) else { return nil }
@@ -2277,10 +2692,6 @@ public struct X86TableEncoder: Sendable {
             guard ops.count == 3,
                   case .reg(let vReg) = ops[1], matchReg(vReg, expected: vvvvClass),
                   case .reg(let dstReg) = ops[2], matchReg(dstReg, expected: regClass) else { return nil }
-            // For vmovss/vmovsd 3-operand form, require register as first operand
-            if (desc.mnemonic == "vmovss" || desc.mnemonic == "vmovsd"), case .mem = ops[0] {
-                return nil
-            }
             vexVvvv = vReg.hwEncoding
             if dstReg.needsRexExtension { rexR = true }
             guard try encodeRM(ops[0], regField: dstReg.low3, expectedClass: rmClass) else { return nil }
@@ -2293,6 +2704,59 @@ public struct X86TableEncoder: Sendable {
             if dstReg.needsRexExtension { rexR = true }
             guard try encodeRM(ops[1], regField: dstReg.low3, expectedClass: rmClass) else { return nil }
             guard encodeImm(ops[0], immSize: .byte, signExtendedTo: .byte) else { return nil }
+
+        case .vexVvvvRmReg(let vvvvClass, let rmClass, let regClass):
+            guard ops.count == 3,
+                  case .reg(let vReg) = ops[0], matchReg(vReg, expected: vvvvClass),
+                  case .reg(let dstReg) = ops[2], matchReg(dstReg, expected: regClass) else { return nil }
+            vexVvvv = vReg.hwEncoding
+            if dstReg.needsRexExtension { rexR = true }
+            guard try encodeRM(ops[1], regField: dstReg.low3, expectedClass: rmClass) else { return nil }
+
+        case .vexRmToVvvv(let rmClass, let vvvvClass):
+            guard ops.count == 2, case .reg(let vReg) = ops[1], matchReg(vReg, expected: vvvvClass) else { return nil }
+            vexVvvv = vReg.hwEncoding
+            guard try encodeRM(ops[0], regField: desc.modrmSlash ?? 0, expectedClass: rmClass) else { return nil }
+
+        case .vexImmRmToVvvv(let rmClass, let vvvvClass):
+            guard ops.count == 3, case .reg(let vReg) = ops[2], matchReg(vReg, expected: vvvvClass) else { return nil }
+            vexVvvv = vReg.hwEncoding
+            guard try encodeRM(ops[1], regField: desc.modrmSlash ?? 0, expectedClass: rmClass) else { return nil }
+            guard encodeImm(ops[0], immSize: .byte, signExtendedTo: .byte) else { return nil }
+
+        case .vexRegVvvvToRm(let regClass, let vvvvClass, let rmClass):
+            guard ops.count == 3,
+                  case .reg(let srcReg) = ops[0], matchReg(srcReg, expected: regClass),
+                  case .reg(let vReg) = ops[1], matchReg(vReg, expected: vvvvClass) else { return nil }
+            vexVvvv = vReg.hwEncoding
+            if srcReg.needsRexExtension { rexR = true }
+            guard try encodeRM(ops[2], regField: srcReg.low3, expectedClass: rmClass) else { return nil }
+
+        case .vexIs4RmVvvvReg(let rmClass, let vvvvClass, let regClass):
+            guard ops.count == 4,
+                  case .reg(let is4Reg) = ops[0], matchReg(is4Reg, expected: regClass),
+                  case .reg(let vReg) = ops[2], matchReg(vReg, expected: vvvvClass),
+                  case .reg(let dstReg) = ops[3], matchReg(dstReg, expected: regClass) else { return nil }
+            vexVvvv = vReg.hwEncoding
+            if dstReg.needsRexExtension { rexR = true }
+            guard try encodeRM(ops[1], regField: dstReg.low3, expectedClass: rmClass) else { return nil }
+            immBytes.append(is4Reg.hwEncoding << 4)
+
+        case .vexVsib(let vvvvClass, let indexClass, let regClass):
+            guard ops.count == 3,
+                  case .reg(let maskReg) = ops[0], matchReg(maskReg, expected: vvvvClass),
+                  case .reg(let dstReg) = ops[2], matchReg(dstReg, expected: regClass) else { return nil }
+            vexVvvv = maskReg.hwEncoding
+            if dstReg.needsRexExtension { rexR = true }
+            guard try encodeRM(ops[1], regField: dstReg.low3, expectedClass: nil, vsibIndex: indexClass) else { return nil }
+
+        case .xmm0RmToReg(let rmClass, let regClass):
+            // The `%xmm0` operand may also be omitted (`blendvps %xmm2, %xmm1`), as GNU `as` and LLVM MC allow.
+            let explicitOps = ops.count == 3 ? Array(ops.dropFirst()) : ops
+            if ops.count == 3 { guard case .reg(.xmm0) = ops[0] else { return nil } }
+            guard explicitOps.count == 2, case .reg(let dstReg) = explicitOps[1], matchReg(dstReg, expected: regClass) else { return nil }
+            if dstReg.needsRexExtension { rexR = true }
+            guard try encodeRM(explicitOps[0], regField: dstReg.low3, expectedClass: rmClass) else { return nil }
 
         case .relBranch(let relSz):
             guard ops.count == 1 else { return nil }
@@ -2326,16 +2790,16 @@ public struct X86TableEncoder: Sendable {
 
         case .segToRm:
             guard ops.count == 2, case .reg(let segReg) = ops[0], segReg.regClass == .seg else { return nil }
-            guard try encodeRM(ops[1], regField: segReg.hwEncoding, expectedClass: nil) else { return nil }
+            guard try encodeRM(ops[1], regField: segReg.hwEncoding, expectedClass: desc.operandSize.gprClass) else { return nil }
 
         case .rmToSeg:
             guard ops.count == 2, case .reg(let segReg) = ops[1], segReg.regClass == .seg else { return nil }
-            guard try encodeRM(ops[0], regField: segReg.hwEncoding, expectedClass: nil) else { return nil }
+            guard try encodeRM(ops[0], regField: segReg.hwEncoding, expectedClass: desc.operandSize.gprClass) else { return nil }
 
         case .crToReg:
             guard ops.count == 2,
                   case .reg(let crReg) = ops[0], crReg.regClass == .cr,
-                  case .reg(let gprReg) = ops[1], (gprReg.regClass == .gpr64 || gprReg.regClass == .gpr32) else { return nil }
+                  case .reg(let gprReg) = ops[1], gprReg.regClass == (mode == .mode64 ? .gpr64 : .gpr32) else { return nil }
             hasModRM = true
             if crReg.needsRexExtension { rexR = true }
             if gprReg.needsRexExtension { rexB = true }
@@ -2343,7 +2807,7 @@ public struct X86TableEncoder: Sendable {
 
         case .regToCr:
             guard ops.count == 2,
-                  case .reg(let gprReg) = ops[0], (gprReg.regClass == .gpr64 || gprReg.regClass == .gpr32),
+                  case .reg(let gprReg) = ops[0], gprReg.regClass == (mode == .mode64 ? .gpr64 : .gpr32),
                   case .reg(let crReg) = ops[1], crReg.regClass == .cr else { return nil }
             hasModRM = true
             if crReg.needsRexExtension { rexR = true }
@@ -2353,7 +2817,7 @@ public struct X86TableEncoder: Sendable {
         case .drToReg:
             guard ops.count == 2,
                   case .reg(let drReg) = ops[0], drReg.regClass == .dr,
-                  case .reg(let gprReg) = ops[1], (gprReg.regClass == .gpr64 || gprReg.regClass == .gpr32) else { return nil }
+                  case .reg(let gprReg) = ops[1], gprReg.regClass == (mode == .mode64 ? .gpr64 : .gpr32) else { return nil }
             hasModRM = true
             if drReg.needsRexExtension { rexR = true }
             if gprReg.needsRexExtension { rexB = true }
@@ -2361,7 +2825,7 @@ public struct X86TableEncoder: Sendable {
 
         case .regToDr:
             guard ops.count == 2,
-                  case .reg(let gprReg) = ops[0], (gprReg.regClass == .gpr64 || gprReg.regClass == .gpr32),
+                  case .reg(let gprReg) = ops[0], gprReg.regClass == (mode == .mode64 ? .gpr64 : .gpr32),
                   case .reg(let drReg) = ops[1], drReg.regClass == .dr else { return nil }
             hasModRM = true
             if drReg.needsRexExtension { rexR = true }
@@ -2395,13 +2859,13 @@ public struct X86TableEncoder: Sendable {
         var out: [UInt8] = []
         out.reserveCapacity(15)
 
-        // 1. Legacy prefixes (lock, rep, segment, address size)
-        if inst.lockPrefix { out.append(0xF0) }
+        // 1. Legacy prefixes in LLVM MC / GNU `as` order: rep, segment, address size, operand size, lock
         if inst.repPrefix != .none { out.append(inst.repPrefix.rawValue) }
         if let seg = segmentOverride { out.append(seg) }
         if addressSizeOverride { out.append(0x67) }
 
         if desc.encodingKind == .vex {
+            guard !inst.lockPrefix else { return nil }
             // VEX 2-byte (C5) vs 3-byte (C4)
             let rInv: UInt8 = rexR ? 0 : 1
             let xInv: UInt8 = rexX ? 0 : 1
@@ -2433,6 +2897,7 @@ public struct X86TableEncoder: Sendable {
                     out.append(0x66)
                 }
             }
+            if inst.lockPrefix { out.append(0xF0) }
 
             // Mandatory SIMD / extension prefix
             switch desc.mandatoryPrefix {
@@ -2561,7 +3026,7 @@ public struct X86Disassembler: Sendable {
         var map: [DecodeKey: [Int]] = [:]
         for (idx, desc) in X86InstructionTable.descriptors.enumerated() {
             switch desc.operandFormat {
-            case .opcodePlusReg, .immToOpcodePlusReg:
+            case .opcodePlusReg, .opcodePlusRegWithAcc, .immToOpcodePlusReg:
                 for r: UInt8 in 0..<8 {
                     let key = DecodeKey(encodingKind: desc.encodingKind, opcodeMap: desc.opcodeMap, opcode: desc.opcode + r)
                     map[key, default: []].append(idx)
@@ -2775,11 +3240,11 @@ public struct X86Disassembler: Sendable {
 
         // 1. Verify prefix & VEX constraints
         if desc.encodingKind == .vex {
-            guard desc.vexL == vexL && desc.mandatoryPrefix.vexPP == vexPP else { return nil }
-            // Check W-sensitive VEX instructions
-            if desc.opcodeMap == .map0F && (desc.opcode == 0x6E || desc.opcode == 0x7E || desc.opcode == 0x2A || desc.opcode == 0x2C) {
-                guard desc.rexW == rexW else { return nil }
-            }
+            // VEX.W is matched exactly: the encoder writes W0 for W-ignored instructions, as GNU `as` and LLVM MC do.
+            guard desc.vexL == vexL && desc.mandatoryPrefix.vexPP == vexPP && desc.rexW == rexW else { return nil }
+            // Formats without a VEX.vvvv operand require VEX.vvvv = 1111b.
+            guard desc.operandFormat.usesVvvv || vexVvvv == 0 else { return nil }
+            guard !lockPrefix && !hasF2 && !hasF3 && !has66 else { return nil }
         } else {
             // Legacy mandatory prefix matching
             switch desc.mandatoryPrefix {
@@ -2859,7 +3324,11 @@ public struct X86Disassembler: Sendable {
         }
 
         // 3. Helper to decode ModR/M + SIB + disp
-        func decodeModRM(rmClass: X86RegClass?, rmKind: X86RMKind = .gprOrMem) throws -> (regBits: UInt8, rmOperand: X86Operand)? {
+        func decodeModRM(
+            rmClass: X86RegClass?,
+            rmKind: X86RMKind = .gprOrMem,
+            vsibIndex: X86RegClass? = nil
+        ) throws -> (regBits: UInt8, rmOperand: X86Operand)? {
             guard cursor < bytes.count else { return nil }
             let modrm = bytes[cursor]
             let mod = (modrm >> 6) & 0x03
@@ -2868,6 +3337,16 @@ public struct X86Disassembler: Sendable {
 
             if let expectedSlash = desc.modrmSlash, regField != expectedSlash {
                 return nil
+            }
+            if mod == 3 && desc.rmConstraint == .memOnly { return nil }
+            if mod != 3 && desc.rmConstraint == .regOnly { return nil }
+
+            if let vsib = vsibIndex {
+                // VSIB: memory only, always with a SIB byte whose index field names a vector register.
+                guard mod != 3, rmField == 4 else { return nil }
+                cursor += 1
+                let mem = try decodeMemoryOperand(mod: mod, rmField: rmField, vsibIndex: vsib)
+                return (regField, .mem(mem))
             }
 
             if mod == 3 {
@@ -2886,7 +3365,7 @@ public struct X86Disassembler: Sendable {
             }
         }
 
-        func decodeMemoryOperand(mod: UInt8, rmField: UInt8) throws -> X86Mem {
+        func decodeMemoryOperand(mod: UInt8, rmField: UInt8, vsibIndex: X86RegClass? = nil) throws -> X86Mem {
             // 16-bit addressing mode
             if codeMode == .mode16 && !has67 {
                 if mod == 0 && rmField == 6 {
@@ -2926,7 +3405,9 @@ public struct X86Disassembler: Sendable {
                 let baseBits = sib & 0x07
 
                 let indexReg: X86Reg?
-                if !rexX && idxBits == 4 {
+                if let vsib = vsibIndex {
+                    indexReg = makeReg(for: vsib, hw: (rexX ? 8 : 0) | idxBits, hasRex: true)
+                } else if !rexX && idxBits == 4 {
                     indexReg = nil
                 } else {
                     indexReg = makeAddrReg((rexX ? 8 : 0) | idxBits)
@@ -2960,7 +3441,10 @@ public struct X86Disassembler: Sendable {
 
         func readImm(size: X86OperandSize) throws -> Int64 {
             switch size {
-            case .byte:  return Int64(try readInt8(at: &cursor))
+            case .byte:
+                // Zero-extended imm8 (shift counts, SIMD selectors) prints as 0..255, signed imm8 as -128..127.
+                let b = try readInt8(at: &cursor)
+                return desc.imm8IsZeroExtended ? Int64(UInt8(bitPattern: b)) : Int64(b)
             case .word:  return Int64(try readInt16(at: &cursor))
             case .dword: return Int64(try readInt32(at: &cursor))
             case .qword: return try readInt64(at: &cursor)
@@ -2977,6 +3461,12 @@ public struct X86Disassembler: Sendable {
         case .opcodePlusReg(let rc):
             let hw = (rexB ? 8 : 0) | (opcodeByte - desc.opcode)
             operands = [.reg(makeReg(for: rc, hw: hw, hasRex: hasRex))]
+
+        case .opcodePlusRegWithAcc(let rc):
+            let hw = (rexB ? 8 : 0) | (opcodeByte - desc.opcode)
+            // 0x90 / REX.W 0x90 are `nop`; only 0x66 0x90 decodes as `xchg %ax, %ax`.
+            guard hw != 0 || desc.operandSize == .word else { return nil }
+            operands = [.reg(makeReg(for: rc, hw: hw, hasRex: hasRex)), .reg(X86Reg.gpr(size: desc.operandSize, hw: 0))]
 
         case .immToOpcodePlusReg(let rc, let immSz):
             let hw = (rexB ? 8 : 0) | (opcodeByte - desc.opcode)
@@ -3043,9 +3533,6 @@ public struct X86Disassembler: Sendable {
 
         case .vexRmVvvvReg(let rmClass, let vvvvClass, let regClass):
             guard let (regBits, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
-            if (desc.mnemonic == "vmovss" || desc.mnemonic == "vmovsd"), case .mem = rmOp {
-                return nil
-            }
             let vReg = makeReg(for: vvvvClass, hw: vexVvvv, hasRex: true)
             let dstReg = makeReg(for: regClass, hw: (rexR ? 8 : 0) | regBits, hasRex: true)
             operands = [rmOp, .reg(vReg), .reg(dstReg)]
@@ -3057,6 +3544,46 @@ public struct X86Disassembler: Sendable {
             let dstReg = makeReg(for: regClass, hw: (rexR ? 8 : 0) | regBits, hasRex: true)
             operands = [.imm(immVal), rmOp, .reg(vReg), .reg(dstReg)]
 
+        case .vexVvvvRmReg(let vvvvClass, let rmClass, let regClass):
+            guard let (regBits, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
+            let vReg = makeReg(for: vvvvClass, hw: vexVvvv, hasRex: true)
+            let dstReg = makeReg(for: regClass, hw: (rexR ? 8 : 0) | regBits, hasRex: true)
+            operands = [.reg(vReg), rmOp, .reg(dstReg)]
+
+        case .vexRmToVvvv(let rmClass, let vvvvClass):
+            guard let (_, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
+            operands = [rmOp, .reg(makeReg(for: vvvvClass, hw: vexVvvv, hasRex: true))]
+
+        case .vexImmRmToVvvv(let rmClass, let vvvvClass):
+            guard let (_, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
+            let immVal = try readImm(size: .byte)
+            operands = [.imm(immVal), rmOp, .reg(makeReg(for: vvvvClass, hw: vexVvvv, hasRex: true))]
+
+        case .vexRegVvvvToRm(let regClass, let vvvvClass, let rmClass):
+            guard let (regBits, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
+            let srcReg = makeReg(for: regClass, hw: (rexR ? 8 : 0) | regBits, hasRex: true)
+            operands = [.reg(srcReg), .reg(makeReg(for: vvvvClass, hw: vexVvvv, hasRex: true)), rmOp]
+
+        case .vexIs4RmVvvvReg(let rmClass, let vvvvClass, let regClass):
+            guard let (regBits, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
+            guard cursor < bytes.count, bytes[cursor] & 0x0F == 0 else { return nil }
+            let is4Reg = makeReg(for: regClass, hw: bytes[cursor] >> 4, hasRex: true)
+            cursor += 1
+            let vReg = makeReg(for: vvvvClass, hw: vexVvvv, hasRex: true)
+            let dstReg = makeReg(for: regClass, hw: (rexR ? 8 : 0) | regBits, hasRex: true)
+            operands = [.reg(is4Reg), rmOp, .reg(vReg), .reg(dstReg)]
+
+        case .vexVsib(let vvvvClass, let indexClass, let regClass):
+            guard let (regBits, memOp) = try decodeModRM(rmClass: nil, vsibIndex: indexClass) else { return nil }
+            let maskReg = makeReg(for: vvvvClass, hw: vexVvvv, hasRex: true)
+            let dstReg = makeReg(for: regClass, hw: (rexR ? 8 : 0) | regBits, hasRex: true)
+            operands = [.reg(maskReg), memOp, .reg(dstReg)]
+
+        case .xmm0RmToReg(let rmClass, let regClass):
+            guard let (regBits, rmOp) = try decodeModRM(rmClass: rmClass) else { return nil }
+            let dstReg = makeReg(for: regClass, hw: (rexR ? 8 : 0) | regBits, hasRex: hasRex)
+            operands = [.reg(.xmm0), rmOp, .reg(dstReg)]
+
         case .relBranch(let relSz):
             let relVal = try readImm(size: relSz)
             operands = [.relTarget(relVal)]
@@ -3066,14 +3593,12 @@ public struct X86Disassembler: Sendable {
             operands = [.imm(immVal)]
 
         case .segToRm:
-            let rmCls: X86RegClass = codeMode == .mode16 ? .gpr16 : (rexW ? .gpr64 : .gpr32)
-            guard let (regBits, rmOp) = try decodeModRM(rmClass: rmCls) else { return nil }
+            guard let (regBits, rmOp) = try decodeModRM(rmClass: desc.operandSize.gprClass) else { return nil }
             guard let segReg = X86Reg.seg(regBits) else { return nil }
             operands = [.reg(segReg), rmOp]
 
         case .rmToSeg:
-            let rmCls: X86RegClass = codeMode == .mode16 ? .gpr16 : (rexW ? .gpr64 : .gpr32)
-            guard let (regBits, rmOp) = try decodeModRM(rmClass: rmCls) else { return nil }
+            guard let (regBits, rmOp) = try decodeModRM(rmClass: desc.operandSize.gprClass) else { return nil }
             guard let segReg = X86Reg.seg(regBits) else { return nil }
             operands = [rmOp, .reg(segReg)]
 
@@ -3117,20 +3642,16 @@ public struct X86Disassembler: Sendable {
         }
 
         // Include explicit size suffix when needed (e.g. memory destination without register operand)
-        let needsSuffix: Bool = {
-            guard desc.operandSize == .byte || desc.operandSize == .word || desc.operandSize == .dword || desc.operandSize == .qword else {
-                return false
-            }
-            if desc.mnemonic.hasSuffix(desc.operandSize.attSuffix) || desc.hasImplicitSizeMnemonic { return false }
-            let hasGPR = operands.contains { op in
-                if case .reg(let r) = op, r.isGPR { return true }
-                return false
-            }
-            return !hasGPR && !operands.isEmpty
-        }()
+        let needsSuffix = desc.needsSizeSuffix(operands: operands)
 
+        let mnemonic: String
+        if let memMnem = desc.memMnemonic, operands.contains(where: \.isMemory) {
+            mnemonic = memMnem
+        } else {
+            mnemonic = desc.mnemonic
+        }
         let inst = X86Instruction(
-            mnemonic: desc.mnemonic,
+            mnemonic: mnemonic,
             sizeSuffix: needsSuffix ? desc.operandSize : .unsized,
             operands: operands,
             lockPrefix: lockPrefix,
@@ -3198,6 +3719,9 @@ extension X86InstructionTable {
 
             case .opcodePlusReg(let rc):
                 ops = [.reg(sampleReg(rc, index: 3))]
+
+            case .opcodePlusRegWithAcc(let rc):
+                ops = [.reg(sampleReg(rc, index: 3)), .reg(X86Reg.gpr(size: desc.operandSize, hw: 0))]
 
             case .immToOpcodePlusReg(let rc, let immSz):
                 let immVal: Int64 = (immSz == .qword) ? 0x1122334455667788 : 42
@@ -3272,6 +3796,29 @@ extension X86InstructionTable {
             case .vexImmRmVvvvReg(let rmClass, let vvvvClass, let regClass):
                 ops = [.imm(0x11), .reg(sampleReg(rmClass, index: 3)), .reg(sampleReg(vvvvClass, index: 2)), .reg(sampleReg(regClass, index: 1))]
 
+            case .vexVvvvRmReg(let vvvvClass, let rmClass, let regClass):
+                ops = [.reg(sampleReg(vvvvClass, index: 3)), .reg(sampleReg(rmClass, index: 2)), .reg(sampleReg(regClass, index: 1))]
+
+            case .vexRmToVvvv(let rmClass, let vvvvClass):
+                ops = [.reg(sampleReg(rmClass, index: 2)), .reg(sampleReg(vvvvClass, index: 1))]
+
+            case .vexImmRmToVvvv(let rmClass, let vvvvClass):
+                ops = [.imm(3), .reg(sampleReg(rmClass, index: 2)), .reg(sampleReg(vvvvClass, index: 1))]
+
+            case .vexRegVvvvToRm(let regClass, let vvvvClass, let rmClass):
+                let rmOp: X86Operand = desc.rmConstraint == .regOnly ? .reg(sampleReg(rmClass, index: 3)) : .mem(sampleMem)
+                ops = [.reg(sampleReg(regClass, index: 1)), .reg(sampleReg(vvvvClass, index: 2)), rmOp]
+
+            case .vexIs4RmVvvvReg(let rmClass, let vvvvClass, let regClass):
+                ops = [.reg(sampleReg(regClass, index: 4)), .reg(sampleReg(rmClass, index: 3)), .reg(sampleReg(vvvvClass, index: 2)), .reg(sampleReg(regClass, index: 1))]
+
+            case .vexVsib(let vvvvClass, let indexClass, let regClass):
+                let vsib = X86Mem(base: .rdi, index: sampleReg(indexClass, index: 5), scale: 4, disp: 8)
+                ops = [.reg(sampleReg(vvvvClass, index: 2)), .mem(vsib), .reg(sampleReg(regClass, index: 1))]
+
+            case .xmm0RmToReg(let rmClass, let regClass):
+                ops = [.reg(.xmm0), .reg(sampleReg(rmClass, index: 2)), .reg(sampleReg(regClass, index: 1))]
+
             case .relBranch(let relSz):
                 let targetVal: Int64 = (relSz == .byte) ? 16 : 0x1000
                 ops = [.relTarget(targetVal)]
@@ -3281,10 +3828,11 @@ extension X86InstructionTable {
                 ops = [.imm(immVal)]
 
             case .segToRm:
-                ops = [.reg(.ds), .reg(.eax)]
+                ops = [.reg(.ds), desc.rmConstraint == .memOnly ? .mem(sampleMem) : .reg(sampleReg(desc.operandSize.gprClass ?? .gpr32))]
+                if desc.rmConstraint == .memOnly { suffix = desc.operandSize }
 
             case .rmToSeg:
-                ops = [.reg(.eax), .reg(.ds)]
+                ops = [.reg(sampleReg(desc.operandSize.gprClass ?? .gpr32)), .reg(.ds)]
 
             case .crToReg:
                 ops = [.reg(.cr4), .reg(.rax)]
@@ -3315,7 +3863,18 @@ extension X86InstructionTable {
                 ops = [.reg(acc), .imm(0x60)]
             }
 
-            let inst = X86Instruction(mnemonic: desc.mnemonic, sizeSuffix: suffix, operands: ops, codeMode: mode)
+            // Respect register-only / memory-only `r/m` forms.
+            if let slot = desc.operandFormat.rmSlot(operandCount: ops.count), slot.index < ops.count {
+                switch desc.rmConstraint {
+                case .memOnly:
+                    if case .reg = ops[slot.index] { ops[slot.index] = .mem(sampleMem) }
+                case .regOnly:
+                    if case .mem = ops[slot.index], let rc = slot.rmClass { ops[slot.index] = .reg(sampleReg(rc, index: 3)) }
+                case .any:
+                    break
+                }
+            }
+            let inst = X86Instruction(mnemonic: desc.memMnemonic ?? desc.mnemonic, sizeSuffix: suffix, operands: ops, codeMode: mode)
             let encoded = try encoder.encode(inst)
             let (decoded, len) = try disassembler.disassembleOne(encoded.bytes, at: 0, codeMode: mode)
             let reencoded = try encoder.encode(decoded)
@@ -3371,6 +3930,39 @@ extension X86InstrDesc {
     @inlinable
     var hasImplicitSizeMnemonic: Bool {
         mnemonic.hasSuffix("64") || mnemonic == "cmpxchg8b" || mnemonic == "cmpxchg16b"
+            || mnemonic == "movd" || mnemonic == "vmovd" || (mnemonic.hasPrefix("set") && operandSize == .byte)
+    }
+
+    /// True if AT&T syntax needs a `b`/`w`/`l`/`q` suffix to fix the operand size of `operands`: no
+    /// operand that sets the size is a general-purpose register (`addl $1, (%rax)`, `pushq (%rax)`).
+    public func needsSizeSuffix(operands: [X86Operand]) -> Bool {
+        guard operandSize == .byte || operandSize == .word || operandSize == .dword || operandSize == .qword else {
+            return false
+        }
+        if X86InstructionTable.mnemonicCarriesSize(mnemonic, operandSize) || hasImplicitSizeMnemonic || operands.isEmpty {
+            return false
+        }
+        // `%cl` (shift count) and `%dx` (port) do not determine the operand size.
+        let sizing: ArraySlice<X86Operand>
+        switch operandFormat {
+        case .shiftByCl, .ioDxToAcc: sizing = operands.dropFirst()
+        case .ioAccToDx:             sizing = operands.dropLast()
+        default:                     sizing = operands[...]
+        }
+        return !sizing.contains { op in
+            if case .reg(let r) = op, r.isGPR { return true }
+            return false
+        }
+    }
+
+    /// True if an 8-bit immediate is zero-extended (shift/rotate counts, bit indices, SIMD selectors and
+    /// predicates). Such immediates accept -128...255 and disassemble as 0...255; the others are sign-extended.
+    @inlinable
+    var imm8IsZeroExtended: Bool {
+        switch opcodeMap {
+        case .map0F, .map0F38, .map0F3A: return true
+        case .primary: return opcode == 0xC0 || opcode == 0xC1 || opcode == 0xCD
+        }
     }
 
     /// True if the operand size is selected with the legacy 0x66 override (rather than a mandatory 0x66 prefix).
@@ -3381,5 +3973,55 @@ extension X86InstrDesc {
         case .none, .pF3, .pF2: return true
         case .p66, .p66F2:      return false
         }
+    }
+}
+
+extension X86OperandFormat {
+    /// Position of the ModR/M `r/m` operand among `operandCount` AT&T operands, with its register class
+    /// (`nil` when the class follows the descriptor's operand size), or `nil` if the format has no `r/m`.
+    public func rmSlot(operandCount: Int) -> (index: Int, rmClass: X86RegClass?)? {
+        switch self {
+        case .rm:                                  return (0, nil)
+        case .regToRm(_, let rc):                  return (1, rc)
+        case .rmToReg(let rc, _):                  return (0, rc)
+        case .immToRm(let rc, _):                  return (1, rc)
+        case .shiftBy1:                            return (operandCount - 1, nil)
+        case .shiftByCl:                           return (1, nil)
+        case .immRmToReg(let rc, _, _):            return (1, rc)
+        case .immRegToRm(_, let rc, _):            return (2, rc)
+        case .vexRmVvvvReg(let rc, _, _):          return (0, rc)
+        case .vexImmRmVvvvReg(let rc, _, _):       return (1, rc)
+        case .vexVvvvRmReg(_, let rc, _):          return (1, rc)
+        case .vexRmToVvvv(let rc, _):              return (0, rc)
+        case .vexImmRmToVvvv(let rc, _):           return (1, rc)
+        case .vexRegVvvvToRm(_, _, let rc):        return (2, rc)
+        case .vexIs4RmVvvvReg(let rc, _, _):       return (1, rc)
+        case .vexVsib:                             return (1, nil)
+        case .xmm0RmToReg(let rc, _):              return (operandCount - 2, rc)
+        case .segToRm:                             return (1, nil)
+        case .rmToSeg:                             return (0, nil)
+        default:                                   return nil
+        }
+    }
+
+    /// True if the format encodes an operand in VEX.vvvv (all others require VEX.vvvv = 1111b).
+    @inlinable
+    var usesVvvv: Bool {
+        switch self {
+        case .vexRmVvvvReg, .vexImmRmVvvvReg, .vexVvvvRmReg, .vexRmToVvvv, .vexImmRmToVvvv,
+             .vexRegVvvvToRm, .vexIs4RmVvvvReg, .vexVsib:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+extension X86Operand {
+    /// True for a (non-indirect) memory operand.
+    @inlinable
+    public var isMemory: Bool {
+        if case .mem = self { return true }
+        return false
     }
 }
