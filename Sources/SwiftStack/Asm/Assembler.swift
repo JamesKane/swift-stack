@@ -2937,18 +2937,27 @@ internal final class AsmSession {
         }
 
         var isNobits = name == ".bss" || name.hasPrefix(".bss.") || name == ".sbss" || name.hasPrefix(".sbss.") || name == ".tbss" || name.hasPrefix(".tbss.")
+        // As in LLVM MC, a `.note*` section without an explicit type is SHT_NOTE (`.note.gnu.property` must be one
+        // for the linker to read its GNU_PROPERTY_AARCH64_FEATURE_1_AND / x86 ISA properties).
+        var isNote = name.hasPrefix(".note")
         if parts.count >= 3 {
             let typeStr = parts[2].lowercased()
             if typeStr.contains("nobits") {
                 isNobits = true
+                isNote = false
             } else if typeStr.contains("progbits") {
                 isNobits = false
+                isNote = false
+            } else if typeStr.contains("note") {
+                isNote = true
             }
         }
 
         let kind: SectionKind
         if isNobits {
             kind = flags.contains(.tls) ? .tbss : .bss
+        } else if isNote {
+            kind = .note
         } else if flags.contains(.execInstr) || name.hasPrefix(".text") {
             kind = .text
         } else if flags.contains(.tls) {

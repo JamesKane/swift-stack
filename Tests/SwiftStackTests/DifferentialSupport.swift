@@ -238,6 +238,8 @@ struct DiffOptions {
 struct NormalizedObject {
     struct SectionInfo: Equatable, CustomStringConvertible {
         let name: String
+        /// `sh_type` (`SHT_PROGBITS`, `SHT_NOTE`, ...); a linker reads `.note.gnu.property` only as `SHT_NOTE`.
+        let type: UInt32
         let nobits: Bool
         let flags: UInt64
         let align: UInt64
@@ -287,7 +289,7 @@ struct NormalizedObject {
         let flagMask = TestELF.SHF_WRITE | TestELF.SHF_ALLOC | TestELF.SHF_EXECINSTR | TestELF.SHF_MERGE | TestELF.SHF_STRINGS | TestELF.SHF_TLS
         for s in elf.sections where (s.flags & TestELF.SHF_ALLOC) != 0 && s.size > 0 {
             sections[s.name] = SectionInfo(
-                name: s.name, nobits: s.type == TestELF.SHT_NOBITS, flags: s.flags & flagMask,
+                name: s.name, type: s.type, nobits: s.type == TestELF.SHT_NOBITS, flags: s.flags & flagMask,
                 align: s.align, size: s.size, data: s.data
             )
         }
@@ -329,7 +331,12 @@ struct NormalizedObject {
         for name in Set(sections.keys).union(oracle.sections.keys).subtracting(ex).sorted() {
             guard let ours = sections[name] else { out.append("missing section \(name)"); continue }
             guard let theirs = oracle.sections[name] else { out.append("extra section \(name)"); continue }
-            if ours.nobits != theirs.nobits { out.append("\(name): NOBITS ours=\(ours.nobits) oracle=\(theirs.nobits)") }
+            // Processor-specific types (SHT_LOPROC...SHT_HIPROC) are not compared: LLVM marks x86-64 `.eh_frame`
+            // SHT_X86_64_UNWIND, which Swift-Stack writes as SHT_PROGBITS (as GNU as does).
+            let isProcessorSpecific = { (t: UInt32) in (0x7000_0000...0x7FFF_FFFF).contains(t) }
+            if ours.type != theirs.type && !(isProcessorSpecific(ours.type) || isProcessorSpecific(theirs.type)) {
+                out.append("\(name): sh_type ours=\(ours.type) oracle=\(theirs.type)")
+            }
             if ours.flags != theirs.flags { out.append("\(name): flags ours=0x\(String(ours.flags, radix: 16)) oracle=0x\(String(theirs.flags, radix: 16))") }
             if options.compareAlignment && ours.align != theirs.align { out.append("\(name): align ours=\(ours.align) oracle=\(theirs.align)") }
             if ours.size != theirs.size {

@@ -19,74 +19,74 @@ internal enum A64Asm {
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) {
+        let sec = session.currentSection
+        let fragmentsBefore = sec.fragments.count
+        let errorsBefore = diagnostics.errorCount
+        parseInstructionForms(mnemonic: rawMnemonic, args: args, loc: loc, session: session, diagnostics: &diagnostics)
+        // A form that parsed but does not encode (an out-of-range immediate or lane, a register or arrangement the
+        // instruction does not take) emits nothing: report it instead of dropping the instruction silently.
+        if sec.fragments.count == fragmentsBefore && diagnostics.errorCount == errorsBefore {
+            diagnostics.report(.asmInvalidOperands, at: loc, args: [rawMnemonic])
+        }
+    }
+
+    /// Parses and emits one instruction. A form that is recognized but invalid returns without emitting anything
+    /// (`parseInstruction` reports it); an unknown mnemonic or operand shape reports `asmInvalidInstruction`.
+    private static func parseInstructionForms(
+        mnemonic rawMnemonic: String,
+        args: String,
+        loc: AsmLoc,
+        session: AsmSession,
+        diagnostics: inout DiagnosticBag
+    ) {
         let mnem = rawMnemonic.lowercased()
         let ops = splitCommaSeparated(args)
         let sec = session.currentSection
+        func emit(_ inst: A64Instruction) { emitInst(inst, into: sec, loc: loc) }
 
-        // 1. Zero-operand fixed system instructions & barriers
-        switch mnem {
-        case "nop":
-            emitInst(A64Instruction(opcode: .nop), into: sec, loc: loc)
+        // 1. Fixed system instructions, barriers, hints, and exception generation
+        let fixed: [String: A64OpcodeId] = ["nop": .nop, "eret": .eret, "yield": .yield, "wfe": .wfe, "wfi": .wfi, "sev": .sev, "sevl": .sevl]
+        if let op = fixed[mnem] {
+            if ops.isEmpty { emit(A64Instruction(opcode: op)) }
             return
+        }
+        switch mnem {
         case "ret":
             if ops.isEmpty {
-                emitInst(A64Instruction(opcode: .ret, rn: .lr), into: sec, loc: loc)
-            } else if let (rn, _, _) = A64GPR.parse(ops[0]) {
-                emitInst(A64Instruction(opcode: .ret, rn: rn), into: sec, loc: loc)
+                emit(A64Instruction(opcode: .ret, rn: .lr))
+            } else if ops.count == 1, case (let rn, true)? = gpr(ops[0]) {
+                emit(A64Instruction(opcode: .ret, rn: rn))
             }
-            return
-        case "eret":
-            emitInst(A64Instruction(opcode: .eret), into: sec, loc: loc)
-            return
-        case "yield":
-            emitInst(A64Instruction(opcode: .yield), into: sec, loc: loc)
-            return
-        case "wfe":
-            emitInst(A64Instruction(opcode: .wfe), into: sec, loc: loc)
-            return
-        case "wfi":
-            emitInst(A64Instruction(opcode: .wfi), into: sec, loc: loc)
-            return
-        case "sev":
-            emitInst(A64Instruction(opcode: .sev), into: sec, loc: loc)
-            return
-        case "sevl":
-            emitInst(A64Instruction(opcode: .sevl), into: sec, loc: loc)
             return
         case "clrex", "isb", "dsb", "dmb":
             // A named option (`ish`, `sy`, ...) or a raw `#imm4` `CRm`; `clrex`/`isb` default to 15.
             let op: A64OpcodeId = mnem == "clrex" ? .clrex : (mnem == "isb" ? .isb : (mnem == "dsb" ? .dsb : .dmb))
             var opt = A64BarrierOption.sy
             if let first = ops.first {
-                if let named = A64BarrierOption.parse(Substring(first)) {
+                guard ops.count == 1 else { return }
+                if let named = A64BarrierOption.parse(Substring(first)), op == .dsb || op == .dmb {
                     opt = named
-                } else if let crm = parseImmediateValue(first, session: session), (0...15).contains(crm) {
+                } else if first.hasPrefix("#") || Int64(first) != nil, let crm = parseImmediateValue(first, session: session), (0...15).contains(crm) {
                     opt = A64BarrierOption(rawValue: UInt8(crm))
+                } else if op == .isb && first.lowercased() == "sy" {
+                    opt = .sy
                 } else {
                     return
                 }
+            } else if op == .dsb || op == .dmb {
+                return
             }
-            emitInst(A64Instruction(opcode: op, barrierOption: opt), into: sec, loc: loc)
+            emit(A64Instruction(opcode: op, barrierOption: opt))
             return
         case "ssbb", "pssbb":
-            emitInst(A64Instruction(opcode: .dsb, barrierOption: A64BarrierOption(rawValue: mnem == "ssbb" ? 0 : 4)), into: sec, loc: loc)
+            if ops.isEmpty { emit(A64Instruction(opcode: .dsb, barrierOption: A64BarrierOption(rawValue: mnem == "ssbb" ? 0 : 4))) }
             return
         case "hint":
-            let immVal = parseImmediateValue(ops.first ?? "0", session: session) ?? 0
-            emitInst(A64Instruction(opcode: .hint, imm: immVal), into: sec, loc: loc)
+            if ops.count == 1, let imm = parseImmediateValue(ops[0], session: session) { emit(A64Instruction(opcode: .hint, imm: imm)) }
             return
         case "svc", "hvc", "smc", "brk", "hlt", "udf":
-            let immVal = parseImmediateValue(ops.first ?? "0", session: session) ?? 0
-            let op: A64OpcodeId
-            switch mnem {
-            case "svc": op = .svc
-            case "hvc": op = .hvc
-            case "smc": op = .smc
-            case "brk": op = .brk
-            case "hlt": op = .hlt
-            default:    op = .udf
-            }
-            emitInst(A64Instruction(opcode: op, imm: immVal), into: sec, loc: loc)
+            let opcodes: [String: A64OpcodeId] = ["svc": .svc, "hvc": .hvc, "smc": .smc, "brk": .brk, "hlt": .hlt, "udf": .udf]
+            if ops.count == 1, let imm = parseImmediateValue(ops[0], session: session) { emit(A64Instruction(opcode: opcodes[mnem]!, imm: imm)) }
             return
         default:
             break
@@ -94,313 +94,238 @@ internal enum A64Asm {
         // PAC/BTI/CSDB hint aliases (`paciasp`, `bti c`, ...).
         let hintName = ops.count == 1 && mnem == "bti" ? "bti \(ops[0].lowercased())" : mnem
         if ops.count <= (mnem == "bti" ? 1 : 0), let imm7 = A64HintAlias.byName[hintName] {
-            emitInst(A64Instruction(opcode: .hint, imm: imm7), into: sec, loc: loc)
+            emit(A64Instruction(opcode: .hint, imm: imm7))
             return
         }
+        if mnem == "bti" { return }
 
-        // 2. System maintenance (`tlbi`, `ic`, `dc`, `at`)
+        // 2. System maintenance (`tlbi`, `ic`, `dc`, `at`): an X register exactly when the operation takes one
         if let kind = Self.maintKinds[mnem] {
-            guard let opName = ops.first,
-                  let maintOp = A64SysMaintOp.parse(kind: kind, name: Substring(opName)) else {
+            guard let opName = ops.first, let maintOp = A64SysMaintOp.parse(kind: kind, name: Substring(opName)) else {
                 diagnostics.report(.asmInvalidInstruction, at: loc, args: [rawMnemonic])
                 return
             }
-            let rt: A64GPR = (ops.count >= 2) ? (A64GPR.parse(ops[1])?.reg ?? .xzr) : .xzr
-            emitInst(A64Instruction(opcode: .sysMaint, rd: rt, sysMaintOp: maintOp), into: sec, loc: loc)
+            if !maintOp.takesRegister {
+                if ops.count == 1 { emit(A64Instruction(opcode: .sysMaint, rd: .xzr, sysMaintOp: maintOp)) }
+            } else if ops.count == 2, case (let rt, true)? = gpr(ops[1]) {
+                emit(A64Instruction(opcode: .sysMaint, rd: rt, sysMaintOp: maintOp))
+            }
             return
         }
 
-        // 3. System register moves (`mrs`, `msr`)
-        if mnem == "mrs" && ops.count == 2 {
-            if let (rd, _, _) = A64GPR.parse(ops[0]),
-               let sysReg = A64SysReg.parse(ops[1]) {
-                emitInst(A64Instruction(opcode: .mrs, rd: rd, sysReg: sysReg), into: sec, loc: loc)
+        // 3. System register moves (`mrs Xt, <sysreg>`, `msr <sysreg>, Xt`, `msr <pstatefield>, #imm`)
+        if mnem == "mrs" || mnem == "msr" {
+            guard ops.count == 2 else { return }
+            if mnem == "mrs" {
+                if case (let rd, true)? = gpr(ops[0]), let sysReg = A64SysReg.parse(ops[1]) {
+                    emit(A64Instruction(opcode: .mrs, rd: rd, sysReg: sysReg))
+                }
                 return
             }
-        }
-        if mnem == "msr" && ops.count == 2 {
             // `spsel` names both a PSTATE field (`msr spsel, #imm`) and a system register (`msr spsel, xN`).
             if let pfield = A64PStateField.parse(Substring(ops[0])), A64GPR.parse(ops[1]) == nil {
-                let immVal = parseImmediateValue(ops[1], session: session) ?? 0
-                emitInst(A64Instruction(opcode: .msrPState, imm: immVal, pstateField: pfield), into: sec, loc: loc)
+                if let imm = parseImmediateValue(ops[1], session: session) {
+                    emit(A64Instruction(opcode: .msrPState, imm: imm, pstateField: pfield))
+                }
                 return
             }
-            if let sysReg = A64SysReg.parse(ops[0]),
-               let (rt, _, _) = A64GPR.parse(ops[1]) {
-                emitInst(A64Instruction(opcode: .msrReg, rd: rt, sysReg: sysReg), into: sec, loc: loc)
-                return
+            if let sysReg = A64SysReg.parse(ops[0]), case (let rt, true)? = gpr(ops[1]) {
+                emit(A64Instruction(opcode: .msrReg, rd: rt, sysReg: sysReg))
             }
+            return
         }
 
         // 4. Branches (`b`, `bl`, `b.cond`, `b<cond>`, `br`, `blr`, `cbz`, `cbnz`, `tbz`, `tbnz`)
         if mnem == "b" || mnem == "bl" {
-            guard let targetStr = ops.first else { return }
-            emitBranchTarget(baseInst: A64Instruction(opcode: mnem == "bl" ? .bl : .b), targetExpr: targetStr, session: session, loc: loc)
+            if ops.count == 1 { emitBranchTarget(baseInst: A64Instruction(opcode: mnem == "bl" ? .bl : .b), targetExpr: ops[0], session: session, loc: loc) }
             return
         }
         if mnem.hasPrefix("b.") {
-            let condStr = String(mnem.dropFirst(2))
-            if let cond = A64Cond.parse(condStr), let targetStr = ops.first {
-                emitBranchTarget(baseInst: A64Instruction(opcode: .bCond, cond: cond), targetExpr: targetStr, session: session, loc: loc)
+            if let cond = A64Cond.parse(String(mnem.dropFirst(2))), ops.count == 1 {
+                emitBranchTarget(baseInst: A64Instruction(opcode: .bCond, cond: cond), targetExpr: ops[0], session: session, loc: loc)
                 return
             }
         }
-        if mnem.count == 3 && mnem.hasPrefix("b") && mnem != "bic" && mnem != "bfi" && mnem != "bfm" && mnem != "brk" && mnem != "bti" && mnem != "blr" {
-            let condStr = String(mnem.dropFirst(1))
-            if let cond = A64Cond.parse(condStr), let targetStr = ops.first {
-                emitBranchTarget(baseInst: A64Instruction(opcode: .bCond, cond: cond), targetExpr: targetStr, session: session, loc: loc)
+        if mnem.count == 3 && mnem.hasPrefix("b") && !["bic", "bfi", "bfm", "brk", "bti", "blr", "bfc", "bif", "bit", "bsl"].contains(mnem) {
+            if let cond = A64Cond.parse(String(mnem.dropFirst(1))), ops.count == 1 {
+                emitBranchTarget(baseInst: A64Instruction(opcode: .bCond, cond: cond), targetExpr: ops[0], session: session, loc: loc)
                 return
             }
         }
-        if (mnem == "br" || mnem == "blr"), let firstOp = ops.first, let (rn, _, _) = A64GPR.parse(firstOp) {
-            emitInst(A64Instruction(opcode: mnem == "br" ? .br : .blr, rn: rn), into: sec, loc: loc)
+        if mnem == "br" || mnem == "blr" {
+            if ops.count == 1, case (let rn, true)? = gpr(ops[0]) { emit(A64Instruction(opcode: mnem == "br" ? .br : .blr, rn: rn)) }
             return
         }
-        if (mnem == "cbz" || mnem == "cbnz") && ops.count == 2 {
-            if let (rt, is64, _) = A64GPR.parse(ops[0]) {
+        if mnem == "cbz" || mnem == "cbnz" {
+            if ops.count == 2, let (rt, is64) = gpr(ops[0]) {
                 let base = A64Instruction(opcode: mnem == "cbz" ? .cbz : .cbnz, is64Bit: is64, rd: rt)
                 emitBranchTarget(baseInst: base, targetExpr: ops[1], session: session, loc: loc)
-                return
             }
+            return
         }
-        if (mnem == "tbz" || mnem == "tbnz") && ops.count == 3 {
-            if let (rt, is64, _) = A64GPR.parse(ops[0]) {
-                let bit = UInt8(truncatingIfNeeded: parseImmediateValue(ops[1], session: session) ?? 0)
-                let base = A64Instruction(opcode: mnem == "tbz" ? .tbz : .tbnz, is64Bit: is64 || bit >= 32, rd: rt, amount: bit)
+        if mnem == "tbz" || mnem == "tbnz" {
+            // The tested bit is 0-31 for a W register and 0-63 for an X register.
+            if ops.count == 3, let (rt, is64) = gpr(ops[0]), let bit = parseImmediateValue(ops[1], session: session),
+               (0...(is64 ? 63 : 31)).contains(bit) {
+                let base = A64Instruction(opcode: mnem == "tbz" ? .tbz : .tbnz, is64Bit: is64, rd: rt, amount: UInt8(bit))
                 emitBranchTarget(baseInst: base, targetExpr: ops[2], session: session, loc: loc)
-                return
             }
+            return
         }
 
         // 5. PC-relative address formation (`adr`, `adrp`)
-        if (mnem == "adr" || mnem == "adrp") && ops.count == 2 {
-            if let (rd, _, _) = A64GPR.parse(ops[0]) {
-                let isPage = (mnem == "adrp")
-                let base = A64Instruction(opcode: isPage ? .adrp : .adr, is64Bit: true, rd: rd, imm: 0)
-                guard let bytes = A64Encoder.encodeBytes(base) else { return }
-                let exprVal = evalExpr(ops[1], session: session)
-                switch exprVal {
-                case .constant(let v):
-                    var instWithImm = base
-                    instWithImm.imm = v
-                    if let immBytes = A64Encoder.encodeBytes(instWithImm) {
-                        sec.emitBytes(immBytes, loc: loc)
-                    }
-                case .symbolOffset(let sym, let addend, let mod):
-                    let rKind: RelocKind
-                    if mod == .a64Got {
-                        rKind = .aarch64_adr_got_page
-                    } else if isPage {
-                        rKind = .aarch64_adr_prel_pg_hi21
-                    } else {
-                        rKind = .aarch64_adr_prel_lo21
-                    }
-                    let fixup = AsmInstFixup(
-                        offsetInInst: 0,
-                        kind: rKind,
-                        symbol: sym,
-                        addend: addend,
-                        width: 4,
-                        resolveIfSameSection: !isPage && mod == .none
-                    )
-                    sec.emitBytes(bytes, fixups: [fixup], loc: loc)
-                default:
-                    sec.emitBytes(bytes, loc: loc)
+        if mnem == "adr" || mnem == "adrp" {
+            guard ops.count == 2, case (let rd, true)? = gpr(ops[0]) else { return }
+            let isPage = (mnem == "adrp")
+            let base = A64Instruction(opcode: isPage ? .adrp : .adr, is64Bit: true, rd: rd, imm: 0)
+            guard let bytes = A64Encoder.encodeBytes(base) else { return }
+            switch evalExpr(ops[1], session: session) {
+            case .constant(let v):
+                // An `adrp` displacement is a whole number of 4 KiB pages.
+                if isPage && v & 0xFFF != 0 { return }
+                var instWithImm = base
+                instWithImm.imm = v
+                emit(instWithImm)
+            case .symbolOffset(let sym, let addend, let mod):
+                let rKind: RelocKind
+                if mod == .a64Got {
+                    rKind = .aarch64_adr_got_page
+                } else if isPage {
+                    rKind = .aarch64_adr_prel_pg_hi21
+                } else {
+                    rKind = .aarch64_adr_prel_lo21
                 }
-                return
+                let fixup = AsmInstFixup(
+                    offsetInInst: 0,
+                    kind: rKind,
+                    symbol: sym,
+                    addend: addend,
+                    width: 4,
+                    resolveIfSameSection: !isPage && mod == .none
+                )
+                sec.emitBytes(bytes, fixups: [fixup], loc: loc)
+            default:
+                break
             }
+            return
         }
 
         // 6. SVE instructions (`addvl`, `addpl`, `rdvl`, `rdsvl`, `rdffr`, `wrffr`, `ldr`/`str` zN/pN)
-        if (mnem == "addvl" || mnem == "addpl") && ops.count == 3 {
-            if let (rd, _, _) = A64GPR.parse(ops[0]),
-               let (rn, _, _) = A64GPR.parse(ops[1]) {
-                let imm = parseImmediateValue(ops[2], session: session) ?? 0
-                emitInst(A64Instruction(opcode: mnem == "addvl" ? .sveAddvl : .sveAddpl, rd: rd, rn: rn, imm: imm), into: sec, loc: loc)
-                return
+        if mnem == "addvl" || mnem == "addpl" {
+            if ops.count == 3, case (let rd, true, _)? = A64GPR.parse(ops[0]), case (let rn, true, _)? = A64GPR.parse(ops[1]),
+               ops[0].lowercased() != "xzr", ops[1].lowercased() != "xzr", let imm = parseImmediateValue(ops[2], session: session) {
+                emit(A64Instruction(opcode: mnem == "addvl" ? .sveAddvl : .sveAddpl, rd: rd, rn: rn, imm: imm))
             }
+            return
         }
-        if (mnem == "rdvl" || mnem == "rdsvl") && ops.count == 2 {
-            if let (rd, _, _) = A64GPR.parse(ops[0]) {
-                let imm6 = UInt32(bitPattern: Int32(truncatingIfNeeded: parseImmediateValue(ops[1], session: session) ?? 0)) & 0x3F
-                let baseWord: UInt32 = (mnem == "rdvl") ? 0x04BF5000 : 0x04BF5800
-                let word = baseWord | (imm6 << 5) | UInt32(rd.rawValue)
-                sec.emitBytes([
-                    UInt8(truncatingIfNeeded: word),
-                    UInt8(truncatingIfNeeded: word >> 8),
-                    UInt8(truncatingIfNeeded: word >> 16),
-                    UInt8(truncatingIfNeeded: word >> 24),
-                ], loc: loc)
-                return
+        if mnem == "rdvl" || mnem == "rdsvl" {
+            if ops.count == 2, case (let rd, true)? = gpr(ops[0]), let imm = parseImmediateValue(ops[1], session: session), (-32...31).contains(imm) {
+                let imm6 = UInt32(bitPattern: Int32(imm)) & 0x3F
+                let word: UInt32 = (mnem == "rdvl" ? 0x04BF_5000 : 0x04BF_5800) | (imm6 << 5) | UInt32(rd.rawValue)
+                sec.emitBytes((0..<4).map { UInt8(truncatingIfNeeded: word >> (8 * $0)) }, loc: loc)
             }
+            return
         }
-        if (mnem == "rdffr" || mnem == "wrffr") && ops.count == 1 {
-            if let pd = A64PReg.parse(Substring(ops[0])) {
-                emitInst(A64Instruction(opcode: mnem == "rdffr" ? .sveRdffr : .sveWrffr, pd: pd), into: sec, loc: loc)
-                return
+        if mnem == "rdffr" || mnem == "wrffr" {
+            if ops.count == 1, ops[0].lowercased().hasSuffix(".b"), let pd = A64PReg.parse(Substring(ops[0])) {
+                emit(A64Instruction(opcode: mnem == "rdffr" ? .sveRdffr : .sveWrffr, pd: pd))
             }
+            return
         }
 
-        // 7. Loads and Stores (`ldr`, `str`, `ldrb`, `strb`, `ldrh`, `strh`, `ldrsb`, `ldrsh`, `ldrsw`,
-        //    `ldur`, `stur`, `ldtr`, `sttr`, `ldp`, `stp`, `ldxr`, `stxr`, `ldaxr`, `stlxr`, `ldar`, `stlr`)
+        // 7. Loads and stores
         if isLoadStoreMnemonic(mnem) {
             parseLoadStore(mnemonic: mnem, ops: ops, loc: loc, session: session, diagnostics: &diagnostics)
             return
         }
 
         // 8. Move wide & `mov` alias (`movz`, `movk`, `movn`, `mov`, `mvn`)
-        if (mnem == "movz" || mnem == "movk" || mnem == "movn") && ops.count >= 2 {
-            if let (rd, is64, _) = A64GPR.parse(ops[0]) {
-                let op: A64OpcodeId = (mnem == "movz") ? .movz : ((mnem == "movk") ? .movk : .movn)
-                var shiftAmt: UInt8 = 0
-                if ops.count >= 3 {
-                    let sParts = ops[2].split(whereSeparator: { $0.isWhitespace })
-                    if sParts.count >= 2, let v = parseImmediateValue(String(sParts[1]), session: session) {
-                        shiftAmt = UInt8(truncatingIfNeeded: v)
-                    }
+        if mnem == "movz" || mnem == "movk" || mnem == "movn" {
+            guard ops.count == 2 || ops.count == 3, let (rd, is64) = gpr(ops[0]) else { return }
+            let op: A64OpcodeId = (mnem == "movz") ? .movz : ((mnem == "movk") ? .movk : .movn)
+            var shiftAmt: Int64 = 0
+            if ops.count == 3 {
+                guard let (kind, amount) = shiftOperand(ops[2], session: session), kind == .lsl else { return }
+                shiftAmt = amount
+            }
+            guard (0...48).contains(shiftAmt) else { return }
+            switch evalExpr(ops[1], session: session) {
+            case .constant(let imm):
+                emit(A64Instruction(opcode: op, is64Bit: is64, rd: rd, amount: UInt8(shiftAmt), imm: imm))
+            case .symbolOffset(let sym, let addend, let mod) where mod == .a64TprelHi12 || mod == .a64TprelLo12Nc:
+                if let bytes = A64Encoder.encodeBytes(A64Instruction(opcode: op, is64Bit: is64, rd: rd, amount: UInt8(shiftAmt), imm: 0)) {
+                    let rKind: RelocKind = (mod == .a64TprelHi12) ? .aarch64_tlsle_add_tprel_hi12 : .aarch64_tlsle_add_tprel_lo12_nc
+                    sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: sym, addend: addend)], loc: loc)
                 }
-                let exprVal = evalExpr(ops[1], session: session)
-                switch exprVal {
-                case .constant(let imm):
-                    emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, amount: shiftAmt, imm: imm & 0xFFFF), into: sec, loc: loc)
-                case .symbolOffset(let sym, let addend, let mod):
-                    let base = A64Instruction(opcode: op, is64Bit: is64, rd: rd, amount: shiftAmt, imm: 0)
-                    if let bytes = A64Encoder.encodeBytes(base) {
-                        let rKind: RelocKind = (mod == .a64TprelHi12) ? .aarch64_tlsle_add_tprel_hi12 : .aarch64_tlsle_add_tprel_lo12_nc
-                        sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: sym, addend: addend)], loc: loc)
-                    }
-                default:
-                    break
-                }
+            default:
+                break
+            }
+            return
+        }
+        if mnem == "mov" && ops.count == 2, let (rd, is64, rdIsSP) = A64GPR.parse(ops[0]) {
+            if let (rn, rnIs64, rnIsSP) = A64GPR.parse(ops[1]) {
+                // `mov` to or from SP is `add Rd, Rn, #0`; between other registers `orr Rd, zr, Rm`.
+                guard rnIs64 == is64, !(rdIsSP || rnIsSP) || (rd.rawValue != 31 || rdIsSP) && (rn.rawValue != 31 || rnIsSP) else { return }
+                emit(.movReg(is64Bit: is64, rd: rd, rn: rn, involvesSP: rdIsSP || rnIsSP))
                 return
             }
+            switch evalExpr(ops[1], session: session) {
+            case nil:
+                // `mov Wd, Vn.s[i]` / `mov Xd, Vn.d[i]` (`umov`)
+                _ = parseFpOrSimd(mnemonic: mnem, ops: ops, loc: loc, session: session)
+            case .constant(let imm):
+                // A W destination takes a 32-bit value (zero- or sign-extended spelling).
+                guard is64 || imm >> 32 == 0 || imm >> 31 == -1,
+                      let movInst = encodeMovImmediate(rd: rd, is64Bit: is64, imm: imm) else { return }
+                if rdIsSP && movInst.opcode != .orrImm { return }
+                emit(movInst)
+            case .symbolDiff(let plusSym, let minusSym, let addend):
+                guard !rdIsSP, let bytes = A64Encoder.encodeBytes(A64Instruction(opcode: .movz, is64Bit: is64, rd: rd, amount: 0, imm: 0)) else { return }
+                let fixup = AsmInstFixup(offsetInInst: 0, kind: .aarch64_abs16, symbol: plusSym, minusSymbol: minusSym, addend: addend, width: 4)
+                sec.emitBytes(bytes, fixups: [fixup], loc: loc)
+            default:
+                break
+            }
+            return
         }
-        if mnem == "mov" && ops.count == 2 {
-            if let (rd, is64, rdIsSP) = A64GPR.parse(ops[0]) {
-                if let (rn, _, rnIsSP) = A64GPR.parse(ops[1]) {
-                    emitInst(.movReg(is64Bit: is64, rd: rd, rn: rn, involvesSP: rdIsSP || rnIsSP), into: sec, loc: loc)
+        if mnem == "mvn" || mnem == "neg" || mnem == "negs" {
+            if ops.count == 2 || ops.count == 3, let (regs, is64) = sameWidthGPRs(ops.prefix(2)) {
+                let (shift, amt) = ops.count == 3 ? (shiftOperand(ops[2], session: session) ?? (.msl, 0)) : (.lsl, 0)
+                if shift != .msl, let amount = UInt8(exactly: amt) {
+                    switch mnem {
+                    case "mvn":  emit(.mvn(is64Bit: is64, rd: regs[0], rm: regs[1], shift: shift, amount: amount))
+                    case "neg":  emit(.neg(is64Bit: is64, rd: regs[0], rm: regs[1], shift: shift, amount: amount))
+                    default:     emit(.negs(is64Bit: is64, rd: regs[0], rm: regs[1], shift: shift, amount: amount))
+                    }
                     return
                 }
-                if let exprVal = evalExpr(ops[1], session: session) {
-                    switch exprVal {
-                    case .constant(let imm):
-                        if let movInst = encodeMovImmediate(rd: rd, is64Bit: is64, imm: imm) {
-                            emitInst(movInst, into: sec, loc: loc)
-                            return
-                        }
-                    case .symbolDiff(let plusSym, let minusSym, let addend):
-                        let base = A64Instruction(opcode: .movz, is64Bit: is64, rd: rd, amount: 0, imm: 0)
-                        if let bytes = A64Encoder.encodeBytes(base) {
-                            let fixup = AsmInstFixup(
-                                offsetInInst: 0,
-                                kind: .aarch64_abs16,
-                                symbol: plusSym,
-                                minusSymbol: minusSym,
-                                addend: addend,
-                                width: 4
-                            )
-                            sec.emitBytes(bytes, fixups: [fixup], loc: loc)
-                            return
-                        }
-                    default:
-                        break
-                    }
-                }
             }
-        }
-        if mnem == "mvn" && ops.count >= 2 {
-            if let (rd, is64, _) = A64GPR.parse(ops[0]),
-               let (rm, _, _) = A64GPR.parse(ops[1]) {
-                let (shift, amt) = parseOptionalShift(ops, startIndex: 2, session: session)
-                emitInst(.mvn(is64Bit: is64, rd: rd, rm: rm, shift: shift, amount: amt), into: sec, loc: loc)
-                return
-            }
+            _ = parseFpOrSimd(mnemonic: mnem, ops: ops, loc: loc, session: session)
+            return
         }
 
-        // 9. Compare & Test aliases (`cmp`, `cmn`, `tst`, `neg`, `negs`)
-        if (mnem == "cmp" || mnem == "cmn") && ops.count >= 2 {
-            if let (rn, is64, rnIsSP) = A64GPR.parse(ops[0]) {
-                let isCmp = (mnem == "cmp")
-                if let (rm, _, _) = A64GPR.parse(ops[1]) {
-                    if rnIsSP || (ops.count >= 3 && hasExtendSpecifier(ops[2])) {
-                        let (ext, amt) = parseOptionalExtend(ops, startIndex: 2, is64Bit: is64, session: session)
-                        emitInst(
-                            A64Instruction(
-                                opcode: isCmp ? .subsExtended : .addsExtended,
-                                is64Bit: is64,
-                                rd: .xzr,
-                                rn: rn,
-                                rm: rm,
-                                extendKind: ext,
-                                amount: amt
-                            ),
-                            into: sec,
-                            loc: loc
-                        )
-                    } else {
-                        let (shift, amt) = parseOptionalShift(ops, startIndex: 2, session: session)
-                        emitInst(
-                            isCmp
-                                ? .cmpShifted(is64Bit: is64, rn: rn, rm: rm, shift: shift, amount: amt)
-                                : .cmnShifted(is64Bit: is64, rn: rn, rm: rm, shift: shift, amount: amt),
-                            into: sec,
-                            loc: loc
-                        )
-                    }
-                    return
-                }
-                if let imm = parseImmediateValue(ops[1], session: session) {
-                    let (_, shiftAmt) = parseOptionalShift(ops, startIndex: 2, session: session)
-                    let lsl12 = (shiftAmt == 12)
-                    emitInst(
-                        isCmp
-                            ? .cmpImm(is64Bit: is64, rn: rn, imm12: UInt16(truncatingIfNeeded: imm), lsl12: lsl12)
-                            : .cmnImm(is64Bit: is64, rn: rn, imm12: UInt16(truncatingIfNeeded: imm), lsl12: lsl12),
-                        into: sec,
-                        loc: loc
-                    )
-                    return
-                }
-            }
+        // 9. Compare & test aliases (`cmp`, `cmn` -> `subs`/`adds` with Rd = zr; `tst` -> `ands`)
+        if mnem == "cmp" || mnem == "cmn" {
+            _ = parseAddSub(mnemonic: mnem == "cmp" ? "subs" : "adds", ops: ["xzr"] + ops, loc: loc, session: session, compareAlias: true)
+            return
         }
-        if mnem == "tst" && ops.count >= 2 {
-            if let (rn, is64, _) = A64GPR.parse(ops[0]) {
-                if let (rm, _, _) = A64GPR.parse(ops[1]) {
-                    let (shift, amt) = parseOptionalShift(ops, startIndex: 2, session: session)
-                    emitInst(.tstShifted(is64Bit: is64, rn: rn, rm: rm, shift: shift, amount: amt), into: sec, loc: loc)
-                    return
-                }
-                if let imm = parseImmediateValue(ops[1], session: session) {
-                    emitInst(.tstImm(is64Bit: is64, rn: rn, bitmask: UInt64(bitPattern: imm)), into: sec, loc: loc)
-                    return
-                }
+        if mnem == "tst" {
+            if let (_, is64) = gpr(ops.first ?? "") {
+                _ = parseLogical(mnemonic: "ands", ops: [is64 ? "xzr" : "wzr"] + ops, loc: loc, session: session)
             }
-        }
-        if (mnem == "neg" || mnem == "negs") && ops.count >= 2 {
-            if let (rd, is64, _) = A64GPR.parse(ops[0]),
-               let (rm, _, _) = A64GPR.parse(ops[1]) {
-                let (shift, amt) = parseOptionalShift(ops, startIndex: 2, session: session)
-                emitInst(
-                    mnem == "neg"
-                        ? .neg(is64Bit: is64, rd: rd, rm: rm, shift: shift, amount: amt)
-                        : .negs(is64Bit: is64, rd: rd, rm: rm, shift: shift, amount: amt),
-                    into: sec,
-                    loc: loc
-                )
-                return
-            }
+            return
         }
 
-        // 10. Arithmetic & Logical (`add`, `adds`, `sub`, `subs`, `and`, `ands`, `orr`, `orn`, `eor`, `eon`, `bic`, `bics`)
+        // 10. Arithmetic & logical (`add`, `adds`, `sub`, `subs`, `and`, `ands`, `orr`, `orn`, `eor`, `eon`, `bic`, `bics`)
         if mnem == "add" || mnem == "adds" || mnem == "sub" || mnem == "subs" {
-            if parseAddSub(mnemonic: mnem, ops: ops, loc: loc, session: session) {
-                return
-            }
+            if parseAddSub(mnemonic: mnem, ops: ops, loc: loc, session: session, compareAlias: false) { return }
+            if (mnem == "add" || mnem == "sub"), parseFpOrSimd(mnemonic: mnem, ops: ops, loc: loc, session: session) { return }
+            return
         }
-        if mnem == "and" || mnem == "ands" || mnem == "orr" || mnem == "orn" || mnem == "eor" || mnem == "eon" || mnem == "bic" || mnem == "bics" {
-            if parseLogical(mnemonic: mnem, ops: ops, loc: loc, session: session) {
-                return
-            }
+        if ["and", "ands", "orr", "orn", "eor", "eon", "bic", "bics"].contains(mnem) {
+            if parseLogical(mnemonic: mnem, ops: ops, loc: loc, session: session) { return }
+            if mnem != "ands" && mnem != "bics", parseFpOrSimd(mnemonic: mnem, ops: ops, loc: loc, session: session) { return }
+            return
         }
 
         // 11. Shifts, Bitfields, Multiply/Divide, Conditional Select
@@ -412,13 +337,26 @@ internal enum A64Asm {
         if parseFpOrSimd(mnemonic: mnem, ops: ops, loc: loc, session: session) {
             return
         }
-
+        if Self.scalarMnemonics.contains(mnem) || resolveTableMnemonic(mnem) != nil {
+            return
+        }
         diagnostics.report(.asmInvalidInstruction, at: loc, args: [rawMnemonic])
     }
 
     // MARK: - Helpers
 
     private static let maintKinds: [String: A64SysMaintKind] = ["tlbi": .tlbi, "ic": .ic, "dc": .dc, "at": .at]
+
+    /// Mnemonics `parseBitfieldOrShiftOrMulOrCond` handles: an operand mismatch there is an invalid form of a
+    /// known instruction (reported as such), not an unknown mnemonic.
+    private static let scalarMnemonics: Set<String> = [
+        "lsl", "lsr", "asr", "ror", "lslv", "lsrv", "asrv", "rorv", "udiv", "sdiv", "smulh", "umulh", "mul", "mneg",
+        "madd", "msub", "ubfiz", "sbfiz", "bfi", "ubfx", "sbfx", "bfxil", "bfc", "ubfm", "sbfm", "bfm", "extr",
+        "sxtb", "sxth", "sxtw", "uxtb", "uxth", "clz", "cls", "rbit", "rev", "rev16", "rev32", "cset", "csetm",
+        "csel", "csinc", "csinv", "csneg", "cinc", "cinv", "cneg", "ccmp", "ccmn", "adc", "adcs", "sbc", "sbcs",
+        "ngc", "ngcs", "smaddl", "smsubl", "umaddl", "umsubl", "smull", "smnegl", "umull", "umnegl",
+        "crc32b", "crc32h", "crc32w", "crc32x", "crc32cb", "crc32ch", "crc32cw", "crc32cx",
+    ]
 
     private static func emitInst(_ inst: A64Instruction, into sec: AsmSectionBuilder, loc: AsmLoc) {
         if let bytes = A64Encoder.encodeBytes(inst) {
@@ -432,6 +370,8 @@ internal enum A64Asm {
             s.removeFirst()
             s = s.trimmingCharacters(in: .whitespaces)
         }
+        // Register names are not symbols (`add x0, x1, s3` is an error, not a reference to `s3`).
+        if A64GPR.parse(s) != nil || A64VReg.parse(s) != nil { return nil }
         return AsmExprEvaluator.evaluate(s, constants: session.constants)
     }
 
@@ -452,7 +392,7 @@ internal enum A64Asm {
                 var inst = baseInst
                 inst.imm = c
                 emitInst(inst, into: sec, loc: loc)
-            case .symbolOffset(let sym, let addend, _):
+            case .symbolOffset(let sym, let addend, .none):
                 if sym == "." {
                     var inst = baseInst
                     inst.imm = addend
@@ -499,91 +439,113 @@ internal enum A64Asm {
         return nil
     }
 
-    private static func hasExtendSpecifier(_ op: String) -> Bool {
-        let first = splitFirstWord(op).0
-        return A64ExtendKind.parse(Substring(first)) != nil
+    /// A general-purpose register other than `sp`/`wsp` (register 31 is `xzr`/`wzr` here), as `(reg, is64)`.
+    private static func gpr(_ op: String) -> (A64GPR, Bool)? {
+        guard let (reg, is64, isSP) = A64GPR.parse(op.trimmingCharacters(in: .whitespaces)), !isSP else { return nil }
+        return (reg, is64)
     }
 
-    private static func parseOptionalShift(_ ops: [String], startIndex: Int, session: AsmSession) -> (A64ShiftKind, UInt8) {
-        guard startIndex < ops.count else { return (.lsl, 0) }
-        let (kindStr, amtStr) = splitFirstWord(ops[startIndex])
-        let kind = A64ShiftKind.parse(Substring(kindStr)) ?? .lsl
-        let amt = UInt8(truncatingIfNeeded: parseImmediateValue(amtStr, session: session) ?? 0)
-        return (kind, amt)
+    /// Registers other than `sp`/`wsp` that all have the same width, as `(regs, is64)`.
+    private static func sameWidthGPRs(_ ops: ArraySlice<String>) -> ([A64GPR], Bool)? {
+        var regs: [A64GPR] = []
+        var width: Bool? = nil
+        for op in ops {
+            guard let (reg, is64) = gpr(op), width == nil || width == is64 else { return nil }
+            regs.append(reg)
+            width = is64
+        }
+        return width.map { (regs, $0) }
     }
 
-    private static func parseOptionalExtend(_ ops: [String], startIndex: Int, is64Bit: Bool, session: AsmSession) -> (A64ExtendKind, UInt8) {
-        let defaultExt: A64ExtendKind = is64Bit ? .uxtx : .uxtw
-        guard startIndex < ops.count else { return (defaultExt, 0) }
-        let (kindStr, amtStr) = splitFirstWord(ops[startIndex])
-        if let ext = A64ExtendKind.parse(Substring(kindStr)) {
-            let amt = amtStr.isEmpty ? 0 : UInt8(truncatingIfNeeded: parseImmediateValue(amtStr, session: session) ?? 0)
-            return (ext, amt)
+    /// `<shift> #<amount>` (`lsl #12`, `asr #3`), with the amount required.
+    private static func shiftOperand(_ op: String, session: AsmSession) -> (A64ShiftKind, Int64)? {
+        let (kindStr, amtStr) = splitFirstWord(op)
+        guard let kind = A64ShiftKind.parse(Substring(kindStr)), !amtStr.isEmpty,
+              let amount = parseImmediateValue(amtStr, session: session), amount >= 0 else { return nil }
+        return (kind, amount)
+    }
+
+    /// `<extend> {#<amount>}` or `lsl #<amount>`: `(extend, amount, amountWritten)` with `extend` nil for `lsl`.
+    private static func extendOperand(_ op: String, session: AsmSession) -> (A64ExtendKind?, Int64, Bool)? {
+        let (kindStr, amtStr) = splitFirstWord(op)
+        let isLSL = kindStr.lowercased() == "lsl"
+        guard isLSL || (A64ExtendKind.parse(Substring(kindStr)) != nil && kindStr.lowercased() != "uxtl") else { return nil }
+        var amount: Int64 = 0
+        if !amtStr.isEmpty {
+            guard let a = parseImmediateValue(amtStr, session: session), a >= 0 else { return nil }
+            amount = a
+        } else if isLSL {
+            return nil
         }
-        if kindStr.lowercased() == "lsl" {
-            let amt = amtStr.isEmpty ? 0 : UInt8(truncatingIfNeeded: parseImmediateValue(amtStr, session: session) ?? 0)
-            return (defaultExt, amt)
-        }
-        return (defaultExt, 0)
+        return (isLSL ? nil : A64ExtendKind.parse(Substring(kindStr)), amount, !amtStr.isEmpty)
     }
 
     // MARK: - Add / Sub / Logical
 
+    /// `add`/`adds`/`sub`/`subs` in their immediate, shifted-register and extended-register forms (and `cmp`/`cmn`,
+    /// passed as `subs`/`adds` with a leading `xzr` for Rd, whose width then follows Rn).
     private static func parseAddSub(
         mnemonic: String,
-        ops: [String],
+        ops rawOps: [String],
         loc: AsmLoc,
-        session: AsmSession
+        session: AsmSession,
+        compareAlias: Bool
     ) -> Bool {
-        guard ops.count >= 3,
-              let (rd, is64, rdIsSP) = A64GPR.parse(ops[0]),
-              let (rn, _, rnIsSP) = A64GPR.parse(ops[1]) else {
-            return false
-        }
+        guard rawOps.count >= 3, rawOps.count <= 4, let (rnReg, rnIs64, rnIsSP) = A64GPR.parse(rawOps[1]) else { return false }
+        var ops = rawOps
+        if compareAlias { ops[0] = rnIs64 ? "xzr" : "wzr" }
+        guard let (rd, is64, rdIsSP) = A64GPR.parse(ops[0]), rnIs64 == is64 else { return false }
+        let rn = rnReg
+        let setsFlags = mnemonic.hasSuffix("s")
+        // `adds`/`subs` write zr, never SP.
+        if setsFlags && rdIsSP { return false }
         let sec = session.currentSection
+        let isAdd = mnemonic.hasPrefix("add")
 
-        // Register 3rd operand?
-        if let (rm, rmIs64, _) = A64GPR.parse(ops[2]) {
-            let useExtended = rdIsSP || rnIsSP || (ops.count >= 4 && hasExtendSpecifier(ops[3])) || (is64 && !rmIs64)
-            if useExtended {
-                var (ext, amt) = parseOptionalExtend(ops, startIndex: 3, is64Bit: is64, session: session)
-                if is64 && !rmIs64 && ops.count < 4 {
-                    ext = .uxtw
-                }
-                let op: A64OpcodeId
-                switch mnemonic {
-                case "add":  op = .addExtended
-                case "adds": op = .addsExtended
-                case "sub":  op = .subExtended
-                default:     op = .subsExtended
-                }
-                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, extendKind: ext, amount: amt), into: sec, loc: loc)
-            } else {
-                let (shift, amt) = parseOptionalShift(ops, startIndex: 3, session: session)
-                let op: A64OpcodeId
-                switch mnemonic {
-                case "add":  op = .addShifted
-                case "adds": op = .addsShifted
-                case "sub":  op = .subShifted
-                default:     op = .subsShifted
-                }
-                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, shiftKind: shift, amount: amt), into: sec, loc: loc)
+        // Register third operand: shifted register, or extended register when SP is involved or an extend is written.
+        if let (rm, rmIs64, rmIsSP) = A64GPR.parse(ops[2]) {
+            guard !rmIsSP else { return false }
+            let spInvolved = rdIsSP || rnIsSP
+            // In the extended form Rn (and Rd of `add`/`sub`) register 31 is SP, so zr is not encodable there.
+            let extendedOK = !(rn.rawValue == 31 && !rnIsSP) && !(!setsFlags && rd.rawValue == 31 && !rdIsSP)
+            if ops.count == 4, let (ext, amount, written) = extendOperand(ops[3], session: session), ext != nil || spInvolved {
+                guard extendedOK else { return false }
+                // `lsl` with SP is `uxtx` (`uxtw` for W); Rm is X only for the 64-bit `uxtx`/`sxtx`.
+                let extend = ext ?? (is64 ? .uxtx : .uxtw)
+                guard rmIs64 == (is64 && extend.uses64BitRegister), (0...4).contains(amount) else { return false }
+                if ext == nil && !written { return false }
+                let op: A64OpcodeId = isAdd ? (setsFlags ? .addsExtended : .addExtended) : (setsFlags ? .subsExtended : .subExtended)
+                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, extendKind: extend, amount: UInt8(amount)), into: sec, loc: loc)
+                return true
             }
+            if spInvolved {
+                guard ops.count == 3, rmIs64 == is64, extendedOK else { return false }
+                let op: A64OpcodeId = isAdd ? (setsFlags ? .addsExtended : .addExtended) : (setsFlags ? .subsExtended : .subExtended)
+                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, extendKind: is64 ? .uxtx : .uxtw), into: sec, loc: loc)
+                return true
+            }
+            guard rmIs64 == is64 else { return false }
+            var shift = A64ShiftKind.lsl
+            var amount: Int64 = 0
+            if ops.count == 4 {
+                guard let (k, a) = shiftOperand(ops[3], session: session), k != .ror, k != .msl, a < (is64 ? 64 : 32) else { return false }
+                (shift, amount) = (k, a)
+            }
+            let op: A64OpcodeId = isAdd ? (setsFlags ? .addsShifted : .addShifted) : (setsFlags ? .subsShifted : .subShifted)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, shiftKind: shift, amount: UInt8(amount)), into: sec, loc: loc)
             return true
         }
 
-        // Immediate or `:lo12:sym` 3rd operand
-        let opImm: A64OpcodeId
-        switch mnemonic {
-        case "add":  opImm = .addImm
-        case "adds": opImm = .addsImm
-        case "sub":  opImm = .subImm
-        default:     opImm = .subsImm
+        // Immediate or `:lo12:sym` third operand, with an optional `lsl #0`/`lsl #12`.
+        let opImm: A64OpcodeId = isAdd ? (setsFlags ? .addsImm : .addImm) : (setsFlags ? .subsImm : .subImm)
+        var shiftAmt: Int64 = 0
+        if ops.count == 4 {
+            guard let (k, a) = shiftOperand(ops[3], session: session), k == .lsl, a == 0 || a == 12 else { return false }
+            shiftAmt = a
         }
-
-        let (_, shiftAmt) = parseOptionalShift(ops, startIndex: 3, session: session)
-        let exprVal = evalExpr(ops[2], session: session)
-        switch exprVal {
+        // A zr register (not SP) as Rd of `add`/`sub` or Rn of any form has no immediate encoding.
+        if (!setsFlags && rd.rawValue == 31 && !rdIsSP) || (rn.rawValue == 31 && !rnIsSP) { return false }
+        switch evalExpr(ops[2], session: session) {
         case .constant(let imm):
             if imm < 0 && imm >= -0xFFF {
                 let flippedOp: A64OpcodeId
@@ -593,16 +555,16 @@ internal enum A64Asm {
                 case .subImm:  flippedOp = .addImm
                 default:       flippedOp = .addsImm
                 }
-                emitInst(A64Instruction(opcode: flippedOp, is64Bit: is64, rd: rd, rn: rn, amount: shiftAmt, imm: -imm), into: sec, loc: loc)
+                emitInst(A64Instruction(opcode: flippedOp, is64Bit: is64, rd: rd, rn: rn, amount: UInt8(shiftAmt), imm: -imm), into: sec, loc: loc)
             } else if imm > 0xFFF && (imm & 0xFFF) == 0 && (imm >> 12) <= 0xFFF && shiftAmt == 0 {
                 emitInst(A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: 12, imm: imm >> 12), into: sec, loc: loc)
             } else {
-                emitInst(A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: shiftAmt, imm: imm), into: sec, loc: loc)
+                emitInst(A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: UInt8(shiftAmt), imm: imm), into: sec, loc: loc)
             }
             return true
 
         case .symbolOffset(let sym, let addend, let mod):
-            let base = A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: shiftAmt, imm: 0)
+            let base = A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: UInt8(shiftAmt), imm: 0)
             guard let bytes = A64Encoder.encodeBytes(base) else { return false }
             let rKind: RelocKind
             switch mod {
@@ -618,58 +580,54 @@ internal enum A64Asm {
         }
     }
 
+    /// `and`/`ands`/`orr`/`orn`/`eor`/`eon`/`bic`/`bics` in their shifted-register and immediate forms.
     private static func parseLogical(
         mnemonic: String,
         ops: [String],
         loc: AsmLoc,
         session: AsmSession
     ) -> Bool {
-        guard ops.count >= 3,
-              let (rd, is64, _) = A64GPR.parse(ops[0]),
-              let (rn, _, _) = A64GPR.parse(ops[1]) else {
-            return false
-        }
+        guard ops.count == 3 || ops.count == 4 else { return false }
         let sec = session.currentSection
 
-        if let (rm, _, _) = A64GPR.parse(ops[2]) {
-            let (shift, amt) = parseOptionalShift(ops, startIndex: 3, session: session)
-            let op: A64OpcodeId
-            switch mnemonic {
-            case "and":  op = .andShifted
-            case "ands": op = .andsShifted
-            case "orr":  op = .orrShifted
-            case "orn":  op = .ornShifted
-            case "eor":  op = .eorShifted
-            case "eon":  op = .eonShifted
-            case "bic":  op = .bicShifted
-            default:     op = .bicsShifted
+        if let (regs, is64) = sameWidthGPRs(ops.prefix(3)) {
+            var shift = A64ShiftKind.lsl
+            var amount: Int64 = 0
+            if ops.count == 4 {
+                guard let (k, a) = shiftOperand(ops[3], session: session), k != .msl, a < (is64 ? 64 : 32) else { return false }
+                (shift, amount) = (k, a)
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, shiftKind: shift, amount: amt), into: sec, loc: loc)
+            let opcodes: [String: A64OpcodeId] = [
+                "and": .andShifted, "ands": .andsShifted, "orr": .orrShifted, "orn": .ornShifted,
+                "eor": .eorShifted, "eon": .eonShifted, "bic": .bicShifted, "bics": .bicsShifted,
+            ]
+            emitInst(A64Instruction(opcode: opcodes[mnemonic]!, is64Bit: is64, rd: regs[0], rn: regs[1], rm: regs[2], shiftKind: shift,
+                                    amount: UInt8(amount)), into: sec, loc: loc)
             return true
         }
 
-        if let imm = parseImmediateValue(ops[2], session: session) {
-            // Note: `bic Rd, Rn, #imm` is an alias for `and Rd, Rn, #~imm`!
-            var mask = UInt64(bitPattern: imm)
-            let op: A64OpcodeId
-            switch mnemonic {
-            case "and":  op = .andImm
-            case "ands": op = .andsImm
-            case "orr":  op = .orrImm
-            case "eor":  op = .eorImm
-            case "bic":
-                op = .andImm
-                mask = is64 ? ~mask : (~mask & 0xFFFF_FFFF)
-            case "bics":
-                op = .andsImm
-                mask = is64 ? ~mask : (~mask & 0xFFFF_FFFF)
-            default:
-                return false
-            }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, imm: Int64(bitPattern: mask)), into: sec, loc: loc)
-            return true
+        // Immediate: `and`/`orr`/`eor` may write SP; `bic`/`bics` (and `orn`/`eon`) take the inverted mask.
+        guard ops.count == 3, let (rd, is64, rdIsSP) = A64GPR.parse(ops[0]), let (rn, rnIs64) = gpr(ops[1]), rnIs64 == is64,
+              let imm = parseImmediateValue(ops[2], session: session) else { return false }
+        // A W operation takes a 32-bit value (zero- or sign-extended spelling).
+        guard is64 || imm >> 32 == 0 || imm >> 31 == -1 else { return false }
+        var mask = UInt64(bitPattern: imm)
+        let op: A64OpcodeId
+        switch mnemonic {
+        case "and": op = .andImm
+        case "ands": op = .andsImm
+        case "orr": op = .orrImm
+        case "eor": op = .eorImm
+        case "bic": op = .andImm; mask = ~mask
+        case "bics": op = .andsImm; mask = ~mask
+        case "orn": op = .orrImm; mask = ~mask
+        default: op = .eorImm; mask = ~mask
         }
-        return false
+        if !is64 { mask &= 0xFFFF_FFFF }
+        // Rd is SP-or-register for `and`/`orr`/`eor` (31 is SP) and zr-or-register for `ands` (31 is zr).
+        if op == .andsImm ? rdIsSP : (rd.rawValue == 31 && !rdIsSP) { return false }
+        emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, imm: Int64(bitPattern: mask)), into: sec, loc: loc)
+        return true
     }
 
     // MARK: - Bitfields, Shifts, Multiply/Divide, Conditional Select
@@ -681,211 +639,149 @@ internal enum A64Asm {
         session: AsmSession
     ) -> Bool {
         let sec = session.currentSection
+        func emit(_ inst: A64Instruction) -> Bool {
+            emitInst(inst, into: sec, loc: loc)
+            return true
+        }
+        /// An immediate operand in `range`.
+        func imm(_ op: String, _ range: ClosedRange<Int64>) -> Int64? {
+            parseImmediateValue(op, session: session).flatMap { range.contains($0) ? $0 : nil }
+        }
 
         switch mnemonic {
         case "lsl", "lsr", "asr", "ror":
-            guard ops.count == 3,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]) else { return false }
-            if let (rm, _, _) = A64GPR.parse(ops[2]) {
-                let op: A64OpcodeId
-                switch mnemonic {
-                case "lsl": op = .lslv
-                case "lsr": op = .lsrv
-                case "asr": op = .asrv
-                default:    op = .rorv
-                }
-                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, loc: loc)
-                return true
+            guard ops.count == 3, let (regs, is64) = sameWidthGPRs(ops.prefix(2)) else { return false }
+            let (rd, rn) = (regs[0], regs[1])
+            if let (rm, rmIs64) = gpr(ops[2]) {
+                guard rmIs64 == is64 else { return false }
+                let op: [String: A64OpcodeId] = ["lsl": .lslv, "lsr": .lsrv, "asr": .asrv, "ror": .rorv]
+                return emit(A64Instruction(opcode: op[mnemonic]!, is64Bit: is64, rd: rd, rn: rn, rm: rm))
             }
-            if let shiftVal = parseImmediateValue(ops[2], session: session) {
-                let shift = UInt8(truncatingIfNeeded: shiftVal)
-                let inst: A64Instruction
-                switch mnemonic {
-                case "lsl": inst = .lslImm(is64Bit: is64, rd: rd, rn: rn, shift: shift)
-                case "lsr": inst = .lsrImm(is64Bit: is64, rd: rd, rn: rn, shift: shift)
-                case "asr": inst = .asrImm(is64Bit: is64, rd: rd, rn: rn, shift: shift)
-                default:    inst = A64Instruction(opcode: .extr, is64Bit: is64, rd: rd, rn: rn, rm: rn, amount: shift)
-                }
-                emitInst(inst, into: sec, loc: loc)
-                return true
-            }
-            return false
-
-        case "lslv", "lsrv", "asrv", "rorv", "udiv", "sdiv", "smulh", "umulh":
-            guard ops.count == 3,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let (rm, _, _) = A64GPR.parse(ops[2]) else { return false }
-            let op: A64OpcodeId
+            guard let shiftVal = imm(ops[2], 0...(is64 ? 63 : 31)) else { return false }
+            let shift = UInt8(shiftVal)
             switch mnemonic {
-            case "lslv":  op = .lslv
-            case "lsrv":  op = .lsrv
-            case "asrv":  op = .asrv
-            case "rorv":  op = .rorv
-            case "udiv":  op = .udiv
-            case "sdiv":  op = .sdiv
-            case "smulh": op = .smulh
-            default:      op = .umulh
+            case "lsl": return emit(.lslImm(is64Bit: is64, rd: rd, rn: rn, shift: shift))
+            case "lsr": return emit(.lsrImm(is64Bit: is64, rd: rd, rn: rn, shift: shift))
+            case "asr": return emit(.asrImm(is64Bit: is64, rd: rd, rn: rn, shift: shift))
+            default:    return emit(A64Instruction(opcode: .extr, is64Bit: is64, rd: rd, rn: rn, rm: rn, amount: shift))
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, loc: loc)
-            return true
 
-        case "mul":
-            guard ops.count == 3,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let (rm, _, _) = A64GPR.parse(ops[2]) else { return false }
-            emitInst(.mul(is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, loc: loc)
-            return true
-
-        case "mneg":
-            guard ops.count == 3,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let (rm, _, _) = A64GPR.parse(ops[2]) else { return false }
-            emitInst(A64Instruction(opcode: .msub, is64Bit: is64, rd: rd, rn: rn, rm: rm, ra: .xzr), into: sec, loc: loc)
-            return true
-
-        case "ubfiz", "sbfiz":
-            guard ops.count == 4,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let lsb = parseImmediateValue(ops[2], session: session),
-                  let width = parseImmediateValue(ops[3], session: session) else { return false }
-            let regWidth: Int64 = is64 ? 64 : 32
-            guard lsb >= 0 && lsb < regWidth && width >= 1 && width <= regWidth - lsb else { return false }
-            let immr = (regWidth - lsb) % regWidth
-            emitInst(A64Instruction(opcode: mnemonic == "ubfiz" ? .ubfm : .sbfm, is64Bit: is64, rd: rd, rn: rn, imm: immr, imm2: UInt8(width - 1)),
-                     into: sec, loc: loc)
-            return true
-
-        case "bfc":
-            guard ops.count == 3,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let lsb = parseImmediateValue(ops[1], session: session),
-                  let width = parseImmediateValue(ops[2], session: session) else { return false }
-            let regWidth: Int64 = is64 ? 64 : 32
-            guard lsb >= 0 && lsb < regWidth && width >= 1 && width <= regWidth - lsb else { return false }
-            emitInst(A64Instruction(opcode: .bfm, is64Bit: is64, rd: rd, rn: .xzr, imm: (regWidth - lsb) % regWidth, imm2: UInt8(width - 1)),
-                     into: sec, loc: loc)
-            return true
+        case "lslv", "lsrv", "asrv", "rorv", "udiv", "sdiv", "smulh", "umulh", "mul", "mneg":
+            guard ops.count == 3, let (regs, is64) = sameWidthGPRs(ops[...]) else { return false }
+            let op: [String: A64OpcodeId] = [
+                "lslv": .lslv, "lsrv": .lsrv, "asrv": .asrv, "rorv": .rorv, "udiv": .udiv, "sdiv": .sdiv,
+                "smulh": .smulh, "umulh": .umulh, "mul": .madd, "mneg": .msub,
+            ]
+            if mnemonic.hasSuffix("mulh") && !is64 { return false }
+            let ra: A64GPR = mnemonic == "mul" || mnemonic == "mneg" ? .xzr : .x0
+            return emit(A64Instruction(opcode: op[mnemonic]!, is64Bit: is64, rd: regs[0], rn: regs[1], rm: regs[2], ra: ra))
 
         case "madd", "msub":
-            guard ops.count == 4,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let (rm, _, _) = A64GPR.parse(ops[2]),
-                  let (ra, _, _) = A64GPR.parse(ops[3]) else { return false }
-            emitInst(A64Instruction(opcode: mnemonic == "madd" ? .madd : .msub, is64Bit: is64, rd: rd, rn: rn, rm: rm, ra: ra), into: sec, loc: loc)
-            return true
+            guard ops.count == 4, let (regs, is64) = sameWidthGPRs(ops[...]) else { return false }
+            return emit(A64Instruction(opcode: mnemonic == "madd" ? .madd : .msub, is64Bit: is64, rd: regs[0], rn: regs[1], rm: regs[2], ra: regs[3]))
 
-        case "ubfx", "sbfx", "bfi", "bfxil", "ubfm", "sbfm", "bfm":
-            guard ops.count == 4,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let v1 = parseImmediateValue(ops[2], session: session),
-                  let v2 = parseImmediateValue(ops[3], session: session) else { return false }
-            let a = UInt8(truncatingIfNeeded: v1)
-            let b = UInt8(truncatingIfNeeded: v2)
-            let inst: A64Instruction
+        case "ubfiz", "sbfiz", "bfi", "ubfx", "sbfx", "bfxil", "bfc":
+            // `<op> Rd, Rn, #lsb, #width` (`bfc Rd, #lsb, #width`): 0 <= lsb < W and 1 <= width <= W - lsb.
+            let regCount = mnemonic == "bfc" ? 1 : 2
+            guard ops.count == regCount + 2, let (regs, is64) = sameWidthGPRs(ops.prefix(regCount)) else { return false }
+            let regWidth: Int64 = is64 ? 64 : 32
+            guard let lsb = imm(ops[regCount], 0...(regWidth - 1)), let width = imm(ops[regCount + 1], 1...(regWidth - lsb)) else { return false }
+            let rd = regs[0], rn = regCount == 2 ? regs[1] : .xzr
+            let insertImmr = (regWidth - lsb) % regWidth
             switch mnemonic {
-            case "ubfx":  inst = .ubfx(is64Bit: is64, rd: rd, rn: rn, lsb: a, width: b)
-            case "sbfx":  inst = .sbfx(is64Bit: is64, rd: rd, rn: rn, lsb: a, width: b)
-            case "bfi":   inst = .bfi(is64Bit: is64, rd: rd, rn: rn, lsb: a, width: b)
-            case "bfxil": inst = A64Instruction(opcode: .bfm, is64Bit: is64, rd: rd, rn: rn, imm: Int64(a), imm2: a + b - 1)
-            case "ubfm":  inst = A64Instruction(opcode: .ubfm, is64Bit: is64, rd: rd, rn: rn, imm: Int64(a), imm2: b)
-            case "sbfm":  inst = A64Instruction(opcode: .sbfm, is64Bit: is64, rd: rd, rn: rn, imm: Int64(a), imm2: b)
-            default:      inst = A64Instruction(opcode: .bfm, is64Bit: is64, rd: rd, rn: rn, imm: Int64(a), imm2: b)
+            case "ubfiz": return emit(A64Instruction(opcode: .ubfm, is64Bit: is64, rd: rd, rn: rn, imm: insertImmr, imm2: UInt8(width - 1)))
+            case "sbfiz": return emit(A64Instruction(opcode: .sbfm, is64Bit: is64, rd: rd, rn: rn, imm: insertImmr, imm2: UInt8(width - 1)))
+            case "bfi", "bfc": return emit(A64Instruction(opcode: .bfm, is64Bit: is64, rd: rd, rn: rn, imm: insertImmr, imm2: UInt8(width - 1)))
+            case "ubfx": return emit(A64Instruction(opcode: .ubfm, is64Bit: is64, rd: rd, rn: rn, imm: lsb, imm2: UInt8(lsb + width - 1)))
+            case "sbfx": return emit(A64Instruction(opcode: .sbfm, is64Bit: is64, rd: rd, rn: rn, imm: lsb, imm2: UInt8(lsb + width - 1)))
+            default:     return emit(A64Instruction(opcode: .bfm, is64Bit: is64, rd: rd, rn: rn, imm: lsb, imm2: UInt8(lsb + width - 1)))
             }
-            emitInst(inst, into: sec, loc: loc)
-            return true
+
+        case "ubfm", "sbfm", "bfm":
+            guard ops.count == 4, let (regs, is64) = sameWidthGPRs(ops.prefix(2)) else { return false }
+            let maxField: Int64 = is64 ? 63 : 31
+            guard let immr = imm(ops[2], 0...maxField), let imms = imm(ops[3], 0...maxField) else { return false }
+            let op: A64OpcodeId = mnemonic == "ubfm" ? .ubfm : (mnemonic == "sbfm" ? .sbfm : .bfm)
+            return emit(A64Instruction(opcode: op, is64Bit: is64, rd: regs[0], rn: regs[1], imm: immr, imm2: UInt8(imms)))
 
         case "extr":
-            guard ops.count == 4,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let (rm, _, _) = A64GPR.parse(ops[2]),
-                  let lsb = parseImmediateValue(ops[3], session: session) else { return false }
-            emitInst(A64Instruction(opcode: .extr, is64Bit: is64, rd: rd, rn: rn, rm: rm, amount: UInt8(truncatingIfNeeded: lsb)), into: sec, loc: loc)
-            return true
+            guard ops.count == 4, let (regs, is64) = sameWidthGPRs(ops.prefix(3)), let lsb = imm(ops[3], 0...(is64 ? 63 : 31)) else { return false }
+            return emit(A64Instruction(opcode: .extr, is64Bit: is64, rd: regs[0], rn: regs[1], rm: regs[2], amount: UInt8(lsb)))
 
         case "sxtb", "sxth", "sxtw", "uxtb", "uxth":
-            guard ops.count == 2,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]) else { return false }
-            let inst: A64Instruction
+            // The source is always a W register; `sxtw` writes X, `uxtb`/`uxth` write W.
+            guard ops.count == 2, let (rd, is64) = gpr(ops[0]), case (let rn, false)? = gpr(ops[1]) else { return false }
             switch mnemonic {
-            case "sxtb": inst = .sxtb(is64Bit: is64, rd: rd, rn: rn)
-            case "sxth": inst = .sxth(is64Bit: is64, rd: rd, rn: rn)
-            case "sxtw": inst = .sxtw(rd: rd, rn: rn)
-            case "uxtb": inst = .uxtb(rd: rd, rn: rn)
-            default:     inst = .uxth(rd: rd, rn: rn)
+            case "sxtb": return emit(.sxtb(is64Bit: is64, rd: rd, rn: rn))
+            case "sxth": return emit(.sxth(is64Bit: is64, rd: rd, rn: rn))
+            case "sxtw": return is64 && emit(.sxtw(rd: rd, rn: rn))
+            case "uxtb": return !is64 && emit(.uxtb(rd: rd, rn: rn))
+            default:     return !is64 && emit(.uxth(rd: rd, rn: rn))
             }
-            emitInst(inst, into: sec, loc: loc)
-            return true
 
-        case "clz", "rbit", "rev", "rev16", "rev32":
-            guard ops.count == 2,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]) else { return false }
-            let op: A64OpcodeId
-            switch mnemonic {
-            case "clz":   op = .clz
-            case "rbit":  op = .rbit
-            case "rev":   op = .rev
-            case "rev16": op = .rev16
-            default:      op = .rev32
-            }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn), into: sec, loc: loc)
-            return true
+        case "clz", "cls", "rbit", "rev", "rev16", "rev32":
+            guard ops.count == 2, let (regs, is64) = sameWidthGPRs(ops[...]) else { return false }
+            let op: [String: A64OpcodeId] = ["clz": .clz, "cls": .cls, "rbit": .rbit, "rev": .rev, "rev16": .rev16, "rev32": .rev32]
+            if mnemonic == "rev32" && !is64 { return false }
+            return emit(A64Instruction(opcode: op[mnemonic]!, is64Bit: is64, rd: regs[0], rn: regs[1]))
 
         case "cset", "csetm":
-            guard ops.count == 2,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let cond = A64Cond.parse(ops[1]) else { return false }
-            emitInst(mnemonic == "cset" ? .cset(is64Bit: is64, rd: rd, cond: cond) : .csetm(is64Bit: is64, rd: rd, cond: cond), into: sec, loc: loc)
-            return true
+            guard ops.count == 2, let (rd, is64) = gpr(ops[0]), let cond = A64Cond.parse(ops[1]), cond != .al, cond != .nv else { return false }
+            return emit(mnemonic == "cset" ? .cset(is64Bit: is64, rd: rd, cond: cond) : .csetm(is64Bit: is64, rd: rd, cond: cond))
 
         case "csel", "csinc", "csinv", "csneg":
-            guard ops.count == 4,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let (rm, _, _) = A64GPR.parse(ops[2]),
-                  let cond = A64Cond.parse(ops[3]) else { return false }
-            let op: A64OpcodeId
-            switch mnemonic {
-            case "csel":  op = .csel
-            case "csinc": op = .csinc
-            case "csinv": op = .csinv
-            default:      op = .csneg
-            }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, cond: cond), into: sec, loc: loc)
-            return true
+            guard ops.count == 4, let (regs, is64) = sameWidthGPRs(ops.prefix(3)), let cond = A64Cond.parse(ops[3]) else { return false }
+            let op: [String: A64OpcodeId] = ["csel": .csel, "csinc": .csinc, "csinv": .csinv, "csneg": .csneg]
+            return emit(A64Instruction(opcode: op[mnemonic]!, is64Bit: is64, rd: regs[0], rn: regs[1], rm: regs[2], cond: cond))
 
         case "cinc", "cinv", "cneg":
-            guard ops.count == 3,
-                  let (rd, is64, _) = A64GPR.parse(ops[0]),
-                  let (rn, _, _) = A64GPR.parse(ops[1]),
-                  let cond = A64Cond.parse(ops[2]) else { return false }
+            guard ops.count == 3, let (regs, is64) = sameWidthGPRs(ops.prefix(2)), let cond = A64Cond.parse(ops[2]),
+                  cond != .al, cond != .nv else { return false }
             let op: A64OpcodeId = (mnemonic == "cinc") ? .csinc : ((mnemonic == "cinv") ? .csinv : .csneg)
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rn, cond: cond.inverted), into: sec, loc: loc)
-            return true
+            return emit(A64Instruction(opcode: op, is64Bit: is64, rd: regs[0], rn: regs[1], rm: regs[1], cond: cond.inverted))
 
-        case "ccmp":
-            guard ops.count == 4,
-                  let (rn, is64, _) = A64GPR.parse(ops[0]),
-                  let nzcv = parseImmediateValue(ops[2], session: session),
-                  let cond = A64Cond.parse(ops[3]) else { return false }
-            if let (rm, _, _) = A64GPR.parse(ops[1]) {
-                emitInst(A64Instruction(opcode: .ccmpReg, is64Bit: is64, rn: rn, rm: rm, cond: cond, imm2: UInt8(truncatingIfNeeded: nzcv)), into: sec, loc: loc)
-                return true
+        case "ccmp", "ccmn":
+            guard ops.count == 4, let (rn, is64) = gpr(ops[0]), let nzcv = imm(ops[2], 0...15), let cond = A64Cond.parse(ops[3]) else { return false }
+            let isCmp = mnemonic == "ccmp"
+            if let (rm, rmIs64) = gpr(ops[1]) {
+                guard rmIs64 == is64 else { return false }
+                return emit(A64Instruction(opcode: isCmp ? .ccmpReg : .ccmnReg, is64Bit: is64, rn: rn, rm: rm, cond: cond, imm2: UInt8(nzcv)))
             }
-            if let imm5 = parseImmediateValue(ops[1], session: session) {
-                emitInst(A64Instruction(opcode: .ccmpImm, is64Bit: is64, rn: rn, cond: cond, imm: imm5, imm2: UInt8(truncatingIfNeeded: nzcv)), into: sec, loc: loc)
-                return true
+            guard let imm5 = imm(ops[1], 0...31) else { return false }
+            return emit(A64Instruction(opcode: isCmp ? .ccmpImm : .ccmnImm, is64Bit: is64, rn: rn, cond: cond, imm: imm5, imm2: UInt8(nzcv)))
+
+        case "adc", "adcs", "sbc", "sbcs", "ngc", "ngcs":
+            // `ngc[s] Rd, Rm` is `sbc[s] Rd, zr, Rm`.
+            let negate = mnemonic.hasPrefix("ngc")
+            guard ops.count == (negate ? 2 : 3), let (regs, is64) = sameWidthGPRs(ops[...]) else { return false }
+            let op: [String: A64OpcodeId] = ["adc": .adc, "adcs": .adcs, "sbc": .sbc, "sbcs": .sbcs, "ngc": .sbc, "ngcs": .sbcs]
+            let rn = negate ? A64GPR.xzr : regs[1]
+            return emit(A64Instruction(opcode: op[mnemonic]!, is64Bit: is64, rd: regs[0], rn: rn, rm: regs[regs.count - 1]))
+
+        case "smaddl", "smsubl", "umaddl", "umsubl", "smull", "smnegl", "umull", "umnegl":
+            // `Xd, Wn, Wm, Xa`; the multiply-only aliases take Ra = xzr. Vector `smull`/`umull` are parsed as SIMD.
+            let accumulates = mnemonic.hasSuffix("addl") || mnemonic.hasSuffix("subl")
+            guard ops.count == (accumulates ? 4 : 3), case (let rd, true)? = gpr(ops[0]), case (let rn, false)? = gpr(ops[1]),
+                  case (let rm, false)? = gpr(ops[2]) else { return false }
+            var ra = A64GPR.xzr
+            if accumulates {
+                guard case (let r, true)? = gpr(ops[3]) else { return false }
+                ra = r
             }
-            return false
+            let op: [String: A64OpcodeId] = [
+                "smaddl": .smaddl, "smsubl": .smsubl, "umaddl": .umaddl, "umsubl": .umsubl,
+                "smull": .smaddl, "smnegl": .smsubl, "umull": .umaddl, "umnegl": .umsubl,
+            ]
+            return emit(A64Instruction(opcode: op[mnemonic]!, rd: rd, rn: rn, rm: rm, ra: ra))
+
+        case "crc32b", "crc32h", "crc32w", "crc32x", "crc32cb", "crc32ch", "crc32cw", "crc32cx":
+            guard ops.count == 3, case (let rd, false)? = gpr(ops[0]), case (let rn, false)? = gpr(ops[1]),
+                  let (rm, rmIs64) = gpr(ops[2]), rmIs64 == mnemonic.hasSuffix("x") else { return false }
+            let op: [String: A64OpcodeId] = [
+                "crc32b": .crc32b, "crc32h": .crc32h, "crc32w": .crc32w, "crc32x": .crc32x,
+                "crc32cb": .crc32cb, "crc32ch": .crc32ch, "crc32cw": .crc32cw, "crc32cx": .crc32cx,
+            ]
+            return emit(A64Instruction(opcode: op[mnemonic]!, rd: rd, rn: rn, rm: rm))
 
         default:
             return false
@@ -895,16 +791,62 @@ internal enum A64Asm {
     // MARK: - Loads and Stores
 
     private static func isLoadStoreMnemonic(_ m: String) -> Bool {
-        switch m {
-        case "ldr", "str", "ldrb", "strb", "ldrh", "strh", "ldrsb", "ldrsh", "ldrsw",
-             "ldur", "stur", "ldurb", "sturb", "ldurh", "sturh", "ldursb", "ldursh", "ldursw",
-             "ldtr", "sttr", "ldtrb", "sttrb", "ldtrh", "sttrh", "ldtrsb", "ldtrsh", "ldtrsw",
-             "ldp", "stp":
-            return true
-        default:
-            return exclusiveOps[m] != nil
-        }
+        gprLoadStores[m] != nil || exclusiveOps[m] != nil || ["ldp", "stp", "ldnp", "stnp", "prfm", "prfum", "rprfm"].contains(m)
     }
+
+    /// Register-width rules of the GPR load/store mnemonics.
+    private enum A64TransferWidth {
+        case wOrX   // ldr, str, ldur, ..., ldrsb, ldrsh
+        case w      // ldrb, strb, ldrh, strh and their unscaled/unprivileged forms
+        case x      // ldrsw, ldursw, ldtrsw
+    }
+
+    /// GPR load/store mnemonics: `(unsigned-offset, pre, post, register-offset, unscaled, unprivileged)` descriptors
+    /// for the X (or only) and W register forms, and the register width rule. Unscaled (`ldur`) and unprivileged
+    /// (`ldtr`) mnemonics have only their own form; `nil` marks an addressing mode the mnemonic does not have.
+    private struct A64GPRTransfer {
+        typealias Ops = (imm: A64OpcodeId?, pre: A64OpcodeId?, post: A64OpcodeId?, reg: A64OpcodeId?, unscaled: A64OpcodeId?, unpriv: A64OpcodeId?)
+        let x: Ops
+        let w: Ops
+        let width: A64TransferWidth
+        let scaleLog2: Int64?   // nil: 2 for W, 3 for X
+    }
+
+    private static let gprLoadStores: [String: A64GPRTransfer] = {
+        typealias T = A64GPRTransfer
+        func same(_ ops: T.Ops, _ width: A64TransferWidth, _ scale: Int64?) -> T { T(x: ops, w: ops, width: width, scaleLog2: scale) }
+        return [
+            "ldr":   same((.ldrImm, .ldrPre, .ldrPost, .ldrReg, .ldur, nil), .wOrX, nil),
+            "str":   same((.strImm, .strPre, .strPost, .strReg, .stur, nil), .wOrX, nil),
+            "ldrb":  same((.ldrbImm, .ldrbPre, .ldrbPost, .ldrbReg, .ldurb, nil), .w, 0),
+            "strb":  same((.strbImm, .strbPre, .strbPost, .strbReg, .sturb, nil), .w, 0),
+            "ldrh":  same((.ldrhImm, .ldrhPre, .ldrhPost, .ldrhReg, .ldurh, nil), .w, 1),
+            "strh":  same((.strhImm, .strhPre, .strhPost, .strhReg, .sturh, nil), .w, 1),
+            "ldrsb": T(x: (.ldrsbImm64, .ldrsbPre64, .ldrsbPost64, .ldrsbReg64, .ldursb64, nil),
+                       w: (.ldrsbImm32, .ldrsbPre32, .ldrsbPost32, .ldrsbReg32, .ldursb32, nil), width: .wOrX, scaleLog2: 0),
+            "ldrsh": T(x: (.ldrshImm64, .ldrshPre64, .ldrshPost64, .ldrshReg64, .ldursh64, nil),
+                       w: (.ldrshImm32, .ldrshPre32, .ldrshPost32, .ldrshReg32, .ldursh32, nil), width: .wOrX, scaleLog2: 1),
+            "ldrsw": same((.ldrswImm, .ldrswPre, .ldrswPost, .ldrswReg, .ldursw, nil), .x, 2),
+            "ldur":   same((nil, nil, nil, nil, .ldur, nil), .wOrX, nil),
+            "stur":   same((nil, nil, nil, nil, .stur, nil), .wOrX, nil),
+            "ldurb":  same((nil, nil, nil, nil, .ldurb, nil), .w, 0),
+            "sturb":  same((nil, nil, nil, nil, .sturb, nil), .w, 0),
+            "ldurh":  same((nil, nil, nil, nil, .ldurh, nil), .w, 1),
+            "sturh":  same((nil, nil, nil, nil, .sturh, nil), .w, 1),
+            "ldursb": T(x: (nil, nil, nil, nil, .ldursb64, nil), w: (nil, nil, nil, nil, .ldursb32, nil), width: .wOrX, scaleLog2: 0),
+            "ldursh": T(x: (nil, nil, nil, nil, .ldursh64, nil), w: (nil, nil, nil, nil, .ldursh32, nil), width: .wOrX, scaleLog2: 1),
+            "ldursw": same((nil, nil, nil, nil, .ldursw, nil), .x, 2),
+            "ldtr":   same((nil, nil, nil, nil, nil, .ldtr), .wOrX, nil),
+            "sttr":   same((nil, nil, nil, nil, nil, .sttr), .wOrX, nil),
+            "ldtrb":  same((nil, nil, nil, nil, nil, .ldtrb), .w, 0),
+            "sttrb":  same((nil, nil, nil, nil, nil, .sttrb), .w, 0),
+            "ldtrh":  same((nil, nil, nil, nil, nil, .ldtrh), .w, 1),
+            "sttrh":  same((nil, nil, nil, nil, nil, .sttrh), .w, 1),
+            "ldtrsb": T(x: (nil, nil, nil, nil, nil, .ldtrsb64), w: (nil, nil, nil, nil, nil, .ldtrsb32), width: .wOrX, scaleLog2: 0),
+            "ldtrsh": T(x: (nil, nil, nil, nil, nil, .ldtrsh64), w: (nil, nil, nil, nil, nil, .ldtrsh32), width: .wOrX, scaleLog2: 1),
+            "ldtrsw": same((nil, nil, nil, nil, nil, .ldtrsw), .x, 2),
+        ]
+    }()
 
     /// Exclusive and acquire/release mnemonics (one descriptor each).
     private static let exclusiveOps: [String: A64OpcodeId] = [
@@ -912,8 +854,11 @@ internal enum A64Asm {
         "ldarh": .ldarh, "stlrh": .stlrh, "ldxrb": .ldxrb, "ldxrh": .ldxrh, "ldaxrb": .ldaxrb, "ldaxrh": .ldaxrh,
         "stxr": .stxr, "stlxr": .stlxr, "stxrb": .stxrb, "stxrh": .stxrh, "stlxrb": .stlxrb, "stlxrh": .stlxrh,
         "ldxp": .ldxp, "ldaxp": .ldaxp, "stxp": .stxp, "stlxp": .stlxp,
+        "ldapr": .ldapr, "ldaprb": .ldaprb, "ldaprh": .ldaprh,
     ]
 
+    /// Parses a load/store. An invalid form (a W or zr base, a register of the wrong width or class, an addressing
+    /// mode the mnemonic does not have) emits nothing, which `parseInstruction` reports.
     private static func parseLoadStore(
         mnemonic: String,
         ops: [String],
@@ -922,72 +867,87 @@ internal enum A64Asm {
         diagnostics: inout DiagnosticBag
     ) {
         let sec = session.currentSection
+        func emit(_ inst: A64Instruction) { emitInst(inst, into: sec, loc: loc) }
+        guard ops.count >= 2 else { return }
 
-        // 1. SVE `ldr`/`str` `zN` or `pN`, `[xBase, #simm9, mul vl]`
-        if (mnemonic == "ldr" || mnemonic == "str") && ops.count >= 2 {
+        // 1. SVE `ldr`/`str` `zN` or `pN`, `[Xn|SP{, #simm9, mul vl}]`
+        if mnemonic == "ldr" || mnemonic == "str" {
             let isLoad = (mnemonic == "ldr")
             if let zd = A64ZReg.parse(Substring(ops[0])) {
-                let (baseReg, immVal) = parseSVEMemOperand(ops: Array(ops.dropFirst()), session: session)
-                emitInst(A64Instruction(opcode: isLoad ? .sveLdrZ : .sveStrZ, rn: baseReg, zd: zd, imm: immVal), into: sec, loc: loc)
+                if let (baseReg, immVal) = parseSVEMemOperand(ops: Array(ops.dropFirst()), session: session) {
+                    emit(A64Instruction(opcode: isLoad ? .sveLdrZ : .sveStrZ, rn: baseReg, zd: zd, imm: immVal))
+                }
                 return
             }
-            if let pd = A64PReg.parse(Substring(ops[0])) {
-                let (baseReg, immVal) = parseSVEMemOperand(ops: Array(ops.dropFirst()), session: session)
-                emitInst(A64Instruction(opcode: isLoad ? .sveLdrP : .sveStrP, rn: baseReg, pd: pd, imm: immVal), into: sec, loc: loc)
+            if !ops[0].lowercased().hasSuffix(".b"), let pd = A64PReg.parse(Substring(ops[0])) {
+                if let (baseReg, immVal) = parseSVEMemOperand(ops: Array(ops.dropFirst()), session: session) {
+                    emit(A64Instruction(opcode: isLoad ? .sveLdrP : .sveStrP, rn: baseReg, pd: pd, imm: immVal))
+                }
                 return
             }
         }
 
-        // 2. Pair loads/stores (`ldp`, `stp`) of W/X or S/D/Q registers
-        if (mnemonic == "ldp" || mnemonic == "stp") && ops.count >= 3 {
-            let isLoad = (mnemonic == "ldp")
-            let memMode = parseMemAddressing(ops: Array(ops.dropFirst(2)), session: session)
-            if let (v1, sw1, _) = A64VReg.parse(ops[0]), let w = sw1,
-               let (v2, sw2, _) = A64VReg.parse(ops[1]), sw2 == w {
+        // 2. Pair loads/stores (`ldp`, `stp`, non-temporal `ldnp`, `stnp`) of W/X or S/D/Q registers
+        if ["ldp", "stp", "ldnp", "stnp"].contains(mnemonic) {
+            let isLoad = mnemonic.hasPrefix("ld")
+            let nonTemporal = mnemonic.hasSuffix("np")
+            guard ops.count >= 3, let mem = parseMemAddressing(ops: Array(ops.dropFirst(2)), session: session),
+                  mem.indexReg == nil, mem.symbolReloc == nil else { return }
+            // `ldnp`/`stnp` have only the signed-offset form.
+            if nonTemporal && mem.indexing != .signed { return }
+            if let (v1, sw1, _) = A64VReg.parse(ops[0]), let w = sw1, let (v2, sw2, _) = A64VReg.parse(ops[1]), sw2 == w {
                 let op: A64OpcodeId
-                switch memMode.indexing {
+                switch mem.indexing {
                 case .pre:    op = isLoad ? .ldpFpPre : .stpFpPre
                 case .post:   op = isLoad ? .ldpFpPost : .stpFpPost
-                case .signed: op = isLoad ? .ldpFpSigned : .stpFpSigned
+                case .signed: op = nonTemporal ? (isLoad ? .ldnpFp : .stnpFp) : (isLoad ? .ldpFpSigned : .stpFpSigned)
                 }
-                emitInst(A64Instruction(opcode: op, rn: memMode.base, vd: v1, vn: v2, scalarWidth: w, imm: memMode.offset), into: sec, loc: loc)
-                return
-            }
-            if let (r1, is64, _) = A64GPR.parse(ops[0]),
-               let (r2, _, _) = A64GPR.parse(ops[1]) {
+                emit(A64Instruction(opcode: op, rn: mem.base, vd: v1, vn: v2, scalarWidth: w, imm: mem.offset))
+            } else if let (regs, is64) = sameWidthGPRs(ops.prefix(2)) {
                 let op: A64OpcodeId
-                switch memMode.indexing {
+                switch mem.indexing {
                 case .pre:    op = isLoad ? .ldpPre : .stpPre
                 case .post:   op = isLoad ? .ldpPost : .stpPost
-                case .signed: op = isLoad ? .ldpSigned : .stpSigned
+                case .signed: op = nonTemporal ? (isLoad ? .ldnp : .stnp) : (isLoad ? .ldpSigned : .stpSigned)
                 }
-                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: r1, rn: memMode.base, rm: r2, imm: memMode.offset), into: sec, loc: loc)
-                return
+                emit(A64Instruction(opcode: op, is64Bit: is64, rd: regs[0], rn: mem.base, rm: regs[1], imm: mem.offset))
             }
-        }
-
-        // 3. Atomics / exclusives: `[Ws,] Rt [, Rt2], [Xn]`
-        if let op = exclusiveOps[mnemonic] {
-            let format = A64InstructionTable.descriptor(for: op).format
-            let hasStatus = format == .atomicStoreExcl || format == .atomicStoreExclPair
-            let hasPair = format == .atomicLoadPair || format == .atomicStoreExclPair
-            let regCount = 1 + (hasStatus ? 1 : 0) + (hasPair ? 1 : 0)
-            guard ops.count == regCount + 1 else { return }
-            let regs = ops.prefix(regCount).compactMap { A64GPR.parse($0) }
-            guard regs.count == regCount else { return }
-            let status = hasStatus ? regs[0].reg : .x0
-            let rt = regs[hasStatus ? 1 : 0]
-            let rt2 = hasPair ? regs[regCount - 1].reg : .x0
-            let mem = parseMemAddressing(ops: [ops[regCount]], session: session)
-            emitInst(A64Instruction(opcode: op, is64Bit: rt.is64Bit, rd: rt.reg, rn: mem.base, rm: status, ra: rt2), into: sec, loc: loc)
             return
         }
 
-        // 4. Literal pool load `ldr xN, =expr` or PC-relative literal `ldr Rt, label` / `ldrsw Xt, label`
-        if (mnemonic == "ldr" || mnemonic == "ldrsw") && ops.count == 2, !ops[1].trimmingCharacters(in: .whitespaces).hasPrefix("[") {
-            let rhs = ops[1].trimmingCharacters(in: .whitespaces)
+        // Prefetch (`prfm <op>, [addr]` / `prfm <op>, label`, `prfum <op>, [Xn, #simm9]`, `rprfm <op>, Xm, [Xn]`)
+        if mnemonic == "prfm" || mnemonic == "prfum" || mnemonic == "rprfm" {
+            parsePrefetch(mnemonic: mnemonic, ops: ops, loc: loc, session: session)
+            return
+        }
+
+        // 3. Atomics / exclusives: `[Ws,] Rt [, Rt2], [Xn|SP{, #0}]`
+        if let op = exclusiveOps[mnemonic] {
+            let desc = A64InstructionTable.descriptor(for: op)
+            let hasStatus = desc.format == .atomicStoreExcl || desc.format == .atomicStoreExclPair
+            let hasPair = desc.format == .atomicLoadPair || desc.format == .atomicStoreExclPair
+            let regCount = 1 + (hasStatus ? 1 : 0) + (hasPair ? 1 : 0)
+            guard ops.count == regCount + 1 else { return }
+            var status = A64GPR.x0
+            if hasStatus {
+                guard case (let s, false)? = gpr(ops[0]) else { return }
+                status = s
+            }
+            // The transfer registers share a width; byte/halfword forms (a fixed `size`) take W registers only.
+            guard let (regs, is64) = sameWidthGPRs(ops[(hasStatus ? 1 : 0)..<regCount]) else { return }
+            if is64 && desc.opcodeMask & (1 << 30) != 0 { return }
+            guard let mem = parseMemAddressing(ops: [ops[regCount]], session: session), mem.indexing == .signed,
+                  mem.indexReg == nil, mem.symbolReloc == nil, mem.offset == 0 else { return }
+            emit(A64Instruction(opcode: op, is64Bit: is64, rd: regs[0], rn: mem.base, rm: status, ra: hasPair ? regs[1] : .x0))
+            return
+        }
+
+        // 4. Literal pool load `ldr Rt, =expr` or PC-relative literal `ldr Rt, label` / `ldrsw Xt, label`
+        let rhs = ops[1].trimmingCharacters(in: .whitespaces)
+        if (mnemonic == "ldr" || mnemonic == "ldrsw") && ops.count == 2 && !rhs.hasPrefix("[") {
             let base: A64Instruction
-            if let (rt, is64, _) = A64GPR.parse(ops[0]) {
+            if let (rt, is64) = gpr(ops[0]) {
+                if mnemonic == "ldrsw" && !is64 { return }
                 base = A64Instruction(opcode: mnemonic == "ldrsw" ? .ldrswLit : .ldrLit, is64Bit: is64, rd: rt, imm: 0)
             } else if mnemonic == "ldr", let (vt, sw, _) = A64VReg.parse(ops[0]), let w = sw, !rhs.hasPrefix("=") {
                 base = A64Instruction(opcode: .ldrFpLit, vd: vt, scalarWidth: w, imm: 0)
@@ -1000,14 +960,8 @@ internal enum A64Asm {
                 let poolLabel = ".Lpool_\(session.literalPoolCounter)"
                 sec.literalPool.append((label: poolLabel, expr: poolExpr))
                 if let bytes = A64Encoder.encodeBytes(base) {
-                    let fixup = AsmInstFixup(
-                        offsetInInst: 0,
-                        kind: .aarch64_ld_prel_lo19,
-                        symbol: poolLabel,
-                        addend: 0,
-                        width: 4,
-                        resolveIfSameSection: true
-                    )
+                    let fixup = AsmInstFixup(offsetInInst: 0, kind: .aarch64_ld_prel_lo19, symbol: poolLabel, addend: 0, width: 4,
+                                             resolveIfSameSection: true)
                     sec.emitBytes(bytes, fixups: [fixup], loc: loc)
                 }
                 return
@@ -1017,17 +971,11 @@ internal enum A64Asm {
                 // `ldr Rt, #disp` -- PC-relative literal with an explicit byte displacement
                 var inst = base
                 inst.imm = disp
-                emitInst(inst, into: sec, loc: loc)
-            case .symbolOffset(let sym, let addend, _):
+                emit(inst)
+            case .symbolOffset(let sym, let addend, .none):
                 if let bytes = A64Encoder.encodeBytes(base) {
-                    let fixup = AsmInstFixup(
-                        offsetInInst: 0,
-                        kind: .aarch64_ld_prel_lo19,
-                        symbol: sym,
-                        addend: addend,
-                        width: 4,
-                        resolveIfSameSection: true
-                    )
+                    let fixup = AsmInstFixup(offsetInInst: 0, kind: .aarch64_ld_prel_lo19, symbol: sym, addend: addend, width: 4,
+                                             resolveIfSameSection: true)
                     sec.emitBytes(bytes, fixups: [fixup], loc: loc)
                 }
             default:
@@ -1036,21 +984,22 @@ internal enum A64Asm {
             return
         }
 
+        guard let mem = parseMemAddressing(ops: Array(ops.dropFirst()), session: session) else { return }
+
         // 5. SIMD/FP register loads/stores (`bN`/`hN`/`sN`/`dN`/`qN`) in every addressing mode
-        if ops.count >= 2, ["ldr", "str", "ldur", "stur"].contains(mnemonic),
-           let (vt, someWidth, _) = A64VReg.parse(ops[0]), let w = someWidth {
+        if ["ldr", "str", "ldur", "stur"].contains(mnemonic), let (vt, someWidth, _) = A64VReg.parse(ops[0]) {
+            guard let w = someWidth else { return }
             let isLoad = mnemonic.hasPrefix("ld")
-            let mem = parseMemAddressing(ops: Array(ops.dropFirst()), session: session)
-            let inst: A64Instruction
             if mnemonic == "ldur" || mnemonic == "stur" {
-                inst = A64Instruction(opcode: isLoad ? .ldurFp : .sturFp, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset)
+                guard mem.indexing == .signed, mem.indexReg == nil, mem.symbolReloc == nil else { return }
+                emit(A64Instruction(opcode: isLoad ? .ldurFp : .sturFp, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset))
             } else if let indexReg = mem.indexReg {
-                inst = A64Instruction(opcode: isLoad ? .ldrFpReg : .strFpReg, rn: mem.base, rm: indexReg, vd: vt, scalarWidth: w,
-                                      extendKind: mem.extendKind, amount: mem.shiftAmount, imm2: mem.shiftPresent ? 1 : 0)
+                emit(A64Instruction(opcode: isLoad ? .ldrFpReg : .strFpReg, rn: mem.base, rm: indexReg, vd: vt, scalarWidth: w,
+                                    extendKind: mem.extendKind, amount: mem.shiftAmount, imm2: mem.shiftPresent ? 1 : 0))
             } else if mem.indexing == .pre {
-                inst = A64Instruction(opcode: isLoad ? .ldrFpPre : .strFpPre, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset)
+                emit(A64Instruction(opcode: isLoad ? .ldrFpPre : .strFpPre, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset))
             } else if mem.indexing == .post {
-                inst = A64Instruction(opcode: isLoad ? .ldrFpPost : .strFpPost, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset)
+                emit(A64Instruction(opcode: isLoad ? .ldrFpPost : .strFpPost, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset))
             } else {
                 let unsignedOps: [A64ScalarWidth: (load: A64OpcodeId, store: A64OpcodeId)] = [
                     .b: (.ldrFpImmB, .strFpImmB), .h: (.ldrFpImmH, .strFpImmH), .s: (.ldrFpImmS, .strFpImmS),
@@ -1059,7 +1008,8 @@ internal enum A64Asm {
                 let pair = unsignedOps[w]!
                 let scaled = A64Instruction(opcode: isLoad ? pair.load : pair.store, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset)
                 if let symReloc = mem.symbolReloc {
-                    guard let bytes = A64Encoder.encodeBytes(A64Instruction(opcode: scaled.opcode, rn: mem.base, vd: vt, scalarWidth: w)) else { return }
+                    guard symReloc.modifier == .none || symReloc.modifier == .a64Lo12,
+                          let bytes = A64Encoder.encodeBytes(A64Instruction(opcode: scaled.opcode, rn: mem.base, vd: vt, scalarWidth: w)) else { return }
                     let kinds: [RelocKind] = [.aarch64_ldst8_abs_lo12_nc, .aarch64_ldst16_abs_lo12_nc, .aarch64_ldst32_abs_lo12_nc,
                                               .aarch64_ldst64_abs_lo12_nc, .aarch64_ldst128_abs_lo12_nc]
                     let fixup = AsmInstFixup(offsetInInst: 0, kind: kinds[Int(w.rawValue)], symbol: symReloc.symbol, addend: symReloc.addend)
@@ -1067,161 +1017,134 @@ internal enum A64Asm {
                     return
                 }
                 // A negative or unaligned offset falls back to the unscaled `ldur`/`stur` form.
-                inst = A64Encoder.encode(scaled) != nil
-                    ? scaled
-                    : A64Instruction(opcode: isLoad ? .ldurFp : .sturFp, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset)
+                emit(A64Encoder.encode(scaled) != nil
+                     ? scaled
+                     : A64Instruction(opcode: isLoad ? .ldurFp : .sturFp, rn: mem.base, vd: vt, scalarWidth: w, imm: mem.offset))
             }
-            emitInst(inst, into: sec, loc: loc)
             return
         }
 
-        // 6. Standard GPR loads/stores
-        guard ops.count >= 2, let (rt, is64, _) = A64GPR.parse(ops[0]) else {
-            diagnostics.report(.asmInvalidInstruction, at: loc, args: [mnemonic])
+        // 6. GPR loads/stores
+        guard let transfer = gprLoadStores[mnemonic], let (rt, is64) = gpr(ops[0]) else { return }
+        switch transfer.width {
+        case .w: if is64 { return }
+        case .x: if !is64 { return }
+        case .wOrX: break
+        }
+        let forms = is64 ? transfer.x : transfer.w
+        let scaleLog2 = transfer.scaleLog2 ?? (is64 ? 3 : 2)
+
+        if let unpriv = forms.unpriv {
+            guard mem.indexing == .signed, mem.indexReg == nil, mem.symbolReloc == nil else { return }
+            emit(A64Instruction(opcode: unpriv, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset))
             return
         }
-        let mem = parseMemAddressing(ops: Array(ops.dropFirst()), session: session)
+        if forms.imm == nil, let unscaled = forms.unscaled {
+            guard mem.indexing == .signed, mem.indexReg == nil, mem.symbolReloc == nil else { return }
+            emit(A64Instruction(opcode: unscaled, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset))
+            return
+        }
+        guard let opImm = forms.imm, let opPre = forms.pre, let opPost = forms.post, let opReg = forms.reg,
+              let opUnscaled = forms.unscaled else { return }
 
         // Register-offset addressing `[Xn, Rm {, extend #shift}]`
         if let indexReg = mem.indexReg {
-            let op: A64OpcodeId
-            switch mnemonic {
-            case "ldr":   op = .ldrReg
-            case "str":   op = .strReg
-            case "ldrb":  op = .ldrbReg
-            case "strb":  op = .strbReg
-            case "ldrh":  op = .ldrhReg
-            case "strh":  op = .strhReg
-            case "ldrsb": op = is64 ? .ldrsbReg64 : .ldrsbReg32
-            case "ldrsh": op = is64 ? .ldrshReg64 : .ldrshReg32
-            default:      op = .ldrswReg
-            }
-            emitInst(
-                A64Instruction(
-                    opcode: op,
-                    is64Bit: is64,
-                    rd: rt,
-                    rn: mem.base,
-                    rm: indexReg,
-                    extendKind: mem.extendKind,
-                    amount: mem.shiftAmount,
-                    imm2: mem.shiftPresent ? 1 : 0
-                ),
-                into: sec,
-                loc: loc
-            )
+            emit(A64Instruction(opcode: opReg, is64Bit: is64, rd: rt, rn: mem.base, rm: indexReg, extendKind: mem.extendKind,
+                                amount: mem.shiftAmount, imm2: mem.shiftPresent ? 1 : 0))
             return
         }
-
-        // Pre-indexed / Post-indexed
-        if mem.indexing == .pre || mem.indexing == .post {
-            let isPre = (mem.indexing == .pre)
-            let op: A64OpcodeId
-            switch (mnemonic, isPre) {
-            case ("ldr", true):    op = .ldrPre
-            case ("ldr", false):   op = .ldrPost
-            case ("str", true):    op = .strPre
-            case ("str", false):   op = .strPost
-            case ("ldrb", true):   op = .ldrbPre
-            case ("ldrb", false):  op = .ldrbPost
-            case ("strb", true):   op = .strbPre
-            case ("strb", false):  op = .strbPost
-            case ("ldrh", true):   op = .ldrhPre
-            case ("ldrh", false):  op = .ldrhPost
-            case ("strh", true):   op = .strhPre
-            case ("strh", false):  op = .strhPost
-            case ("ldrsb", true):  op = is64 ? .ldrsbPre64 : .ldrsbPre32
-            case ("ldrsb", false): op = is64 ? .ldrsbPost64 : .ldrsbPost32
-            case ("ldrsh", true):  op = is64 ? .ldrshPre64 : .ldrshPre32
-            case ("ldrsh", false): op = is64 ? .ldrshPost64 : .ldrshPost32
-            case ("ldrsw", true):  op = .ldrswPre
-            default:               op = .ldrswPost
-            }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, loc: loc)
+        // Pre-indexed / post-indexed
+        if mem.indexing != .signed {
+            emit(A64Instruction(opcode: mem.indexing == .pre ? opPre : opPost, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset))
             return
         }
-
-        // Unscaled (`ldur`/`stur`) or Unprivileged (`ldtr`/`sttr`)
-        if mnemonic.hasPrefix("ldur") || mnemonic.hasPrefix("stur") || mnemonic.hasPrefix("ldtr") || mnemonic.hasPrefix("sttr") {
-            let op: A64OpcodeId
-            switch mnemonic {
-            case "ldur":   op = .ldur
-            case "stur":   op = .stur
-            case "ldurb":  op = .ldurb
-            case "sturb":  op = .sturb
-            case "ldurh":  op = .ldurh
-            case "sturh":  op = .sturh
-            case "ldursb": op = is64 ? .ldursb64 : .ldursb32
-            case "ldursh": op = is64 ? .ldursh64 : .ldursh32
-            case "ldursw": op = .ldursw
-            case "ldtr":   op = .ldtr
-            case "sttr":   op = .sttr
-            case "ldtrb":  op = .ldtrb
-            case "sttrb":  op = .sttrb
-            case "ldtrh":  op = .ldtrh
-            case "sttrh":  op = .sttrh
-            case "ldtrsb": op = is64 ? .ldtrsb64 : .ldtrsb32
-            case "ldtrsh": op = is64 ? .ldtrsh64 : .ldtrsh32
-            default:       op = .ldtrsw
-            }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, loc: loc)
-            return
-        }
-
-        // Unsigned immediate (or auto-fallback to `ldur`/`stur` if negative/unaligned offset!)
-        let opImm: A64OpcodeId
-        let scaleLog2: Int
-        switch mnemonic {
-        case "ldr":   opImm = .ldrImm;  scaleLog2 = is64 ? 3 : 2
-        case "str":   opImm = .strImm;  scaleLog2 = is64 ? 3 : 2
-        case "ldrb":  opImm = .ldrbImm; scaleLog2 = 0
-        case "strb":  opImm = .strbImm; scaleLog2 = 0
-        case "ldrh":  opImm = .ldrhImm; scaleLog2 = 1
-        case "strh":  opImm = .strhImm; scaleLog2 = 1
-        case "ldrsb": opImm = is64 ? .ldrsbImm64 : .ldrsbImm32; scaleLog2 = 0
-        case "ldrsh": opImm = is64 ? .ldrshImm64 : .ldrshImm32; scaleLog2 = 1
-        default:      opImm = .ldrswImm; scaleLog2 = 2
-        }
-
         if let symReloc = mem.symbolReloc {
-            let base = A64Instruction(opcode: opImm, is64Bit: is64, rd: rt, rn: mem.base, imm: 0)
-            if let bytes = A64Encoder.encodeBytes(base) {
+            if let bytes = A64Encoder.encodeBytes(A64Instruction(opcode: opImm, is64Bit: is64, rd: rt, rn: mem.base, imm: 0)) {
                 let rKind: RelocKind
-                if symReloc.modifier == .a64GotLo12 {
-                    rKind = .aarch64_ld64_got_lo12_nc
-                } else {
-                    switch scaleLog2 {
-                    case 0:  rKind = .aarch64_ldst8_abs_lo12_nc
-                    case 1:  rKind = .aarch64_ldst16_abs_lo12_nc
-                    case 2:  rKind = .aarch64_ldst32_abs_lo12_nc
-                    default: rKind = .aarch64_ldst64_abs_lo12_nc
-                    }
+                switch (symReloc.modifier, scaleLog2) {
+                case (.a64GotLo12, _): rKind = .aarch64_ld64_got_lo12_nc
+                case (_, 0):           rKind = .aarch64_ldst8_abs_lo12_nc
+                case (_, 1):           rKind = .aarch64_ldst16_abs_lo12_nc
+                case (_, 2):           rKind = .aarch64_ldst32_abs_lo12_nc
+                default:               rKind = .aarch64_ldst64_abs_lo12_nc
                 }
                 sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: symReloc.symbol, addend: symReloc.addend)], loc: loc)
             }
             return
         }
-
+        // Unsigned scaled offset, or the unscaled `ldur`/`stur` form for a negative or unaligned one (as LLVM does).
         let candidate = A64Instruction(opcode: opImm, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset)
-        if let bytes = A64Encoder.encodeBytes(candidate) {
-            sec.emitBytes(bytes, loc: loc)
+        emit(A64Encoder.encode(candidate) != nil ? candidate : A64Instruction(opcode: opUnscaled, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset))
+    }
+
+    /// `prfm`/`prfum`: the operation is a name (`pldl1keep`) or `#imm5`; `prfm` takes every addressing mode of a
+    /// 64-bit `ldr` (an offset the scaled form cannot encode selects `prfum`, as in LLVM) and a literal label.
+    private static func parsePrefetch(mnemonic: String, ops: [String], loc: AsmLoc, session: AsmSession) {
+        let sec = session.currentSection
+        guard ops.count >= 2 else { return }
+        let opText = ops[0].trimmingCharacters(in: .whitespaces)
+        if mnemonic == "rprfm" {
+            // `rprfm <op>, Xm, [Xn]` is a register-offset `prfm` (A64PrefetchOp.rangeFields).
+            let rangeOp: UInt8
+            if let named = A64PrefetchOp.parseRange(Substring(opText)) {
+                rangeOp = named
+            } else if opText.hasPrefix("#"), let v = parseImmediateValue(opText, session: session), (0...63).contains(v) {
+                rangeOp = UInt8(v)
+            } else {
+                return
+            }
+            guard ops.count == 3, case (let rm, true)? = gpr(ops[1]), let fields = A64PrefetchOp.rangeFields(rangeOp),
+                  let mem = parseMemAddressing(ops: [ops[2]], session: session), mem.indexing == .signed, mem.indexReg == nil,
+                  mem.symbolReloc == nil, mem.offset == 0 else { return }
+            emitInst(A64Instruction(opcode: .prfmReg, rd: fields.rt, rn: mem.base, rm: rm, extendKind: fields.extend,
+                                    amount: fields.shifted ? 3 : 0), into: sec, loc: loc)
             return
         }
-
-        // Fallback to unscaled `ldur`/`stur` if `mem.offset` is negative or unaligned in -256...255
-        let unscaledOp: A64OpcodeId
-        switch mnemonic {
-        case "ldr":   unscaledOp = .ldur
-        case "str":   unscaledOp = .stur
-        case "ldrb":  unscaledOp = .ldurb
-        case "strb":  unscaledOp = .sturb
-        case "ldrh":  unscaledOp = .ldurh
-        case "strh":  unscaledOp = .sturh
-        case "ldrsb": unscaledOp = is64 ? .ldursb64 : .ldursb32
-        case "ldrsh": unscaledOp = is64 ? .ldursh64 : .ldursh32
-        default:      unscaledOp = .ldursw
+        let prfop: UInt8
+        if let named = A64PrefetchOp.parse(Substring(opText)) {
+            prfop = named
+        } else if opText.hasPrefix("#"), let v = parseImmediateValue(opText, session: session), (0...31).contains(v) {
+            prfop = UInt8(v)
+        } else {
+            return
         }
-        emitInst(A64Instruction(opcode: unscaledOp, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, loc: loc)
+        let rt = A64GPR(rawValue: prfop)
+        let rhs = ops[1].trimmingCharacters(in: .whitespaces)
+        if !rhs.hasPrefix("[") {
+            guard mnemonic == "prfm", ops.count == 2 else { return }
+            let base = A64Instruction(opcode: .prfmLit, rd: rt)
+            switch evalExpr(rhs, session: session) {
+            case .constant(let disp):
+                var inst = base
+                inst.imm = disp
+                emitInst(inst, into: sec, loc: loc)
+            case .symbolOffset(let sym, let addend, .none):
+                guard let bytes = A64Encoder.encodeBytes(base) else { return }
+                let fixup = AsmInstFixup(offsetInInst: 0, kind: .aarch64_ld_prel_lo19, symbol: sym, addend: addend, width: 4,
+                                         resolveIfSameSection: true)
+                sec.emitBytes(bytes, fixups: [fixup], loc: loc)
+            default:
+                break
+            }
+            return
+        }
+        guard let mem = parseMemAddressing(ops: Array(ops.dropFirst()), session: session), mem.indexing == .signed else { return }
+        if mnemonic == "prfum" {
+            guard mem.indexReg == nil, mem.symbolReloc == nil else { return }
+            emitInst(A64Instruction(opcode: .prfum, rd: rt, rn: mem.base, imm: mem.offset), into: sec, loc: loc)
+        } else if let indexReg = mem.indexReg {
+            emitInst(A64Instruction(opcode: .prfmReg, rd: rt, rn: mem.base, rm: indexReg, extendKind: mem.extendKind,
+                                    amount: mem.shiftAmount), into: sec, loc: loc)
+        } else if let symReloc = mem.symbolReloc {
+            guard symReloc.modifier == .none || symReloc.modifier == .a64Lo12,
+                  let bytes = A64Encoder.encodeBytes(A64Instruction(opcode: .prfmImm, rd: rt, rn: mem.base)) else { return }
+            let fixup = AsmInstFixup(offsetInInst: 0, kind: .aarch64_ldst64_abs_lo12_nc, symbol: symReloc.symbol, addend: symReloc.addend)
+            sec.emitBytes(bytes, fixups: [fixup], loc: loc)
+        } else {
+            let scaled = A64Instruction(opcode: .prfmImm, rd: rt, rn: mem.base, imm: mem.offset)
+            emitInst(A64Encoder.encode(scaled) != nil ? scaled : A64Instruction(opcode: .prfum, rd: rt, rn: mem.base, imm: mem.offset),
+                     into: sec, loc: loc)
+        }
     }
 
     private enum A64MemIndexing {
@@ -1242,72 +1165,85 @@ internal enum A64Asm {
         var symbolReloc: (symbol: String, addend: Int64, modifier: AsmRelocModifier)? = nil
     }
 
-    private static func parseMemAddressing(ops: [String], session: AsmSession) -> A64ParsedMem {
+    /// Parses `[Xn|SP]`, `[Xn|SP, #imm]`, `[Xn|SP, #imm]!`, `[Xn|SP], #imm`, `[Xn|SP, :lo12:sym]` and
+    /// `[Xn|SP, Rm{, extend {#amount}}]` (a W index with `uxtw`/`sxtw`, an X index alone or with `lsl`/`sxtx`).
+    /// Nil for anything else: a W or zr base, a missing or mismatched index extend, a register post-index,
+    /// trailing operands.
+    private static func parseMemAddressing(ops: [String], session: AsmSession) -> A64ParsedMem? {
         var result = A64ParsedMem()
-        guard let first = ops.first?.trimmingCharacters(in: .whitespaces) else { return result }
-
-        // Post-indexed `[Xn], #imm`
-        if first.hasPrefix("[") && first.hasSuffix("]") && ops.count >= 2 {
-            let baseName = String(first.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
-            if let (bReg, _, _) = A64GPR.parse(baseName) {
-                result.base = bReg
-                result.indexing = .post
-                result.offset = parseImmediateValue(ops[1], session: session) ?? 0
-                return result
-            }
+        guard let first = ops.first?.trimmingCharacters(in: .whitespaces), ops.count <= 2 else { return nil }
+        func baseRegister(_ text: String) -> A64GPR? {
+            guard let (reg, is64, isSP) = A64GPR.parse(text.trimmingCharacters(in: .whitespaces)), is64, isSP || reg.rawValue != 31 else { return nil }
+            return reg
         }
 
-        // `[Xn ...]` or `[Xn ...] !`
+        // Post-indexed `[Xn], #imm`
+        if ops.count == 2 {
+            guard first.hasPrefix("["), first.hasSuffix("]"), let base = baseRegister(String(first.dropFirst().dropLast())),
+                  let offset = parseImmediateValue(ops[1], session: session) else { return nil }
+            result.base = base
+            result.indexing = .post
+            result.offset = offset
+            return result
+        }
+
+        // `[Xn ...]` or `[Xn ...]!`
         var raw = first
         if raw.hasSuffix("!") {
             result.indexing = .pre
             raw = String(raw.dropLast()).trimmingCharacters(in: .whitespaces)
         }
-        if raw.hasPrefix("[") && raw.hasSuffix("]") {
-            raw = String(raw.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
-        }
+        guard raw.hasPrefix("[") && raw.hasSuffix("]") else { return nil }
+        raw = String(raw.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
         let innerParts = splitCommaSeparated(raw)
-        if let basePart = innerParts.first, let (bReg, _, _) = A64GPR.parse(basePart) {
-            result.base = bReg
-        }
-        guard innerParts.count >= 2 else { return result }
+        guard let basePart = innerParts.first, let base = baseRegister(basePart), innerParts.count <= 3 else { return nil }
+        result.base = base
+        guard innerParts.count >= 2 else { return result.indexing == .pre ? nil : result }
 
-        // Check if 2nd part is an index register `[Xn, Rm {, extend #shift}]`
-        if let (rm, rmIs64, _) = A64GPR.parse(innerParts[1]) {
+        // Index register `[Xn, Rm {, extend #shift}]`
+        if let (rm, rmIs64, rmIsSP) = A64GPR.parse(innerParts[1]) {
+            guard !rmIsSP, result.indexing == .signed else { return nil }
             result.indexReg = rm
             result.extendKind = rmIs64 ? .uxtx : .uxtw
-            if innerParts.count >= 3 {
-                let (ext, amt) = parseOptionalExtend(innerParts, startIndex: 2, is64Bit: rmIs64, session: session)
-                result.extendKind = ext
-                result.shiftAmount = amt
-                result.shiftPresent = !splitFirstWord(innerParts[2]).1.isEmpty
+            if innerParts.count == 3 {
+                guard let (ext, amount, written) = extendOperand(innerParts[2], session: session), amount <= 4 else { return nil }
+                let kind = ext ?? .uxtx
+                // A W index is extended (`uxtw`/`sxtw`); an X index is shifted (`lsl`) or `sxtx`.
+                guard rmIs64 ? (kind == .uxtx || kind == .sxtx) && !(ext == .uxtx) : (kind == .uxtw || kind == .sxtw) else { return nil }
+                result.extendKind = kind
+                result.shiftAmount = UInt8(amount)
+                result.shiftPresent = written
+            } else if !rmIs64 {
+                return nil
             }
             return result
         }
 
-        // Otherwise evaluate immediate or `:lo12:sym`
-        if let exprVal = evalExpr(innerParts[1], session: session) {
-            switch exprVal {
-            case .constant(let v):
-                result.offset = v
-            case .symbolOffset(let sym, let addend, let mod):
-                result.symbolReloc = (sym, addend, mod)
-            default:
-                break
-            }
+        // Otherwise an immediate or `:lo12:sym`
+        guard innerParts.count == 2 else { return nil }
+        switch evalExpr(innerParts[1], session: session) {
+        case .constant(let v):
+            result.offset = v
+        case .symbolOffset(let sym, let addend, let mod) where result.indexing == .signed:
+            result.symbolReloc = (sym, addend, mod)
+        default:
+            return nil
         }
         return result
     }
 
-    private static func parseSVEMemOperand(ops: [String], session: AsmSession) -> (A64GPR, Int64) {
-        guard var raw = ops.first?.trimmingCharacters(in: .whitespaces) else { return (.x0, 0) }
-        if raw.hasPrefix("[") && raw.hasSuffix("]") {
-            raw = String(raw.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
-        }
+    /// `[Xn|SP]` or `[Xn|SP, #simm9, mul vl]` of SVE `ldr`/`str`, as `(base, imm)`.
+    private static func parseSVEMemOperand(ops: [String], session: AsmSession) -> (A64GPR, Int64)? {
+        guard ops.count == 1 else { return nil }
+        var raw = ops[0].trimmingCharacters(in: .whitespaces)
+        guard raw.hasPrefix("[") && raw.hasSuffix("]") else { return nil }
+        raw = String(raw.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
         let parts = splitCommaSeparated(raw)
-        let baseReg = parts.first.flatMap { A64GPR.parse($0)?.reg } ?? .x0
-        let immVal = (parts.count >= 2) ? (parseImmediateValue(parts[1], session: session) ?? 0) : 0
-        return (baseReg, immVal)
+        guard let basePart = parts.first, let (base, is64, isSP) = A64GPR.parse(basePart), is64, isSP || base.rawValue != 31 else { return nil }
+        if parts.count == 1 { return (base, 0) }
+        guard parts.count == 3, parts[2].lowercased().split(separator: " ").joined(separator: " ") == "mul vl",
+              let imm = parseImmediateValue(parts[1], session: session) else { return nil }
+        return (base, imm)
     }
 
     // MARK: - Scalar FP, Advanced SIMD (NEON), and LSE Atomics (table-driven)
@@ -1322,6 +1258,8 @@ internal enum A64Asm {
         case scalar(A64VReg, A64ScalarWidth)
         case vector(A64VReg, A64Arrangement)
         case element(A64VReg, A64ScalarWidth, UInt8)
+        /// `v2.4b[1]`: a group of four bytes, the by-element operand of `sdot`/`udot`.
+        case byteQuad(A64VReg, UInt8)
         /// `{v0.16b, v1.16b}` (`arrangement` set) or `{v0.s}[1]` (`laneWidth` and `lane` set).
         case list(first: A64VReg, count: Int, arrangement: A64Arrangement?, laneWidth: A64ScalarWidth?, lane: UInt8?)
         case mem(base: A64GPR, offset: String?, preIndex: Bool)
@@ -1334,6 +1272,8 @@ internal enum A64Asm {
     /// the `st<op>` store aliases, and the `2` upper-half suffix).
     private struct A64MnemonicForm {
         var descs: [A64InstrDesc]
+        /// The mnemonic as written, without a `2` suffix (`mov`, `sxtl`, ... select alias operand shapes).
+        var spelling = ""
         var acquire = false
         var release = false
         var size: A64ScalarWidth? = nil
@@ -1350,7 +1290,10 @@ internal enum A64Asm {
              .simdTwoRegMiscFp, .simdAcrossLanes, .simdNarrow, .simdShiftImm, .simdShiftLong, .simdShiftNarrow,
              .simdDupElem, .simdDupGpr, .simdDupScalar, .simdInsGpr, .simdInsElem, .simdUmovSmov, .simdModImm,
              .simdLdStMulti, .simdLdStMultiPost, .simdLd1R, .simdLd1RPost, .simdLdStLane, .simdLdStLanePost,
-             .simdTbl, .simdExt:
+             .simdTbl, .simdExt, .simdThreeLong, .simdThreeWide, .simdThreeNarrow, .simdDot, .simdElem, .simdElemLong,
+             .simdDotElem, .simdLongPairwise, .simdFpCmpZero, .simdFpNarrow, .simdFpLong, .simdScalarTwoRegMiscFp,
+             .simdScalarPairwise, .simdAcrossLanesLong, .simdAcrossLanesFp, .cryptoAes, .cryptoSha3, .cryptoSha2,
+             .simdScalarElem, .simdScalarFpCmpZero, .simdScalarThreeSameFp:
             return true
         default:
             return false
@@ -1382,13 +1325,24 @@ internal enum A64Asm {
         ("casp", .casp, false), ("swp", .swp, false), ("cas", .cas, false),
     ]
 
+    /// Formats with a `2` (upper-half) mnemonic suffix: the `Q` bit selects the upper half of the narrow operand.
+    private static func hasUpperHalfForm(_ format: A64InstrFormat) -> Bool {
+        switch format {
+        case .simdNarrow, .simdShiftLong, .simdShiftNarrow, .simdThreeLong, .simdThreeWide, .simdThreeNarrow,
+             .simdElemLong, .simdFpNarrow, .simdFpLong:
+            return true
+        default:
+            return false
+        }
+    }
+
     private static func resolveTableMnemonic(_ mnem: String) -> A64MnemonicForm? {
         if let descs = tableParsedByMnemonic[mnem] {
-            return A64MnemonicForm(descs: descs)
+            return A64MnemonicForm(descs: descs, spelling: mnem)
         }
-        if mnem.hasSuffix("2"), let descs = tableParsedByMnemonic[String(mnem.dropLast())],
-           descs.contains(where: { $0.format == .simdNarrow || $0.format == .simdShiftLong || $0.format == .simdShiftNarrow }) {
-            return A64MnemonicForm(descs: descs, upperHalf: true)
+        if mnem.hasSuffix("2"), let descs = tableParsedByMnemonic[String(mnem.dropLast())]?.filter({ hasUpperHalfForm($0.format) }),
+           !descs.isEmpty {
+            return A64MnemonicForm(descs: descs, spelling: String(mnem.dropLast()), upperHalf: true)
         }
         for base in lseBases where mnem.hasPrefix(base.name) {
             var rest = mnem.dropFirst(base.name.count)
@@ -1497,6 +1451,12 @@ internal enum A64Asm {
         if let (v, w, lane) = parseVectorElement(s), let lane {
             return .element(v, w, lane)
         }
+        let lower = s.lowercased()
+        if lower.hasPrefix("v"), let dot = lower.range(of: ".4b["), lower.hasSuffix("]"),
+           let num = UInt8(lower[lower.index(after: lower.startIndex)..<dot.lowerBound]), num <= 31,
+           let lane = UInt8(lower[dot.upperBound..<lower.index(before: lower.endIndex)]) {
+            return .byteQuad(A64VReg(rawValue: num), lane)
+        }
         return .other(s)
     }
 
@@ -1505,6 +1465,12 @@ internal enum A64Asm {
         var s = text.trimmingCharacters(in: .whitespaces)
         if s.hasPrefix("#") { s.removeFirst() }
         return Double(s.trimmingCharacters(in: .whitespaces))
+    }
+
+    /// True for the `#0.0` (or `#0`) of an FP compare with zero; `#-0.0` is rejected, as in LLVM.
+    private static func isFPZero(_ text: String) -> Bool {
+        guard let v = parseFPImmediate(text) else { return false }
+        return v == 0 && v.sign == .plus
     }
 
     /// Parses an integer immediate, accepting full 64-bit hexadecimal patterns (`#0xff00ff0000000000`).
@@ -1557,10 +1523,14 @@ internal enum A64Asm {
             return width.map { (regs, $0) }
         }
         func vectors(_ count: Int) -> (regs: [A64VReg], arrangement: A64Arrangement)? {
-            guard ops.count >= count else { return nil }
+            vectorsFrom(0, count: count)
+        }
+        /// `count` vector operands from `start` that share one arrangement.
+        func vectorsFrom(_ start: Int, count: Int) -> (regs: [A64VReg], arrangement: A64Arrangement)? {
+            guard ops.count >= start + count else { return nil }
             var regs: [A64VReg] = []
             var arr: A64Arrangement? = nil
-            for op in ops.prefix(count) {
+            for op in ops[start..<(start + count)] {
                 guard case .vector(let v, let a) = op, arr == nil || arr == a else { return nil }
                 regs.append(v)
                 arr = a
@@ -1579,6 +1549,7 @@ internal enum A64Asm {
             return immediate(op).map { (.xzr, $0) }
         }
 
+        if form.upperHalf && !hasUpperHalfForm(desc.format) { return nil }
         var inst = A64Instruction(opcode: desc.id)
         switch desc.format {
         case .lseAtomic, .lseCas:
@@ -1641,7 +1612,7 @@ internal enum A64Asm {
             inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, scalarWidth: dst, scalarWidth2: src)
 
         case .fpCmpZero:
-            guard ops.count == 2, case .scalar(let vn, let w) = ops[0], case .other(let z) = ops[1], parseFPImmediate(z) == 0 else { return nil }
+            guard ops.count == 2, case .scalar(let vn, let w) = ops[0], case .other(let z) = ops[1], isFPZero(z) else { return nil }
             inst = A64Instruction(opcode: desc.id, vn: vn, scalarWidth: w)
 
         case .fpCondCompare:
@@ -1660,7 +1631,7 @@ internal enum A64Asm {
 
         case .simdThreeSameInt, .simdThreeSameBit, .simdThreeSameFp, .simdPermute:
             // `mov Vd.<T>, Vn.<T>` is `orr Vd.<T>, Vn.<T>, Vn.<T>`.
-            if desc.id == .simdOrr && ops.count == 2, let (regs, arr) = vectors(2) {
+            if desc.id == .simdOrr && ops.count == 2 && form.spelling == "mov", let (regs, arr) = vectors(2) {
                 inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], vm: regs[1], arrangement: arr)
             } else {
                 guard ops.count == 3, let (regs, arr) = vectors(3) else { return nil }
@@ -1672,15 +1643,109 @@ internal enum A64Asm {
             if desc.format == .simdCmpZero && immediate(ops[2]) != 0 { return nil }
             inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], arrangement: arr)
 
-        case .simdAcrossLanes:
+        case .simdFpCmpZero:
+            guard ops.count == 3, let (regs, arr) = vectors(2), case .other(let z) = ops[2], isFPZero(z) else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], arrangement: arr)
+
+        case .simdLongPairwise:
+            guard ops.count == 2, case .vector(let vd, let dArr) = ops[0], case .vector(let vn, let nArr) = ops[1],
+                  nArr.pairwiseWidened == dArr else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, arrangement: nArr)
+
+        case .simdAcrossLanes, .simdAcrossLanesFp, .simdAcrossLanesLong, .simdScalarPairwise:
+            // `saddlv`/`uaddlv` write a scalar of twice the element width.
+            let widening: UInt8 = desc.format == .simdAcrossLanesLong ? 1 : 0
             guard ops.count == 2, case .scalar(let vd, let w) = ops[0], case .vector(let vn, let arr) = ops[1],
-                  w == arr.elementWidth else { return nil }
+                  w.rawValue == arr.elementWidth.rawValue + widening else { return nil }
             inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, arrangement: arr)
+
+        case .simdScalarTwoRegMiscFp:
+            guard ops.count == 2, let (regs, w) = scalars(2) else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], scalarWidth: w)
+
+        case .simdScalarFpCmpZero:
+            guard ops.count == 3, let (regs, w) = scalars(2), case .other(let z) = ops[2], isFPZero(z) else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], scalarWidth: w)
+
+        case .simdScalarThreeSameFp:
+            guard ops.count == 3, let (regs, w) = scalars(3) else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], vm: regs[2], scalarWidth: w)
+
+        case .simdFpNarrow, .simdFpLong:
+            guard ops.count == 2, case .vector(let vd, let dArr) = ops[0], case .vector(let vn, let nArr) = ops[1] else { return nil }
+            let (narrow, wide) = desc.format == .simdFpNarrow ? (dArr, nArr) : (nArr, dArr)
+            guard narrow.widened == wide, (narrow.qBit == 1) == form.upperHalf else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, arrangement: narrow)
+
+        case .simdThreeLong, .simdThreeWide, .simdThreeNarrow:
+            guard ops.count == 3, case .vector(let vd, let dArr) = ops[0], case .vector(let vn, let nArr) = ops[1],
+                  case .vector(let vm, let mArr) = ops[2] else { return nil }
+            // (destination, first source, second source) as (narrow or wide) for each shape.
+            let narrow: A64Arrangement, shapeOK: Bool
+            switch desc.format {
+            case .simdThreeLong: (narrow, shapeOK) = (nArr, mArr == nArr && nArr.widened == dArr)
+            case .simdThreeWide: (narrow, shapeOK) = (mArr, nArr == dArr && mArr.widened == dArr)
+            default:             (narrow, shapeOK) = (dArr, mArr == nArr && dArr.widened == nArr)
+            }
+            guard shapeOK, (narrow.qBit == 1) == form.upperHalf else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: narrow)
+
+        case .simdDot:
+            guard ops.count == 3, case .vector(let vd, let dArr) = ops[0], let (regs, nArr) = vectorsFrom(1, count: 2),
+                  nArr == (dArr.qBit == 1 ? A64Arrangement.b16 : .b8) else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: regs[0], vm: regs[1], arrangement: dArr)
+
+        case .simdElem:
+            guard ops.count == 3, let (regs, arr) = vectors(2), case .element(let vm, let w, let idx) = ops[2],
+                  w == arr.elementWidth else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], vm: vm, arrangement: arr, index: idx)
+
+        case .simdScalarElem:
+            guard ops.count == 3, let (regs, w) = scalars(2), case .element(let vm, let ew, let idx) = ops[2], ew == w else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], vm: vm, scalarWidth: w, index: idx)
+
+        case .simdElemLong:
+            guard ops.count == 3, case .vector(let vd, let dArr) = ops[0], case .vector(let vn, let nArr) = ops[1],
+                  case .element(let vm, let w, let idx) = ops[2], w == nArr.elementWidth, nArr.widened == dArr,
+                  (nArr.qBit == 1) == form.upperHalf else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: nArr, index: idx)
+
+        case .simdDotElem:
+            guard ops.count == 3, case .vector(let vd, let dArr) = ops[0], case .vector(let vn, let nArr) = ops[1],
+                  nArr == (dArr.qBit == 1 ? A64Arrangement.b16 : .b8), case .byteQuad(let vm, let idx) = ops[2] else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: dArr, index: idx)
+
+        case .cryptoAes:
+            guard ops.count == 2, let (regs, arr) = vectors(2), arr == .b16 else { return nil }
+            inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1])
+
+        case .cryptoSha3:
+            guard ops.count == 3 else { return nil }
+            switch desc.id {
+            case .sha1c, .sha1p, .sha1m, .sha256h, .sha256h2:
+                let nWidth: A64ScalarWidth = desc.id == .sha256h || desc.id == .sha256h2 ? .q : .s
+                guard case .scalar(let vd, .q) = ops[0], case .scalar(let vn, let w) = ops[1], w == nWidth,
+                      case .vector(let vm, .s4) = ops[2] else { return nil }
+                inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm)
+            default:
+                guard let (regs, arr) = vectors(3), arr == .s4 else { return nil }
+                inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1], vm: regs[2])
+            }
+
+        case .cryptoSha2:
+            guard ops.count == 2 else { return nil }
+            if desc.id == .sha1h {
+                guard let (regs, w) = scalars(2), w == .s else { return nil }
+                inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1])
+            } else {
+                guard let (regs, arr) = vectors(2), arr == .s4 else { return nil }
+                inst = A64Instruction(opcode: desc.id, vd: regs[0], vn: regs[1])
+            }
 
         case .simdNarrow, .simdShiftNarrow, .simdShiftLong:
             // Narrowing forms take the narrow destination arrangement, `sshll`/`ushll` the narrow source.
             let isLong = desc.format == .simdShiftLong
-            let isAlias = form.descs.count == 1 && (desc.id == .simdSshll || desc.id == .simdUshll) && ops.count == 2
+            let isAlias = form.spelling == "sxtl" || form.spelling == "uxtl"
             let operandCount = desc.format == .simdNarrow || isAlias ? 2 : 3
             guard ops.count == operandCount, case .vector(let vd, let dArr) = ops[0], case .vector(let vn, let nArr) = ops[1] else { return nil }
             let narrow = isLong ? nArr : dArr
@@ -1721,6 +1786,8 @@ internal enum A64Asm {
             inst = A64Instruction(opcode: desc.id, vd: vd, vn: vn, scalarWidth: w, index: idx, imm2: idx2)
 
         case .simdUmovSmov:
+            // `mov` is the `umov` alias for 32- and 64-bit lanes only.
+            if form.spelling == "mov", ops.count == 2, case .element(_, let w, _) = ops[1], w != .s && w != .d { return nil }
             guard ops.count == 2, case .gpr(let rd, let is64, false) = ops[0], case .element(let vn, let w, let idx) = ops[1] else { return nil }
             inst = A64Instruction(opcode: desc.id, is64Bit: is64, rd: rd, vn: vn, scalarWidth: w, index: idx)
 
@@ -1728,7 +1795,7 @@ internal enum A64Asm {
             guard ops.count == 2 || ops.count == 3 else { return nil }
             let arr: A64Arrangement
             switch ops[0] {
-            case .vector(let v, let a):
+            case .vector(let v, let a) where a != .d1:
                 inst.vd = v
                 arr = a
             case .scalar(let v, .d) where desc.id == .simdMovi:
@@ -1758,7 +1825,7 @@ internal enum A64Asm {
             guard ops.count == (isPost ? 3 : 2), case .list(let first, let count, let someArr, nil, nil) = ops[0],
                   let arr = someArr, let base = baseOnly(ops[1]) else { return nil }
             if desc.format == .simdLd1R || desc.format == .simdLd1RPost {
-                guard count == 1 else { return nil }
+                guard count == A64Encoder.structureCount(desc.id) else { return nil }
             }
             inst = A64Instruction(opcode: desc.id, rn: base, rm: .xzr, vd: first, arrangement: arr, imm2: UInt8(count))
             if isPost {
@@ -1769,8 +1836,9 @@ internal enum A64Asm {
 
         case .simdLdStLane, .simdLdStLanePost:
             let isPost = desc.format == .simdLdStLanePost
-            guard ops.count == (isPost ? 3 : 2), case .list(let first, 1, nil, let someWidth, let someLane) = ops[0],
-                  let w = someWidth, let lane = someLane, let base = baseOnly(ops[1]) else { return nil }
+            guard ops.count == (isPost ? 3 : 2), case .list(let first, let count, nil, let someWidth, let someLane) = ops[0],
+                  count == A64Encoder.structureCount(desc.id), let w = someWidth, let lane = someLane,
+                  let base = baseOnly(ops[1]) else { return nil }
             inst = A64Instruction(opcode: desc.id, rn: base, rm: .xzr, vd: first, scalarWidth: w, index: lane)
             if isPost {
                 guard let (rm, imm) = postIndex(ops[2]) else { return nil }

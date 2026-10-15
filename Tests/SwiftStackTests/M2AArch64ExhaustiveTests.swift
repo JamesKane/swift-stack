@@ -20,6 +20,11 @@ import Testing
 // Forms LLVM rejects as unpredictable (writeback base equal to a transfer register, `ldp` with Rt == Rt2,
 // an exclusive store whose status register is also a source) are not generated. Every descriptor must
 // produce at least one instruction, so a new table entry cannot escape the sweep.
+//
+// A second test checks rejection: representative invalid operand forms of every descriptor (`A64Mutation`:
+// wrong arrangement or element width, out-of-range immediate or lane, wrong register width or class) must be
+// rejected by our assembler exactly when llvm-mc rejects them, and every descriptor must have some that both
+// reject. All lines of each pass go to llvm-mc in one invocation (`LLVMMC`), which keeps the run bounded.
 
 enum A64Sweep {
     typealias GPRSlot = WritableKeyPath<A64Instruction, A64GPR>
@@ -56,6 +61,8 @@ enum A64Sweep {
     static func gprWidths(_ desc: A64InstrDesc) -> [Bool] {
         if desc.scaleLog2 == 255 || desc.opcodeMask & (1 << 30) == 0 { return [false, true] }
         if desc.id == .ldrswLit { return [true] }
+        // Fixed-size exclusives and acquire/release forms (`ldarb`, `ldaprh`, ...) always use W registers.
+        if [.atomicLoad, .atomicStore, .atomicStoreExcl].contains(desc.format) { return [false] }
         return [(desc.opcodeBits >> 23) & 1 != 0 && (desc.opcodeBits >> 22) & 1 == 0]
     }
 
@@ -153,9 +160,17 @@ enum A64Sweep {
                 add { $0.is64Bit = is64; $0.extendKind = e; $0.amount = amt }
             } } }
 
-        case .dp2Source, .dp3Source:
+        case .dp2Source, .dp3Source, .addSubCarry:
             f.gprSlots = desc.format == .dp3Source ? [\.rd, \.rn, \.rm, \.ra] : [\.rd, \.rn, \.rm]
             for is64 in [false, true] { add { $0.is64Bit = is64 } }
+
+        case .dp3Long:
+            f.gprSlots = [\.rd, \.rn, \.rm, \.ra]
+            add { $0.is64Bit = true }
+
+        case .crc32:
+            f.gprSlots = [\.rd, \.rn, \.rm]
+            add { _ in }
 
         case .dp1Source:
             f.gprSlots = [\.rd, \.rn]
@@ -218,7 +233,7 @@ enum A64Sweep {
 
         case .msrPState:
             for field: A64PStateField in [.spsel, .daifset, .daifclr, .pan] {
-                let maxImm: Int64 = field == .daifset || field == .daifclr ? 15 : 1
+                let maxImm: Int64 = field == .pan ? 1 : 15
                 for imm in 0...maxImm { add { $0.pstateField = field; $0.imm = imm } }
             }
 
@@ -361,15 +376,44 @@ enum A64Sweep {
             f.vSlots = [\.vd, \.vn, \.vm]
             for a in arrangements(desc) { add { $0.arrangement = a } }
 
-        case .simdTwoRegMisc, .simdTwoRegMiscFp, .simdCmpZero, .simdAcrossLanes, .simdNarrow:
+        case .simdThreeLong, .simdThreeWide, .simdThreeNarrow, .simdDot:
+            f.vSlots = [\.vd, \.vn, \.vm]
+            for a in arrangements(desc) { add { $0.arrangement = a } }
+
+        case .simdTwoRegMisc, .simdTwoRegMiscFp, .simdCmpZero, .simdAcrossLanes, .simdNarrow, .simdLongPairwise,
+             .simdFpCmpZero, .simdFpNarrow, .simdFpLong, .simdScalarPairwise, .simdAcrossLanesLong, .simdAcrossLanesFp:
             f.vSlots = [\.vd, \.vn]
             for a in arrangements(desc) { add { $0.arrangement = a } }
+
+        case .simdScalarTwoRegMiscFp, .simdScalarFpCmpZero, .simdScalarThreeSameFp:
+            f.vSlots = desc.format == .simdScalarThreeSameFp ? [\.vd, \.vn, \.vm] : [\.vd, \.vn]
+            for w in widths(desc) { add { $0.scalarWidth = w } }
+
+        case .simdElem, .simdElemLong, .simdDotElem:
+            // Every lane of every arrangement; `vm` is swept too (h elements take v0-v15 only).
+            f.vSlots = [\.vd, \.vn, \.vm]
+            for a in arrangements(desc) {
+                let lanes = desc.format == .simdDotElem ? 4 : UInt8(16 >> a.elementWidth.rawValue)
+                for idx in 0..<lanes { add { $0.arrangement = a; $0.index = idx } }
+            }
+
+        case .simdScalarElem:
+            f.vSlots = [\.vd, \.vn, \.vm]
+            for w in widths(desc) { for idx in 0..<UInt8(16 >> w.rawValue) { add { $0.scalarWidth = w; $0.index = idx } } }
+
+        case .cryptoAes, .cryptoSha2:
+            f.vSlots = [\.vd, \.vn]
+            add { _ in }
+
+        case .cryptoSha3:
+            f.vSlots = [\.vd, \.vn, \.vm]
+            add { _ in }
 
         case .simdShiftImm, .simdShiftLong, .simdShiftNarrow:
             f.vSlots = [\.vd, \.vn]
             for a in arrangements(desc) {
                 let esize = UInt8(8 << a.elementWidth.rawValue)
-                let leftShift = [.simdShl, .simdSli, .simdSshll, .simdUshll].contains(desc.id)
+                let leftShift = [.simdShl, .simdSli, .simdSshll, .simdUshll, .simdSqshlImm, .simdUqshlImm, .simdSqshlu].contains(desc.id)
                 for amt in leftShift ? [0, 1, esize - 1] : [1, esize / 2, esize] { add { $0.arrangement = a; $0.amount = amt } }
             }
 
@@ -442,14 +486,16 @@ enum A64Sweep {
             let isPost = desc.format == .simdLd1RPost
             f.gprSlots = isPost ? [\.rn, \.rm] : [\.rn]
             f.vSlots = [\.vd]
-            for a in arrangements(desc) { add { $0.arrangement = a; $0.rm = .xzr; $0.imm = isPost ? Int64(a.elementWidth.byteCount) : 0 } }
+            let count = Int64(A64Encoder.structureCount(desc.id))
+            for a in arrangements(desc) { add { $0.arrangement = a; $0.rm = .xzr; $0.imm = isPost ? count * Int64(a.elementWidth.byteCount) : 0 } }
 
         case .simdLdStLane, .simdLdStLanePost:
             let isPost = desc.format == .simdLdStLanePost
             f.gprSlots = isPost ? [\.rn, \.rm] : [\.rn]
             f.vSlots = [\.vd]
+            let count = Int64(A64Encoder.structureCount(desc.id))
             for w in widths(desc) { for idx in 0..<UInt8(16 >> w.rawValue) {
-                add { $0.scalarWidth = w; $0.index = idx; $0.rm = .xzr; $0.imm = isPost ? Int64(w.byteCount) : 0 }
+                add { $0.scalarWidth = w; $0.index = idx; $0.rm = .xzr; $0.imm = isPost ? count * Int64(w.byteCount) : 0 }
             } }
 
         case .simdTbl:
@@ -498,6 +544,11 @@ enum A64Sweep {
             return rd != ra
         case .lseCasp:
             return rd & 1 == 0 && rm & 1 == 0
+        case .simdElem, .simdElemLong:
+            // A by-element operand with `h` elements is in v0-v15 (the `M` bit is part of the lane).
+            return i.arrangement.elementWidth != .h || i.vm.rawValue < 16
+        case .simdScalarElem:
+            return i.scalarWidth != .h || i.vm.rawValue < 16
         default:
             return true
         }
@@ -505,12 +556,28 @@ enum A64Sweep {
 
     /// Every generated instruction for `desc`: its base forms, plus each register slot swept over all 32
     /// encodings for every distinct shape (register width, element width, arrangement, ordering, ...).
+    /// The operand shape of a base form: what selects a different encoding of the same descriptor.
+    struct Shape: Hashable {
+        let is64: Bool, w: A64ScalarWidth, w2: A64ScalarWidth, arr: A64Arrangement, ext: A64ExtendKind
+        let imm2: UInt8, acq: Bool, rel: Bool, sysMaint: A64SysMaintOp
+
+        init(_ b: A64Instruction, _ desc: A64InstrDesc) {
+            (is64, w, w2, arr, ext) = (b.is64Bit, b.scalarWidth, b.scalarWidth2, b.arrangement, b.extendKind)
+            imm2 = desc.format == .simdLdStMulti || desc.format == .simdLdStMultiPost || desc.format == .simdTbl ? b.imm2 : 0
+            (acq, rel, sysMaint) = (b.acquire, b.release, b.sysMaintOp)
+        }
+    }
+
+    /// Up to `limit` legal base forms of `desc` with distinct shapes, spread over its shapes.
+    static func representatives(_ desc: A64InstrDesc, limit: Int = 4) -> [A64Instruction] {
+        var seenShapes = Set<Shape>()
+        let distinct = forms(desc).bases.filter { isLegal($0, desc) && seenShapes.insert(Shape($0, desc)).inserted }
+        guard distinct.count > limit else { return distinct }
+        return (0..<limit).map { distinct[$0 * (distinct.count - 1) / (limit - 1)] }
+    }
+
     static func cases(_ desc: A64InstrDesc) -> [A64Instruction] {
         let f = forms(desc)
-        struct Shape: Hashable {
-            let is64: Bool, w: A64ScalarWidth, w2: A64ScalarWidth, arr: A64Arrangement, ext: A64ExtendKind
-            let imm2: UInt8, acq: Bool, rel: Bool, sysMaint: A64SysMaintOp
-        }
         var seenShapes = Set<Shape>()
         var seen = Set<A64Instruction>()
         var out: [A64Instruction] = []
@@ -519,10 +586,7 @@ enum A64Sweep {
         }
         for b in f.bases {
             emit(b)
-            let shape = Shape(is64: b.is64Bit, w: b.scalarWidth, w2: b.scalarWidth2, arr: b.arrangement, ext: b.extendKind,
-                              imm2: desc.format == .simdLdStMulti || desc.format == .simdLdStMultiPost || desc.format == .simdTbl ? b.imm2 : 0,
-                              acq: b.acquire, rel: b.release, sysMaint: b.sysMaintOp)
-            guard seenShapes.insert(shape).inserted else { continue }
+            guard seenShapes.insert(Shape(b, desc)).inserted else { continue }
             for slot in f.gprSlots {
                 // `sysMaint` operations without a register operand encode Rt = 31 only.
                 if desc.format == .sysMaint && !b.sysMaintOp.takesRegister { continue }
@@ -541,6 +605,131 @@ enum A64Sweep {
             }
         }
         return out
+    }
+}
+
+/// Representative invalid operand forms, made by mutating the text of a valid instruction: each vector
+/// arrangement or element width replaced by the others (wrong arrangement), each integer immediate by values at
+/// and beyond common field limits and each FP immediate by unrepresentable ones (out-of-range immediate), each lane
+/// index by the first out-of-range one (out-of-range lane), each register by one of another width or class, a
+/// memory base by a W register (wrong register class), and an operand added to an instruction that takes none.
+/// Some mutations are still valid (`#4` -> `#5`); the sweep requires that LLVM and our assembler agree on every
+/// one (and on the bytes where both accept it), and that each descriptor has mutations both reject.
+enum A64Mutation {
+    static let arrangements = ["16b", "8b", "8h", "4h", "4s", "2s", "2d", "1d", "1q"]
+    static let elementWidths = ["b", "h", "s", "d"]
+
+    /// The mnemonic and top-level operands of `mnem op, { list }, [mem], ...`.
+    static func split(_ text: String) -> (mnemonic: String, operands: [String]) {
+        guard let space = text.firstIndex(of: " ") else { return (text, []) }
+        var ops: [String] = [], current = "", depth = 0
+        for ch in text[text.index(after: space)...] {
+            if ch == "{" || ch == "[" { depth += 1 }
+            if ch == "}" || ch == "]" { depth -= 1 }
+            if ch == "," && depth == 0 {
+                ops.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            } else {
+                current.append(ch)
+            }
+        }
+        ops.append(current.trimmingCharacters(in: .whitespaces))
+        return (String(text[..<space]), ops)
+    }
+
+    /// Ranges of the suffix `token` (`.4s`, `.b`) in `s` not followed by a letter or digit.
+    static func occurrences(of token: String, in s: String) -> [Range<String.Index>] {
+        var out: [Range<String.Index>] = []
+        var from = s.startIndex
+        while let r = s.range(of: token, range: from..<s.endIndex) {
+            let after = r.upperBound == s.endIndex ? nil : s[r.upperBound]
+            if !(after.map { $0.isLetter || $0.isNumber } ?? false) {
+                out.append(r)
+            }
+            from = r.upperBound
+        }
+        return out
+    }
+
+    /// Variants of one operand.
+    static func operandMutations(_ op: String) -> [String] {
+        var out: [String] = []
+        // Wrong arrangement: every `.T` of the operand (all registers of a list) replaced at once.
+        for arr in arrangements where !occurrences(of: ".\(arr)", in: op).isEmpty {
+            for alt in arrangements where alt != arr { out.append(op.replacingOccurrences(of: ".\(arr)", with: ".\(alt)")) }
+        }
+        // Elements and lane lists (`v1.s[2]`, `{ v0.h, v1.h }[3]`, `v2.4b[1]`): wrong element width, lane out of range.
+        if op.hasSuffix("]"), let lb = op.lastIndex(of: "["), !op.hasPrefix("[") {
+            let head = op[..<lb]
+            let widthTokens = elementWidths.filter { !occurrences(of: ".\($0)", in: String(head)).isEmpty }
+            if let w = widthTokens.first {
+                for alt in elementWidths where alt != w { out.append(op.replacingOccurrences(of: ".\(w)", with: ".\(alt)")) }
+                out.append("\(head)[\(16 >> elementWidths.firstIndex(of: w)!)]")
+            } else if head.hasSuffix(".4b") {
+                out.append("\(head)[4]")
+            }
+        }
+        // Immediates (also inside a memory operand).
+        if let hash = op.firstIndex(of: "#") {
+            let start = op.index(after: hash)
+            let end = op[start...].firstIndex(where: { $0 == "]" || $0 == "," || $0 == " " }) ?? op.endIndex
+            let literal = String(op[start..<end])
+            let (prefix, suffix) = (op[..<start], op[end...])
+            if literal.contains(".") {
+                for alt in ["0.1", "64.0", "-0.0"] where alt != literal { out.append("\(prefix)\(alt)\(suffix)") }
+            } else if let value = literal.hasPrefix("0x") ? Int64(literal.dropFirst(2), radix: 16) : Int64(literal) {
+                let candidates: [Int64] = [-1, 0, 5, value + 1, value - 1, 64, 4096, 65536, 1 << 26, 1 << 32]
+                for alt in candidates where alt != value { out.append("\(prefix)\(alt)\(suffix)") }
+            }
+        }
+        // Wrong register class or width.
+        out += registerMutations(op)
+        if op.hasPrefix("[") {
+            let inner = op.dropFirst()
+            let base = inner.prefix { $0 != "," && $0 != "]" }
+            for alt in registerMutations(String(base)) where alt.hasPrefix("w") { out.append("[\(alt)\(inner.dropFirst(base.count))") }
+        }
+        return out
+    }
+
+    static func registerMutations(_ op: String) -> [String] {
+        let lower = op.lowercased()
+        switch lower {
+        case "sp":  return ["wsp", "xzr"]
+        case "wsp": return ["sp", "wzr"]
+        case "xzr": return ["wzr", "sp"]
+        case "wzr": return ["xzr", "wsp"]
+        default: break
+        }
+        guard let first = lower.first, let n = Int(lower.dropFirst().prefix { $0.isNumber }) else { return [] }
+        let rest = lower.dropFirst(1 + String(n).count)
+        switch (first, rest.isEmpty) {
+        case ("x", true): return ["w\(n)", "q\(n)"]
+        case ("w", true): return ["x\(n)", "s\(n)"]
+        case ("b", true), ("h", true), ("s", true), ("d", true), ("q", true):
+            return ["b", "h", "s", "d", "q"].filter { $0 != String(first) }.map { "\($0)\(n)" } + ["x\(n)"]
+        case ("v", false) where rest.hasPrefix(".") && !rest.contains("["):
+            return ["q\(n)", "x\(n)"]
+        case ("p", false) where rest == ".b":
+            return ["p\(n).h", "p\(n + 16).b"]
+        default:
+            return []
+        }
+    }
+
+    /// Every mutation of `text` (distinct, and different from `text`).
+    static func mutations(_ text: String) -> [String] {
+        let (mnemonic, ops) = split(text)
+        var out: [String] = ops.isEmpty || (ops.count == 1 && ops[0].isEmpty) ? ["\(mnemonic) x0"] : []
+        for (i, op) in ops.enumerated() {
+            for alt in operandMutations(op) {
+                var mutated = ops
+                mutated[i] = alt
+                out.append("\(mnemonic) " + mutated.joined(separator: ", "))
+            }
+        }
+        var seen: Set<String> = [text]
+        return out.filter { seen.insert($0).inserted }
     }
 }
 
@@ -572,10 +761,12 @@ private func ownAssembleA64(_ lines: [String]) -> (bytes: [UInt8], errors: Int) 
 @Suite("M2 — Exhaustive AArch64 encoder sweep against LLVM MC")
 struct M2AArch64ExhaustiveTests {
     static var llvmMC: String? { ExternalTool.find("llvm-mc") }
-    /// The features the table covers: base A64, LSE, FP16, Advanced SIMD, the SVE subset, the PAC/BTI/PAN
-    /// system aliases (without `+pauth`/`+bti`/`+pan`, LLVM prints and accepts only the raw `hint`/`msr` forms),
-    /// and what `smc` (`+el3`) and the EL2/SME/RNDR system registers VectraOS's arm64 loader and kernel name require.
-    static let llvmArgs = ["--triple=aarch64", "-mattr=+lse,+fp-armv8,+neon,+fullfp16,+sve,+pauth,+bti,+pan,+el3,+el2vmsa,+sme,+rand"]
+    /// The features the table covers: base A64, LSE, RDM, RCpc, CRC32, FP16, Advanced SIMD with dot product and
+    /// the AES/SHA1/SHA256 crypto extension (the Q8B's Armv8.2-A set), the SVE subset, the PAC/BTI/PAN system
+    /// aliases (without `+pauth`/`+bti`/`+pan`, LLVM prints and accepts only the raw `hint`/`msr` forms), and what
+    /// `smc` (`+el3`) and the EL2/SME/RNDR system registers VectraOS's arm64 loader and kernel name require.
+    static let llvmArgs = ["--triple=aarch64", "-mattr=+lse,+rdm,+rcpc,+crc,+fp-armv8,+neon,+fullfp16,+dotprod,+aes,+sha2,+sve,"
+                           + "+pauth,+bti,+pan,+el3,+el2vmsa,+sme,+rand"]
 
     @Test("Every AArch64 descriptor: all operand forms round-trip and match llvm-mc bit for bit",
           .enabled(if: M2AArch64ExhaustiveTests.llvmMC != nil))
@@ -674,5 +865,78 @@ struct M2AArch64ExhaustiveTests {
 
         #expect(covered.count == table.count, Comment(rawValue: "descriptors with no round-tripping instruction: " + missing.prefix(30).map { "\(table[$0].id)" }.joined(separator: ", ")))
         #expect(failures.count == 0, Comment(rawValue: "\(failures.count) failures (report: \(report)):\n  " + failures.prefix(40).joined(separator: "\n  ")))
+    }
+
+    /// Descriptors for which llvm-mc 22 accepts an invalid operand and encodes a different instruction: an out-of-range
+    /// fixed-point `#fbits` on scalar `scvtf`/`ucvtf` from an X register or to an H register (truncated), an out-of-range
+    /// `ext` index (truncated), a 32-bit `mov` immediate above 32 bits (truncated), and a W register with `sxtx` in
+    /// `adds`/`subs` (encoded as the X register).
+    static let llvmAlteringDescriptors: Set<A64OpcodeId> = [.scvtfFixed, .ucvtfFixed, .simdExt, .movz, .movn, .addsExtended, .subsExtended]
+
+    @Test("Every AArch64 descriptor: invalid operand forms are rejected by our assembler exactly when llvm-mc rejects them",
+          .enabled(if: M2AArch64ExhaustiveTests.llvmMC != nil))
+    func rejectionSweep() throws {
+        let mc = try #require(Self.llvmMC)
+        let table = A64InstructionTable.entries
+
+        // 1. Mutate the text of up to four representative forms (distinct shapes) of every descriptor.
+        var lines: [(descriptor: Int, text: String)] = []
+        var seen = Set<String>()
+        for (index, desc) in table.enumerated() {
+            for inst in A64Sweep.representatives(desc) {
+                guard let word = A64Encoder.encode(inst), let decoded = A64Disassembler.decode(word) else { continue }
+                for m in A64Mutation.mutations(A64Disassembler.format(decoded)) where seen.insert(m).inserted {
+                    lines.append((index, m))
+                }
+            }
+        }
+
+        // 2. LLVM and our assembler must agree on every line: both reject it, or both accept it with the same bytes.
+        //    llvm-mc 22 accepts a few invalid operands and silently encodes something else (`llvmAlteringDescriptors`);
+        //    where its bytes do not decode to the line it was given, our rejection counts as agreement and the case is
+        //    listed in the report.
+        var failures: [String] = []
+        var llvmTruncations: [String] = []
+        var verdicts: [String] = []
+        var rejectedBoth = [Int](repeating: 0, count: table.count)
+        var acceptedBoth = 0
+        let llvm = try LLVMMC.assemble(lines.map(\.text), mc: mc, args: Self.llvmArgs)
+        for (line, l) in zip(lines, llvm) {
+            let (bytes, errors) = ownAssembleA64([line.text])
+            let ours = errors == 0 && !bytes.isEmpty ? bytes : nil
+            verdicts.append("\(table[line.descriptor].id)\t\(l == nil ? "llvm-rejects" : "llvm-accepts")\t\(ours == nil ? "rejected" : "accepted")\t\(line.text)")
+            if let l, ours == nil, Self.llvmAlteringDescriptors.contains(table[line.descriptor].id), l.bytes.count == 4,
+               let decoded = A64Disassembler.decode(l.bytes.enumerated().reduce(UInt32(0)) { $0 | UInt32($1.element) << (8 * UInt32($1.offset)) }),
+               canonicalA64(A64Disassembler.format(decoded)) != canonicalA64(line.text) {
+                llvmTruncations.append("llvm-mc alters: \(line.text) -> \(A64Disassembler.format(decoded))")
+                rejectedBoth[line.descriptor] += 1
+                continue
+            }
+            switch (l, ours) {
+            case (nil, nil):
+                rejectedBoth[line.descriptor] += 1
+            case (let l?, let ours?) where !l.fixup && l.bytes == ours:
+                acceptedBoth += 1
+            case (nil, let ours?):
+                failures.append("accepted, llvm-mc rejects: \(line.text) -> [\(ours.map { String(format: "%02x", $0) }.joined(separator: " "))]")
+            case (let l?, nil):
+                failures.append("rejected, llvm-mc accepts: \(line.text) llvm=[\(l.bytes.map { String(format: "%02x", $0) }.joined(separator: " "))]")
+            case (let l?, let ours?):
+                failures.append("encoding: \(line.text) ours=[\(ours.map { String(format: "%02x", $0) }.joined(separator: " "))] "
+                                + "llvm=[\(l.bytes.map { String(format: "%02x", $0) }.joined(separator: " "))\(l.fixup ? " +fixup" : "")]")
+            }
+        }
+
+        let uncovered = table.indices.filter { rejectedBoth[$0] == 0 }
+        let report = FileManager.default.temporaryDirectory.appendingPathComponent("ss_a64_rejection.txt").path
+        let summary = "descriptors \(table.count), invalid-form candidates \(lines.count), rejected by both \(rejectedBoth.reduce(0, +)) "
+            + "(of which llvm-mc alters \(llvmTruncations.count)), accepted by both \(acceptedBoth), failures \(failures.count)"
+        let reportLines = [summary] + uncovered.map { "NO REJECTED FORM: #\($0) \(table[$0].id) \(table[$0].format)" } + failures + llvmTruncations
+        try reportLines.joined(separator: "\n").write(toFile: report, atomically: true, encoding: .utf8)
+        try verdicts.joined(separator: "\n").write(toFile: report.replacingOccurrences(of: ".txt", with: "_lines.txt"), atomically: true, encoding: .utf8)
+        print("AArch64 rejection sweep: \(summary) (report: \(report))")
+
+        #expect(uncovered.isEmpty, Comment(rawValue: "descriptors without a rejected invalid form: " + uncovered.prefix(30).map { "\(table[$0].id)" }.joined(separator: ", ")))
+        #expect(failures.isEmpty, Comment(rawValue: "\(failures.count) failures (report: \(report)):\n  " + failures.prefix(40).joined(separator: "\n  ")))
     }
 }

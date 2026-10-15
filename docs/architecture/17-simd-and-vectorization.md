@@ -114,7 +114,7 @@ These baselines are deliberate floors. Code generated without extra flags MAY us
 - **Scalar uses:** F16C gives hardware `Float16` ↔ `Float` conversion. RDRAND is available to the runtime's entropy source. FSGSBASE is used by codegen only where the OS enables it, never on hosts by default. VectraOS does not enable it: its kernel keeps `CR4.FSGSBASE` off and sets `%fs` itself ([08](08-runtime-and-stdlib.md) §7).
 - **Opt-in:** `-target-feature +avx2` (with FMA and BMI as separate features), which adds 256-bit integer vectors.
 
-**AArch64:** `armv8-a` with Advanced SIMD (NEON), which is mandatory. Later features (e.g. `+dotprod`, `+i8mm`, SVE) are opt-in. SVE is a non-goal for v1.
+**AArch64:** `armv8-a` with Advanced SIMD (NEON), which is mandatory. Later features (e.g. `+dotprod`, `+i8mm`, SVE) are opt-in. SVE is a non-goal for v1. The encoder, disassembler and assembler ([05](05-assembler.md) §4.7) already cover the Armv8.2-A vector set of VectraOS's first AArch64 board (the SC8280XP: FP16 arithmetic, dot product, RDM, AES/SHA1/SHA256, plus the widening, narrowing, pairwise, by-element and saturating forms), so opting in to those needs no encoder work.
 
 **RV64: the RVA23 profile (RVA23U64).**
 
