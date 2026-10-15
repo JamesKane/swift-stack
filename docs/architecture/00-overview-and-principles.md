@@ -222,13 +222,13 @@ VectraOS (`~/Projects/OS/VectraOS-swift`) is a capability microkernel OS for edg
 | FreeBSD | `x86_64-unknown-freebsd`, `aarch64-unknown-freebsd`, `riscv64-unknown-freebsd` | FreeBSD libc, `kqueue` |
 | macOS | `x86_64-apple-darwin`, `arm64-apple-darwin` | Mach-O, dynamic `libSystem` only, mandatory code signing on arm64 |
 
-**ISA baselines** are deliberate floors for code Swift-Stack generates by default, and apply to every OS on that architecture. VectraOS builds below them where it has to: its kernels use no FP or vector registers, its x86-64 user code targets baseline x86-64, its RV64 kernel is `rv64imac_zicsr_zifencei` (soft-float `lp64`), and its RV64 user code `rv64gc` with V checked at run time. Each such build selects its ISA explicitly ([17](17-simd-and-vectorization.md) §5.4):
+**ISA baselines** are deliberate floors for code Swift-Stack generates by default, and apply to every OS on that architecture. VectraOS builds below them where it has to: its kernels use no FP or vector registers, its x86-64 user code targets baseline x86-64 today but inherits the 2013 Mac Pro-class floor (decided 2026-10-15), its RV64 kernel is `rv64imac_zicsr_zifencei` (soft-float `lp64`), and its RV64 user code `rv64gc` with V checked at run time. Each such build selects its ISA explicitly ([17](17-simd-and-vectorization.md) §5.4):
 
 - **x86-64:** 2013 Mac Pro-class (Ivy Bridge feature set: `x86-64-v2` + AVX, F16C, AES-NI, PCLMULQDQ, RDRAND, XSAVE/XSAVEOPT, FSGSBASE).
 - **AArch64:** `armv8-a`.
 - **RV64:** RVA23.
 
-Older CPUs are not supported by default code generation; a build that selects a lower ISA explicitly, as VectraOS's do, gets scalar code where the floor would use vectors. Whether the floors should follow VectraOS is [17](17-simd-and-vectorization.md) §8, question 6. The details and the opt-in features above each floor are in [17](17-simd-and-vectorization.md) §5.4 (D9).
+Older CPUs are not supported by default code generation; a build that selects a lower ISA explicitly, as VectraOS's do, gets scalar code where the floor would use vectors. On x86-64, VectraOS adopts Swift-Stack's floor rather than the reverse; whether RV64 should do the same is [17](17-simd-and-vectorization.md) §8, question 6. The details and the opt-in features above each floor are in [17](17-simd-and-vectorization.md) §5.4 (D9).
 
 Targets are brought up in order: **VectraOS static ELF → Linux → FreeBSD → macOS** ([09](09-roadmap.md)). The driver supports cross-compilation from the start ([15](15-driver-and-diagnostics.md)). Selecting a triple selects the encoder, ABI rules, object format and sysroot.
 
