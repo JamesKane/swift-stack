@@ -43,24 +43,26 @@ public struct DataLayout: Sendable, Equatable {
     public let ptrdiffType: TypeId
     /// `_Alignof(max_align_t)`, also `__BIGGEST_ALIGNMENT__` and the default of `__attribute__((aligned))`.
     public let maxAlignment: Int
-    /// A zero-width bit-field raises the alignment of the enclosing structure to its declared type's (AAPCS64; clang's
-    /// `useZeroLengthBitfieldAlignment`). On x86-64 and RISC-V it only closes the storage unit.
-    public let zeroWidthBitFieldAligns: Bool
+    /// AAPCS64 bit-field alignment (clang's `useZeroLengthBitfieldAlignment`): unnamed bit-fields count toward the
+    /// alignment of the enclosing structure or union as named ones do, and a zero-width one raises it to its declared
+    /// type's alignment even in a packed record. On x86-64 and RISC-V unnamed bit-fields do not affect alignment, and
+    /// a zero-width one only closes the storage unit.
+    public let unnamedBitFieldsAlign: Bool
 
     public static let x86_64 = DataLayout(
         arch: .x86_64, pointerSize: 8, longSize: 8, longDoubleFormat: .x87Extended, bitIntRule: .words64, bitIntMaxWidth: 8192,
         charIsSigned: true, wcharType: .int, wintType: .uint, sizeType: .ulong, ptrdiffType: .long, maxAlignment: 16,
-        zeroWidthBitFieldAligns: false)
+        unnamedBitFieldsAlign: false)
 
     public static let aarch64 = DataLayout(
         arch: .aarch64, pointerSize: 8, longSize: 8, longDoubleFormat: .ieeeQuad, bitIntRule: .chunks128, bitIntMaxWidth: 128,
         charIsSigned: false, wcharType: .uint, wintType: .uint, sizeType: .ulong, ptrdiffType: .long, maxAlignment: 16,
-        zeroWidthBitFieldAligns: true)
+        unnamedBitFieldsAlign: true)
 
     public static let riscv64 = DataLayout(
         arch: .riscv64, pointerSize: 8, longSize: 8, longDoubleFormat: .ieeeQuad, bitIntRule: .words64, bitIntMaxWidth: 128,
         charIsSigned: false, wcharType: .int, wintType: .uint, sizeType: .ulong, ptrdiffType: .long, maxAlignment: 16,
-        zeroWidthBitFieldAligns: false)
+        unnamedBitFieldsAlign: false)
 
     public static func forArch(_ arch: AssemblerArch) -> DataLayout {
         switch arch {

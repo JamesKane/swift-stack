@@ -122,6 +122,9 @@ public final class SemModule: @unchecked Sendable {
     /// Symbols of block-scope statics and compound literals (`DeclId` → symbol); other objects are named by their
     /// declaration.
     public var staticSymbols: [DeclId: String] = [:]
+    /// GNU `asm("name")` labels: the symbol of each object or function with linkage declared with one, by C name
+    /// (glibc's `__REDIRECT` names `stat` `stat64` under `_FILE_OFFSET_BITS=64`).
+    public var asmLabels: [String: String] = [:]
 
     public init(
         declTable: consuming DeclTable,
@@ -144,7 +147,12 @@ public final class SemModule: @unchecked Sendable {
 
     /// The symbol an object or function is known by in the object file.
     public func symbolName(of decl: DeclId) -> String {
-        staticSymbols[decl] ?? declTable.name(of: decl)
+        if let symbol = staticSymbols[decl] { return symbol }
+        let name = declTable.name(of: decl)
+        if let label = asmLabels[name], declTable.kind(of: decl) == .function || attributes(of: decl).hasStaticStorage {
+            return label
+        }
+        return name
     }
 
     public func attributes(of decl: DeclId) -> DeclAttributes {

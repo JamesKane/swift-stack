@@ -84,6 +84,11 @@ public final class CPreprocessor {
 
     private var macros: [String: PPMacro] = [:]
     private var pragmaOnceFiles: Set<String> = []
+    /// `#pragma pack`: the current maximum member alignment (0: the default), the `push` stack, and each change with
+    /// the index of the first processed token it applies to.
+    private var packAlignment = 0
+    private var packStack: [Int] = []
+    private var packChanges: [(index: Int, alignment: Int)] = []
     private var includeGuards: [String: String] = [:] // filePath -> guardMacroName
     private var counterValue: UInt32 = 0
     private var activeInclusions: [String] = [] // Call stack of included files for #include_next
@@ -406,6 +411,8 @@ public final class CPreprocessor {
                 end: tok.endLocation
             )
         }
+        output.packChanges += packChanges.map { (TokenId(UInt32(startCount + $0.index)), $0.alignment) }
+        packChanges = []
     }
 
     /// Preprocesses a file in `assembler-with-cpp` mode and returns reconstructed assembly source text.
@@ -722,7 +729,7 @@ public final class CPreprocessor {
             case "embed":
                 handleEmbed(Array(tokens.dropFirst()), currentFilePath: currentFilePath, location: first.location, into: &output)
             case "pragma":
-                handlePragma(Array(tokens.dropFirst()), currentFilePath: currentFilePath)
+                handlePragma(Array(tokens.dropFirst()), currentFilePath: currentFilePath, outputCount: output.count)
             case "error":
                 let msg = tokens.dropFirst().map { $0.spelling }.joined(separator: " ")
                 diagnostics.report(.ppUserError, at: first.location, args: [msg])
@@ -965,9 +972,36 @@ public final class CPreprocessor {
         return nil
     }
 
-    private func handlePragma(_ tokens: [PPToken], currentFilePath: String) {
+    private func handlePragma(_ tokens: [PPToken], currentFilePath: String, outputCount: Int) {
         if tokens.first?.spelling == "once" {
             pragmaOnceFiles.insert(currentFilePath)
+        } else if tokens.first?.spelling == "pack", tokens.count >= 3, tokens[1].kind == .lParen {
+            handlePragmaPack(tokens.dropFirst(2).prefix { $0.kind != .rParen }.filter { $0.kind != .comma })
+            if packChanges.last?.index == outputCount { packChanges.removeLast() }
+            packChanges.append((outputCount, packAlignment))
+        }
+    }
+
+    /// `#pragma pack(N)`, `pack()`, `pack(push[, id][, N])`, `pack(pop[, id][, N])` as GCC and Clang accept them;
+    /// `N` is a power of two up to 16 (others are ignored, as Clang ignores them with a warning).
+    private func handlePragmaPack(_ args: [PPToken]) {
+        func value(_ t: PPToken?) -> Int? {
+            guard let t, t.kind == .intLiteral, let n = Int(t.spelling), [1, 2, 4, 8, 16].contains(n) else { return nil }
+            return n
+        }
+        switch args.first?.spelling {
+        case nil:
+            packAlignment = 0
+        case "push":
+            packStack.append(packAlignment)
+            if let n = value(args.last) { packAlignment = n }
+        case "pop":
+            packAlignment = packStack.popLast() ?? 0
+            if let n = value(args.last) { packAlignment = n }
+        case "show":
+            break
+        default:
+            if let n = value(args.first) { packAlignment = n }
         }
     }
 
@@ -1272,9 +1306,18 @@ public final class CPreprocessor {
             if rep.kind == .hash && repIdx + 1 < macro.replacementTokens.count {
                 let nextRep = macro.replacementTokens[repIdx + 1]
                 if let arg = paramToArg[nextRep.spelling] {
-                    let strContent = arg.map { $0.spelling }.joined(separator: " ")
-                    let escaped = "\"" + strContent.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
-                    subst.append(makeSyntheticToken(kind: .stringLiteral, flags: rep.flags, spelling: escaped))
+                    // C23 6.10.4.2p2: white space between the argument's tokens becomes one space, none is added;
+                    // `"` and `\` are escaped only in string literals and character constants
+                    var strContent = ""
+                    for (k, t) in arg.enumerated() {
+                        if k > 0 && (t.isLeadingSpace || t.isLeadingNewline) { strContent += " " }
+                        if t.kind == .stringLiteral || t.kind == .charLiteral {
+                            strContent += t.spelling.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                        } else {
+                            strContent += t.spelling
+                        }
+                    }
+                    subst.append(makeSyntheticToken(kind: .stringLiteral, flags: rep.flags, spelling: "\"" + strContent + "\""))
                     repIdx += 2
                     continue
                 }

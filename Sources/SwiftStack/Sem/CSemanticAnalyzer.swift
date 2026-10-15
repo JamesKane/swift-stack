@@ -24,6 +24,8 @@ public struct CSemanticAnalyzer: ~Copyable {
     /// Index into `semGlobals` of each file-scope object name's definition (or tentative definition).
     private var globalIndexByName: [String: Int] = [:]
     private var staticSymbols: [DeclId: String] = [:]
+    /// GNU `asm("name")` labels of objects and functions with linkage, by C name (`SemModule.asmLabels`).
+    private var asmLabels: [String: String] = [:]
     /// Explicit alignments (`alignas`, `aligned`) of objects.
     private var objectAlignments: [DeclId: Int] = [:]
 
@@ -78,6 +80,8 @@ public struct CSemanticAnalyzer: ~Copyable {
     /// controlling expression.
     private struct SwitchContext {
         var values: Set<Int64> = []
+        /// GNU case ranges, as (low, high).
+        var ranges: [(Int64, Int64)] = []
         var hasDefault = false
         var cases: [UInt32] = []
         var defaultLabel: SemInstId = .nilId
@@ -194,6 +198,7 @@ public struct CSemanticAnalyzer: ~Copyable {
         finalMod.functions = semFunctions
         finalMod.globals = semGlobals
         finalMod.staticSymbols = staticSymbols
+        finalMod.asmLabels = asmLabels
 
         // Data images of the static-storage objects (C23 6.7.10p10)
         var evaluator = StaticInitializerEvaluator(module: finalMod)
@@ -628,6 +633,12 @@ public struct CSemanticAnalyzer: ~Copyable {
                                                : "variable length array declaration cannot have 'extern' or 'static' storage"])
             }
             let alignment = explicitAlignment(attributes, tree: tree, tokens: tokens)
+            // An `asm` label names the symbol of an object or function with linkage (on a block-scope `register`
+            // variable it names a register instead, which is not modeled)
+            if !spec.isTypedef, isFileScope || spec.isExtern || isFunctionType(type),
+               let label = asmLabel(attributes, tree: tree, tokens: tokens) {
+                asmLabels[name] = label
+            }
             if spec.isTypedef {
                 let declId = declareTypedef(name, type: type, alignment: alignment, at: nameTok, tokens: tokens)
                 // A variably modified typedef evaluates its lengths where it is declared (C23 6.7.8p3)
@@ -654,6 +665,25 @@ public struct CSemanticAnalyzer: ~Copyable {
         for (type, length) in pendingVLALengths { items += [type.rawIndex, length.rawIndex] }
         pendingVLALengths.removeAll()
         return emitList(.declLocal, .void, arg0: decl.rawIndex, items: items, node: node)
+    }
+
+    /// The GNU `asm("name")` label among `attributes`: its string literals, concatenated.
+    private func asmLabel(_ attributes: [NodeId], tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> String? {
+        for attr in attributes where tree.kind(of: attr) == .attributeSpec {
+            let anchor = tree.token(of: attr)
+            guard ["asm", "__asm", "__asm__"].contains(spelling(of: anchor, in: tokens)) else { continue }
+            var i = Int(anchor.rawIndex) + 1
+            guard i < tokens.count, CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(i)))) == .lParen else { continue }
+            i += 1
+            var label = ""
+            while i < tokens.count, CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(i)))) == .stringLiteral {
+                let s = spelling(of: TokenId(UInt32(i)), in: tokens)
+                label += s.count >= 2 ? String(s.dropFirst().dropLast()) : ""
+                i += 1
+            }
+            return label
+        }
+        return nil
     }
 
     /// GNU `__attribute__((mode(M)))` on an integer declaration selects the integer type of machine mode `M`
@@ -793,7 +823,9 @@ public struct CSemanticAnalyzer: ~Copyable {
                                           isFileScope: Bool, alignment: Int?, at nameTok: TokenId, into stmts: inout [UInt32],
                                           tree: borrowing ParseTree, tokens: borrowing TokenBuffer) {
         var varType = declaredType
-        // An array of unknown size is completed by its initializer (C23 6.7.10p22)
+        // An array of unknown size is completed by its initializer (C23 6.7.10p22). This length counts the list's
+        // items, for the checks below; resolving the initializer (from the declared type) gives the actual one, which
+        // brace elision can make shorter
         if let initializer, case .array(let element, 0) = canonicalKind(varType), !typePool.isVariableLengthArray(varType.typeId),
            let count = initializerLength(initializer, element: element, tree: tree, tokens: tokens) {
             varType = QualType(typeId: typePool.arrayType(elementType: element, count: count), qualifiers: varType.qualifiers)
@@ -838,7 +870,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                 if !spec.infersType && currentScope.lookupLocalOrdinary(name) == nil {
                     currentScope.insertOrdinary(symbol: CSymbol(name: name, declId: declId, type: varType, storage: .global(name: name)))
                 }
-                let resolved = resolveVariableInitializer(initializer, type: varType, infersType: spec.infersType, tree: tree, tokens: tokens)
+                let resolved = resolveVariableInitializer(initializer, type: declaredType, infersType: spec.infersType, tree: tree, tokens: tokens)
                 initInst = resolved.inst
                 if !isConstantInitializer(initializer, tree: tree, tokens: tokens) {
                     reportError("initializer element is not a compile-time constant", diagId: .semaConstantExprNotConstant, at: tree.token(of: initializer), in: tokens)
@@ -851,7 +883,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             }
             if initializer != nil || !spec.isExtern {
                 registerFileScopeObject(SemGlobal(
-                    declId: declId, symbol: name, type: varType, isExternal: !isStatic, isThreadLocal: spec.isThreadLocal,
+                    declId: declId, symbol: asmLabels[name] ?? name, type: varType, isExternal: !isStatic, isThreadLocal: spec.isThreadLocal,
                     alignment: max(objectAlignment, alignment ?? 1), initBlock: .nilId, initInst: initInst, isTentative: initializer == nil))
             }
 
@@ -887,7 +919,7 @@ public struct CSemanticAnalyzer: ~Copyable {
 
         var initInst = SemInstId.nilId
         if let initializer {
-            let resolved = resolveVariableInitializer(initializer, type: varType, infersType: spec.infersType, tree: tree, tokens: tokens)
+            let resolved = resolveVariableInitializer(initializer, type: declaredType, infersType: spec.infersType, tree: tree, tokens: tokens)
             initInst = resolved.inst
             if spec.isStatic && !isConstantInitializer(initializer, tree: tree, tokens: tokens) {
                 reportError("initializer element is not a compile-time constant", diagId: .semaConstantExprNotConstant, at: tree.token(of: initializer), in: tokens)
@@ -1094,13 +1126,14 @@ public struct CSemanticAnalyzer: ~Copyable {
             let mChildren = tree.children(of: member)
             guard let specsNode = mChildren.first(where: { tree.kind(of: $0) == .declSpecs }) else { continue }
             let spec = resolveDeclSpecs(specsNode, tree: tree, tokens: tokens)
-            let specAttributes = tree.children(of: specsNode).filter { tree.kind(of: $0) == .attributeSpec }
+            let specAttributes = mChildren.prefix { tree.kind(of: $0) == .attributeSpec }
+                + tree.children(of: specsNode).filter { tree.kind(of: $0) == .attributeSpec }
             if !mChildren.contains(where: { tree.kind(of: $0) == .declarator }) {
                 // C11 anonymous struct or union member; a named tag here only declares the tag
                 let specChildren = tree.children(of: specsNode)
                 if let tag = specChildren.first(where: { tree.kind(of: $0) == .structType || tree.kind(of: $0) == .unionType }),
                    [.kwStruct, .kwUnion].contains(CTokenKind(rawValue: tokens.kind(of: tree.token(of: tag)))) {
-                    let attributes = specAttributes + mChildren.filter { tree.kind(of: $0) == .attributeSpec }
+                    let attributes = specAttributes + mChildren.drop { tree.kind(of: $0) == .attributeSpec }.filter { tree.kind(of: $0) == .attributeSpec }
                     members.append(StructMemberDecl(name: "", type: spec.type, alignment: explicitAlignment(attributes, tree: tree, tokens: tokens),
                                                     isPacked: hasPackedAttribute(attributes, tree: tree, tokens: tokens)))
                 }
@@ -1157,8 +1190,10 @@ public struct CSemanticAnalyzer: ~Copyable {
         }
 
         let typeAttributes = children.filter { tree.kind(of: $0) == .attributeSpec }
+        // The `#pragma pack` in effect where the definition starts (a directive cannot come between tag and brace)
         typePool.completeStruct(structTypeId, fields: members, isPacked: hasPackedAttribute(typeAttributes, tree: tree, tokens: tokens),
-                                alignment: explicitAlignment(typeAttributes, tree: tree, tokens: tokens))
+                                alignment: explicitAlignment(typeAttributes, tree: tree, tokens: tokens),
+                                maxFieldAlignment: tokens.packAlignment(at: nameTok))
         if !name.isEmpty {
             _ = declTable.append(kind: isUnion ? .unionDecl : .structDecl, name: name, type: QualType(typeId: structTypeId))
         }
@@ -1785,16 +1820,29 @@ public struct CSemanticAnalyzer: ~Copyable {
     private func promotedType(of value: SemInstId) -> QualType {
         let t = typeOf(value)
         guard typePool.isInteger(type: t.typeId) else { return t.unqualified() }
-        let promotedId = typePool.promote(type: t.typeId)
-        // A bit-field of a type whose promoted type is `int` or `unsigned int` promotes to `int` if `int` can
-        // represent all its values (C23 6.3.1.1p2)
-        if kindOf(value) == .lvalueToRvalue, (promotedId == .int || promotedId == .uint) {
-            let operand = SemInstId(block.block.arg0[value])
-            if kindOf(operand) == .bitField, let width = block.block.extra(of: operand).dropFirst(2).first, width < 32 {
-                return .int
-            }
-        }
-        return QualType(typeId: promotedId)
+        return bitFieldPromotedType(value) ?? QualType(typeId: typePool.promote(type: t.typeId))
+    }
+
+    /// The type a bit-field promotes to (C23 6.3.1.1p2), as Clang's `isPromotableBitField` decides it (compatible
+    /// with GCC): an integer or enumeration bit-field narrower than `int` promotes to `int`, whatever its declared type
+    /// (`unsigned long f : 4` too), and one as wide as `int` to `int` or `unsigned int` by its signedness; a wider one,
+    /// or a `_BitInt` one, is not promoted. `value` is the bit-field lvalue or its lvalue conversion; nil for other
+    /// values.
+    private func bitFieldPromotedType(_ value: SemInstId) -> QualType? {
+        let field = kindOf(value) == .lvalueToRvalue ? SemInstId(block.block.arg0[value]) : value
+        guard kindOf(field) == .bitField, !typePool.isBitPrecise(typeOf(field).typeId) else { return nil }
+        let extra = Array(block.block.extra(of: field))
+        guard extra.count >= 4 else { return nil }
+        let width = Int(extra[2]), isSigned = extra[3] != 0
+        if width < 32 { return .int }
+        if width == 32 { return isSigned ? .int : QualType(typeId: .uint) }
+        return nil
+    }
+
+    /// The type an arithmetic operand enters the usual arithmetic conversions with: a bit-field's promoted type, or
+    /// its own.
+    private func arithmeticOperandType(_ value: SemInstId) -> QualType {
+        bitFieldPromotedType(value) ?? typeOf(value)
     }
 
     /// The default argument promotions (C23 6.5.2.2p6): `float` (and `_Float16`) to `double`, and the integer
@@ -2036,32 +2084,52 @@ public struct CSemanticAnalyzer: ~Copyable {
             stmts.append(emitList(.switchStmt, .void, arg0: control.rawIndex, items: [body.rawIndex, context.defaultLabel.rawIndex] + context.cases,
                                   node: stmtNode).rawIndex)
 
-        case .caseStmt:
+        case .caseStmt, .caseRangeStmt:
             let children = tree.children(of: stmtNode)
             let caseTok = tree.token(of: stmtNode)
-            var value: Int64 = 0
-            if let valueNode = children.first {
-                if switchStack.isEmpty {
-                    reportError("'case' statement not in switch statement", diagId: .semaJumpOutsideLoop, at: caseTok, in: tokens, args: ["case", "switch statement"])
-                } else if !isIntegerConstantExpression(valueNode, tree: tree, tokens: tokens) {
-                    reportError("expression is not an integer constant expression", diagId: .semaConstantExprNotConstant, at: tree.token(of: valueNode), in: tokens)
-                } else {
-                    let v = evaluateIntegerConstant(valueNode, tree: tree, tokens: tokens)
-                    if switchStack[switchStack.count - 1].values.insert(v).inserted == false {
-                        reportError("duplicate case value '\(v)'", diagId: .semaDuplicateCase, at: tree.token(of: valueNode), in: tokens, args: ["case value '\(v)'"])
+            let bounds = tree.kind(of: stmtNode) == .caseRangeStmt ? 2 : 1
+            // Each bound: an integer constant expression, converted to the promoted type of the controlling
+            // expression (C23 6.8.5.3p5)
+            var raw: [Int64] = []
+            var converted: [Int64] = []
+            if switchStack.isEmpty {
+                reportError("'case' statement not in switch statement", diagId: .semaJumpOutsideLoop, at: caseTok, in: tokens, args: ["case", "switch statement"])
+            } else {
+                for valueNode in children.prefix(bounds) {
+                    guard isIntegerConstantExpression(valueNode, tree: tree, tokens: tokens) else {
+                        reportError("expression is not an integer constant expression", diagId: .semaConstantExprNotConstant, at: tree.token(of: valueNode), in: tokens)
+                        continue
                     }
-                    // The value converted to the promoted type of the controlling expression (C23 6.8.5.3p5)
+                    let v = evaluateIntegerConstant(valueNode, tree: tree, tokens: tokens)
                     let controlType = switchStack[switchStack.count - 1].controlType.typeId
-                    value = integerTraits(controlType) != nil ? makeConst(UInt64(bitPattern: v), controlType).signedValue : v
+                    raw.append(v)
+                    converted.append(integerTraits(controlType) != nil ? makeConst(UInt64(bitPattern: v), controlType).signedValue : v)
+                }
+                if raw.count == bounds {
+                    let (low, high) = (raw[0], raw[bounds - 1])
+                    var context = switchStack[switchStack.count - 1]
+                    let clash = context.ranges.first { $0.0 <= high && low <= $0.1 }.map(\.0)
+                        ?? (bounds == 1 ? (context.values.contains(low) ? low : nil) : context.values.first { (low...max(low, high)).contains($0) })
+                    if let clash, low <= high {
+                        reportError("duplicate case value '\(clash)'", diagId: .semaDuplicateCase, at: tree.token(of: children[0]), in: tokens, args: ["case value '\(clash)'"])
+                    }
+                    if bounds == 1 { context.values.insert(low) } else if low <= high { context.ranges.append((low, high)) }
+                    switchStack[switchStack.count - 1] = context
                 }
             }
-            let constant = block.block.addIntConstant(value)
-            let sub = labeledStatement(of: stmtNode, skip: 1, tree: tree, tokens: tokens)
-            let label = emit(.caseLabel, .void, (sub ?? .nilId).rawIndex, constant, node: stmtNode)
+            while converted.count < bounds { converted.append(0) }
+            let sub = labeledStatement(of: stmtNode, skip: bounds, tree: tree, tokens: tokens)
+            let label: SemInstId
+            if bounds == 1 {
+                label = emit(.caseLabel, .void, (sub ?? .nilId).rawIndex, block.block.addIntConstant(converted[0]), node: stmtNode)
+            } else {
+                let low = block.block.addIntConstant(converted[0]), high = block.block.addIntConstant(converted[1])
+                label = emitList(.caseRange, .void, arg0: (sub ?? .nilId).rawIndex, items: [low, high], node: stmtNode)
+            }
             if !switchStack.isEmpty { switchStack[switchStack.count - 1].cases.append(label.rawIndex) }
             stmts.append(label.rawIndex)
             if sub == nil {
-                for child in children.dropFirst() { analyzeStatement(child, into: &stmts, tree: tree, tokens: tokens) }
+                for child in children.dropFirst(bounds) { analyzeStatement(child, into: &stmts, tree: tree, tokens: tokens) }
             }
 
         case .defaultStmt:
@@ -2311,10 +2379,11 @@ public struct CSemanticAnalyzer: ~Copyable {
                     opcode = opcode == .add ? .ptrAdd : .ptrSub
                     value = pointerIndex(value)
                 } else if opcode == .shl || opcode == .shr {
-                    computation = QualType(typeId: typePool.promote(type: lhsType.typeId))
+                    computation = bitFieldPromotedType(lhs) ?? QualType(typeId: typePool.promote(type: lhsType.typeId))
                     value = promoted(value)
                 } else if typePool.isArithmetic(type: lhsType.typeId) && typePool.isArithmetic(type: typeOf(value).typeId) {
-                    computation = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, typeOf(value).typeId))
+                    let lhsOperand = bitFieldPromotedType(lhs) ?? lhsType
+                    computation = QualType(typeId: typePool.commonArithmeticType(lhsOperand.typeId, arithmeticOperandType(value).typeId))
                     value = convertImplicitly(value, to: computation, reason: .arithmeticConvert, node: children[1])
                 }
             }
@@ -2393,7 +2462,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             checkScalarCondition(cond, at: tree.token(of: exprNode), tokens: tokens)
             var thenType = QualType.error
             if isTyped(thenInst) && isTyped(elseInst) {
-                thenType = conditionalResultType(typeOf(thenInst), typeOf(elseInst), at: tree.token(of: exprNode), tokens: tokens)
+                thenType = conditionalResultType(arithmeticOperandType(thenInst), arithmeticOperandType(elseInst), at: tree.token(of: exprNode), tokens: tokens)
             }
             nodeTypes[exprNode] = thenType.typeId
             if children.count == 2 {
@@ -2419,7 +2488,6 @@ public struct CSemanticAnalyzer: ~Copyable {
             let ctrlType = (isTyped(ctrlInst) ? decayed(rawType) : rawType).unqualified()
             unevaluatedDepth -= 1
             container.block.truncate(to: mark)
-            let ctrlCan = typePool.canonical(of: ctrlType.typeId)
 
             var selectedNode: NodeId? = nil
             var defaultNode: NodeId? = nil
@@ -2429,9 +2497,10 @@ public struct CSemanticAnalyzer: ~Copyable {
                 let assoc = children[i]
                 let aChildren = tree.children(of: assoc)
                 if aChildren.count >= 2 {
-                    let aType = resolveType(from: aChildren[0], tree: tree, tokens: tokens).unqualified()
-                    let aCan = typePool.canonical(of: aType.typeId)
-                    if (aType.typeId == ctrlType.typeId || aCan == ctrlCan) && selectedNode == nil {
+                    // C23 6.5.2.1p3: the association whose type is compatible with the controlling type, which is
+                    // unqualified, so a qualified association type never matches
+                    let aType = resolveType(from: aChildren[0], tree: tree, tokens: tokens)
+                    if selectedNode == nil, aType.qualifiers == 0, typesCompatible(aType, ctrlType) {
                         selectedNode = aChildren[1]
                     }
                 } else if aChildren.count == 1 {
@@ -2441,7 +2510,11 @@ public struct CSemanticAnalyzer: ~Copyable {
             }
 
             guard let chosen = selectedNode ?? defaultNode else {
-                // Association matching is approximate (types are compared by identity, not compatibility): leave untyped
+                if !ctrlType.isError {
+                    let name = typePool.name(of: ctrlType)
+                    reportError("controlling expression type '\(name)' not compatible with any generic association",
+                                diagId: .semaGenericNoMatch, at: tree.token(of: exprNode), in: tokens, args: [name])
+                }
                 nodeTypes[exprNode] = .int
                 return container.block.append(kind: .errorInst, type: .int, node: exprNode)
             }
@@ -2629,7 +2702,7 @@ public struct CSemanticAnalyzer: ~Copyable {
         if isComparison {
             nodeTypes[exprNode] = .int
             if lArith && rArith {
-                let common = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
+                let common = QualType(typeId: typePool.commonArithmeticType(arithmeticOperandType(l).typeId, arithmeticOperandType(r).typeId))
                 l = convertImplicitly(l, to: common, reason: .arithmeticConvert, node: children[0])
                 r = convertImplicitly(r, to: common, reason: .arithmeticConvert, node: children[1])
             } else if typePool.isPointer(type: typeOf(l).typeId) || typePool.isPointer(type: typeOf(r).typeId) {
@@ -2671,7 +2744,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                 nodeTypes[exprNode] = .int
                 return emit(.errorInst, .int, l.rawIndex, r.rawIndex, node: exprNode)
             }
-            let common = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
+            let common = QualType(typeId: typePool.commonArithmeticType(arithmeticOperandType(l).typeId, arithmeticOperandType(r).typeId))
             l = convertImplicitly(l, to: common, reason: .arithmeticConvert, node: children[0])
             r = convertImplicitly(r, to: common, reason: .arithmeticConvert, node: children[1])
             nodeTypes[exprNode] = common.typeId

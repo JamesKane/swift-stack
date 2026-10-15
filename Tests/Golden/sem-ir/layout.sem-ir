@@ -1,0 +1,37 @@
+file scope
+  %1 = int 1 : int
+  %2 = assign_convert %1 int_to_int : char
+  %3 = int 2 : int
+  %4 = int 3 : int
+  %5 = assign_convert %4 int_to_int : short
+  %6 = init_list {[0] %2, [1] %3, [2] %5} : struct Packed
+  %7 = int 1 : int
+  %8 = assign_convert %7 int_to_int : char
+  %9 = float 0x4000000000000000 : double
+  %10 = int 1 : int
+  %11 = neg %10 : int
+  %12 = int 5 : int
+  %13 = init_list {[0] %8, [1] %9, [2] %11, [3] %12} : struct Two
+  %14 = int 1 : int
+  %15 = assign_convert %14 int_to_int : char
+  %16 = int 2 : int
+  %17 = assign_convert %16 int_to_int : long
+  %18 = init_list {[0] %15, [1] %17} : struct One
+  %19 = int 1 : int
+  %20 = assign_convert %19 int_to_int : char
+  %21 = int 2 : int
+  %22 = init_list {[0] %20, [1] %21} : struct StillTwo
+  %23 = int 1 : int
+  %24 = assign_convert %23 int_to_int : char
+  %25 = int 2 : int
+  %26 = init_list {[0] %24, [1] %25} : struct Normal
+global packed: struct Packed align 8 init %6
+  bytes [01 02 00 00 00 00 00 00 03 00 00 00 00 00 00 00]
+global two: struct Two align 2 init %13
+  bytes [01 00 00 00 00 00 00 00 00 40 2f 00 00 00 00 00]
+global one: struct One align 1 init %18
+  bytes [01 02 00 00 00 00 00 00 00]
+global still: struct StillTwo align 2 init %22
+  bytes [01 00 02 00 00 00]
+global normal: struct Normal align 4 init %26
+  bytes [01 00 00 00 02 00 00 00]

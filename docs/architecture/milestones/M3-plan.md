@@ -31,13 +31,40 @@ The phases are worked in order, each as one or more serial agent tasks with its 
 | 7 | Debug and repro | CUD records ([07](../07-debugging-and-sdi.md) §5.5) from the frame layout, a minimal SDI fragment (procedures, line table), the `ssdb` symbolizer, and `--record`/`--replay` bundles ([15](../15-driver-and-diagnostics.md) §4.8). | Exit criterion 3; a replayed bundle reproduces its recorded output hashes |
 | 8 | VectraOS | A C program built by Swift-Stack, linked with VectraOS's `libcroi-runtime.a` (clang-built at `-O2` with `-fstack-protector-strong`), loaded by its kernel and run under QEMU. A Swift-Stack test builds VectraOS out of tree in its own build directory, substitutes the program, and boots it with `tools/qemu.sh`. VectraOS sources are not changed. | Exit criterion 2 |
 
-## 3. Decisions taken in scoping
+## 3. Progress
+
+**Phase 1 is done** (2026-10-15). Its gate:
+- **The SemIR verifier passes on every corpus.** That covers c-testsuite (220 files), SQLite, Lua and VectraOS (both architectures), with no verifier issues, no unmodeled instructions, and a data image for every static object.
+- **Layout matches clang 22.** `sizeof`, `_Alignof` and `offsetof` agree on 100 generated probe files per target (x86-64, AArch64, RISC-V), which cover packed and aligned records, `#pragma pack`, bit-fields, `_BitInt`, `long double` and flexible array members.
+- **Initializer images match `clang -c -O0`.** That holds on 300 generated files per target and for every global of the x86-64 corpora (268 files), relocations included.
+- **Golden `--dump=sem-ir` tests** cover conversions, control flow, lvalues, static initializers and layout (`Tests/Golden/sem-ir`).
+
+The probes found and fixed:
+- `#pragma pack` (it had been ignored);
+- `_Alignas` on a member (it applied to the record instead);
+- the AAPCS64 alignment of unnamed bit-fields;
+- `asm` labels (it had been ignored, so glibc's `stat64` redirect was lost);
+- brace elision in the length of an array of unknown size;
+- the spacing of `#` stringizing;
+- `_Generic` association matching;
+- static flexible array members;
+- bit-field integer promotion;
+- GNU case ranges.
+
+Carried forward:
+- **Phase 4:** LLVM gives an internal object of size 0 one byte, so that distinct objects have distinct addresses. The object writer should do the same.
+- **Phase 6:** `_Complex` is not supported (`__STDC_NO_COMPLEX__`; 02 §4.2.6), so GCC torture tests that use it are out of the differential set.
+- **Clang divergences, not defects:**
+  - Clang 22 emits an initialized array of `_BitInt(N > 128)`, or a record holding one, with LLVM's larger allocation size: `_BitInt(300) a[6]` has `sizeof` 240 but a 280-byte symbol. The image probes keep these out.
+  - The D7 profile predefines clang 19's `__clang_version__` and GCC 14's `__GNUC__`, so a string built from them differs from clang 22's (SQLite's compile options).
+
+## 4. Decisions taken in scoping
 
 - **SQLite is staged.** The M3 exit uses the amalgamation and its shell on a scripted SQL corpus. SQLite's TCL test suite (`testfixture`, dynamically linked against the host's libtcl) becomes a follow-on gate once dynamic linking is proven.
 - **`long double` is supported.** The SysV X87 class and an x87 encoder subset are in M3, which reverses M2's exclusion of x87 for exactly that subset.
 - **VectraOS is exercised from Swift-Stack's side**, with an out-of-tree build and no VectraOS source changes.
 - **`-g` gives DWARF 5 `.debug_line`** from both the code generator and the assembler, so gdb and perf get file and line on Linux. Variable information stays in SDI, after M3.
 
-## 4. Out of scope for M3
+## 5. Out of scope for M3
 
 Optimization beyond `-O0` (M5), the AArch64 and RV64 back ends (M5), the RV64 linker and its relaxation (M5), `-march` enforcement on AArch64, FreeBSD and Mach-O output, shared-library output, general-dynamic TLS, DWARF variable information, and the interactive `ssdb` debugger.

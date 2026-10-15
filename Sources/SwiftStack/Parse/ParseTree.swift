@@ -56,6 +56,8 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
     case breakStmt = 46
     case labelStmt = 47
     case asmStmt = 48
+    /// GNU `case low ... high:`: children are the two bounds, then the labeled statement, if any.
+    case caseRangeStmt = 75
 
     // Expressions (30..38, 49..63)
     case assignExpr = 30
@@ -133,6 +135,7 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
         case .forStmt: return "forStmt"
         case .switchStmt: return "switchStmt"
         case .caseStmt: return "caseStmt"
+        case .caseRangeStmt: return "caseRangeStmt"
         case .defaultStmt: return "defaultStmt"
         case .gotoStmt: return "gotoStmt"
         case .continueStmt: return "continueStmt"

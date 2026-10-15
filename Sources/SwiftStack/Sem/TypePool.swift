@@ -450,20 +450,27 @@ public final class TypePool {
     }
 
     /// Creates a complete struct or union type.
-    public func structType(name: String, fields: [StructMemberDecl], isUnion: Bool, isPacked: Bool = false, alignment: Int? = nil) -> TypeId {
+    public func structType(name: String, fields: [StructMemberDecl], isUnion: Bool, isPacked: Bool = false, alignment: Int? = nil,
+                           maxFieldAlignment: Int? = nil) -> TypeId {
         let id = declareStruct(name: name, isUnion: isUnion)
-        completeStruct(id, fields: fields, isPacked: isPacked, alignment: alignment)
+        completeStruct(id, fields: fields, isPacked: isPacked, alignment: alignment, maxFieldAlignment: maxFieldAlignment)
         return id
     }
 
     /// Defines the members of a declared struct or union, laid out per the x86-64 System V psABI (the AArch64 and
     /// RISC-V psABIs share these rules): members at their alignment; a bit-field shares the storage unit of its
     /// declared type with the bits before it unless it would cross that unit's boundary; a zero-width bit-field ends
-    /// the unit (and on AArch64 raises the structure's alignment to its type's); unnamed bit-fields do not affect the
-    /// alignment. `packed` aligns every member at 1 and lets bit-fields straddle units. An `aligned`/`alignas`
-    /// member alignment raises the member's alignment (also in a packed structure), and `alignment` (the type's own
-    /// `aligned` attribute) raises the structure's.
-    public func completeStruct(_ id: TypeId, fields: [StructMemberDecl], isPacked: Bool = false, alignment explicitAlignment: Int? = nil) {
+    /// the unit; unnamed bit-fields do not affect the alignment (AArch64 differs: `DataLayout.unnamedBitFieldsAlign`).
+    /// `packed` aligns every member at 1 and lets bit-fields straddle units. An `aligned`/`alignas` member alignment
+    /// raises the member's alignment (also in a packed structure), and `alignment` (the type's own `aligned`
+    /// attribute) raises the structure's.
+    ///
+    /// `maxFieldAlignment` is the `#pragma pack` in effect, as Clang's Itanium layout applies it: it caps every
+    /// member's alignment (an explicit member alignment too, but not the structure's own), bit-fields are placed
+    /// without padding so they may straddle units, and a bit-field of a packed structure keeps its unpacked
+    /// alignment, capped.
+    public func completeStruct(_ id: TypeId, fields: [StructMemberDecl], isPacked: Bool = false, alignment explicitAlignment: Int? = nil,
+                               maxFieldAlignment: Int? = nil) {
         guard case .struct(let name, _, let isUnion) = typeInfo(of: id).kind else { return }
         var structFields: [StructField] = []
         var bitOffset = 0  // next free bit (struct), or the widest member in bits (union)
@@ -472,10 +479,19 @@ public final class TypePool {
         for f in fields {
             let fSize = size(of: f.type.typeId)
             let packed = isPacked || f.isPacked
-            let fAlign = max(packed ? 1 : max(1, alignment(of: f.type.typeId)), f.alignment ?? 1)
+            let natural = max(max(1, alignment(of: f.type.typeId)), f.alignment ?? 1)
+            var fAlign = packed ? max(1, f.alignment ?? 1) : natural
+            if let pack = maxFieldAlignment, f.bitWidth != 0 {
+                // Under `#pragma pack`, a bit-field of a packed structure is aligned as if unpacked (then capped)
+                fAlign = min(packed && f.bitWidth != nil ? natural : fAlign, pack)
+            }
+            // `#pragma pack`, with any value, suppresses padding before a bit-field
+            let padsBitFields = !packed && maxFieldAlignment == nil
             if let width = f.bitWidth {
                 let unitBits = max(8, fSize * 8)
-                if !f.name.isEmpty { maxAlign = max(maxAlign, fAlign) }
+                if !f.name.isEmpty || dataLayout.unnamedBitFieldsAlign { maxAlign = max(maxAlign, fAlign) }
+                // AAPCS64: a zero-width bit-field raises the alignment to its type's, packed or not, in a union too
+                if width == 0 && dataLayout.unnamedBitFieldsAlign { maxAlign = max(maxAlign, alignment(of: f.type.typeId)) }
                 if isUnion {
                     structFields.append(StructField(name: f.name, type: f.type, offset: 0, bitWidth: width))
                     bitOffset = max(bitOffset, width)
@@ -483,13 +499,12 @@ public final class TypePool {
                 }
                 if width == 0 {
                     bitOffset = (bitOffset + unitBits - 1) / unitBits * unitBits
-                    if dataLayout.zeroWidthBitFieldAligns && !packed { maxAlign = max(maxAlign, fAlign) }
                     continue
                 }
-                if !packed && bitOffset / unitBits != (bitOffset + width - 1) / unitBits {
+                if padsBitFields && bitOffset / unitBits != (bitOffset + width - 1) / unitBits {
                     bitOffset = (bitOffset + fAlign * 8 - 1) / (fAlign * 8) * (fAlign * 8)
                 }
-                let unitStart = packed ? bitOffset / 8 : bitOffset / unitBits * fSize
+                let unitStart = padsBitFields ? bitOffset / unitBits * fSize : bitOffset / 8
                 structFields.append(StructField(name: f.name, type: f.type, offset: UInt32(unitStart), bitWidth: width,
                                                 bitOffset: bitOffset - unitStart * 8))
                 bitOffset += width

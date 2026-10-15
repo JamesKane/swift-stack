@@ -2,9 +2,8 @@ import Foundation
 import Testing
 @testable import SwiftStack
 
-// M3 phase 1 gates (milestones/M3-plan.md §2): the SemIR verifier passes on every C corpus the M1 tests check;
-// `sizeof`/`_Alignof`/`offsetof` match clang 22 on generated probes for x86-64, AArch64 and RISC-V; the data images
-// of generated global initializers match `clang-22 -c -O0` for x86-64; and golden `--dump=sem-ir` tests.
+// M3 phase 1 gates (milestones/M3-plan.md §2): the SemIR verifier passes on every C corpus the M1 tests check, and
+// golden `--dump=sem-ir` tests. The layout and data-image comparisons with clang are in M3ClangProbeTests.
 
 enum SemIRCorpusCheck {
     /// Front-end counts over a corpus, for the gate report.
@@ -122,5 +121,36 @@ struct M3SemIRCorpusTests {
             verified += 1
         }
         #expect(verified > 100)
+    }
+}
+
+/// Golden `--dump=sem-ir` tests (`Tests/Golden/sem-ir`): each `.c` file's SemIR for x86-64, verified and compared with
+/// the `.sem-ir` file beside it. `SWIFTSTACK_UPDATE_GOLDEN=1` rewrites the expectations; review the diff.
+@Suite("M3 — golden SemIR dumps")
+struct M3SemIRGoldenTests {
+    static var directory: String { CCorpora.repoTests.appendingPathComponent("Golden/sem-ir").path }
+    static var sources: [String] { CCorpora.cFiles(in: directory) }
+
+    @Test("Golden SemIR", arguments: sources)
+    func golden(_ path: String) throws {
+        let outcome = try CFrontendCheck.run(path: path, target: CTarget(arch: "x86_64", triple: "x86_64-unknown-linux-gnu", flags: []))
+        let module = try #require(outcome.module, "\(path): \(outcome.firstError)")
+        var verifier = SemIRVerifier(module: module)
+        verifier.run()
+        #expect(verifier.issues.isEmpty, "\(path): \(verifier.issues.prefix(5))")
+        #expect(verifier.summary.unmodeled == 0, "\(path): unmodeled instructions")
+
+        let actual = module.dumpText()
+        let expectedPath = String(path.dropLast(2)) + ".sem-ir"
+        if ProcessInfo.processInfo.environment["SWIFTSTACK_UPDATE_GOLDEN"] == "1" {
+            try actual.write(toFile: expectedPath, atomically: true, encoding: .utf8)
+            return
+        }
+        let expected = try String(contentsOfFile: expectedPath, encoding: .utf8)
+        if actual != expected {
+            let a = actual.split(separator: "\n", omittingEmptySubsequences: false), e = expected.split(separator: "\n", omittingEmptySubsequences: false)
+            let line = zip(a, e).enumerated().first { $0.element.0 != $0.element.1 }?.offset ?? min(a.count, e.count)
+            Issue.record("\(expectedPath):\(line + 1): expected '\(line < e.count ? e[line] : "<end>")', got '\(line < a.count ? a[line] : "<end>")'")
+        }
     }
 }

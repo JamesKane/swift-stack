@@ -94,9 +94,15 @@ public struct StaticInitializerEvaluator {
             let fields = typePool.fields(of: can)
             var elementType = QualType.error
             var elementSize = 0
-            if case .array(let element, _) = typePool.typeInfo(of: can).kind {
+            if case .array(let element, let length) = typePool.typeInfo(of: can).kind {
                 elementType = element
                 elementSize = typePool.size(of: element.typeId)
+                if length == 0 {
+                    // A flexible array member initialized statically (a GNU extension): the object grows to hold it
+                    var end = 0
+                    for j in stride(from: 0, to: items.count - 2, by: 3) { end = max(end, Int(items[j]) + Int(items[j + 1])) }
+                    grow(&image, to: offset + end * elementSize)
+                }
             }
             var i = 0
             while i + 2 < items.count {
@@ -122,6 +128,7 @@ public struct StaticInitializerEvaluator {
             let s = c.block.stringConstant(of: inst)
             let size = typePool.size(of: can)
             let n = size == 0 ? s.bytes.count : min(size, s.bytes.count)
+            if size == 0 { grow(&image, to: offset + n) }
             try checkBounds(offset, n, image)
             for k in 0..<n { image.bytes[offset + k] = s.bytes[k] }
         default:
@@ -169,7 +176,12 @@ public struct StaticInitializerEvaluator {
     }
 
     private func checkBounds(_ offset: Int, _ size: Int, _ image: DataImage) throws {
-        guard offset >= 0, offset + size <= image.bytes.count else { throw Failure.unsupported("initializer beyond the object (a flexible array member)") }
+        guard offset >= 0, offset + size <= image.bytes.count else { throw Failure.unsupported("initializer beyond the object") }
+    }
+
+    /// Extends `image` with zero bytes to at least `size` bytes.
+    private func grow(_ image: inout DataImage, to size: Int) {
+        if size > image.bytes.count { image.bytes.append(contentsOf: [UInt8](repeating: 0, count: size - image.bytes.count)) }
     }
 
     /// Sets `width` bits at bit `bitOffset` of the storage unit at byte `offset` (little-endian bit order).

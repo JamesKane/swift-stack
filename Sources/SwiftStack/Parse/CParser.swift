@@ -571,6 +571,8 @@ public struct CParser: ~Copyable {
             defer { memberDeclarationDepth -= 1 }
             while !isAtEnd && currentKind != .rBrace {
                 let prevCursor = cursor
+                // Attributes and alignment specifiers before a member belong to it (they are its first children)
+                let memberStart = parseTree.count
                 parseAttributes()
                 if currentKind == .rBrace { break }
                 if currentKind == .kwStaticAssert {
@@ -578,7 +580,7 @@ public struct CParser: ~Copyable {
                 } else if currentKind == .semicolon {
                     advance()
                 } else if isTypeStart() {
-                    _ = parseMemberDeclaration()
+                    _ = parseMemberDeclaration(start: memberStart)
                 } else {
                     // Not a member declaration: record the syntax error instead of skipping the token
                     parseTree.appendLeaf(kind: .errorNode, token: advance(), hasError: true)
@@ -594,10 +596,10 @@ public struct CParser: ~Copyable {
         return parseTree.append(kind: isUnion ? .unionType : .structType, token: anchorTok, subtreeSize: subSize)
     }
 
-    /// A member declaration (C23 6.7.2.1): `fieldDecl` with children `declSpecs`, then each `declarator`
-    /// followed by its bit-field width, if any. An unnamed bit-field has an empty declarator whose token is the `:`.
-    private mutating func parseMemberDeclaration() -> NodeId {
-        let start = parseTree.count
+    /// A member declaration (C23 6.7.2.1): `fieldDecl` with children the attributes before it (from `start`), then
+    /// `declSpecs`, then each `declarator` followed by its bit-field width, if any. An unnamed bit-field has an
+    /// empty declarator whose token is the `:`.
+    private mutating func parseMemberDeclaration(start: UInt32) -> NodeId {
         parseDeclarationSpecifiers()
         var firstName = currentTokenId
         var isFirst = true
@@ -996,13 +998,19 @@ public struct CParser: ~Copyable {
         case .kwCase:
             let start = parseTree.count
             let anchor = advance()
-            _ = parseExpression()
+            _ = parseConditionalExpression()
+            // GNU case range `case low ... high:`
+            let isRange = currentKind == .ellipsis
+            if isRange {
+                advance()
+                _ = parseConditionalExpression()
+            }
             expect(.colon)
             if currentKind != .rBrace && currentKind != .kwCase && currentKind != .kwDefault {
                 _ = parseStatement()
             }
             let subSize = parseTree.count - start + 1
-            return parseTree.append(kind: .caseStmt, token: anchor, subtreeSize: subSize)
+            return parseTree.append(kind: isRange ? .caseRangeStmt : .caseStmt, token: anchor, subtreeSize: subSize)
 
         case .kwDefault:
             let start = parseTree.count

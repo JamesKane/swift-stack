@@ -151,6 +151,8 @@ extension SemModule {
             ops = extra.count >= 2 ? "\(r(a0)) body \(r(extra[0])) default \(r(extra[1])) cases [\(extra.dropFirst(2).map { r($0) }.joined(separator: ", "))]" : r(a0)
         case .caseLabel:
             ops = "\(c.block.intConstant(at: a1)): \(r(a0))"
+        case .caseRange:
+            ops = extra.count == 2 ? "\(c.block.intConstant(at: extra[0])) ... \(c.block.intConstant(at: extra[1])): \(r(a0))" : r(a0)
         case .defaultLabel:
             ops = r(a0)
         case .label:

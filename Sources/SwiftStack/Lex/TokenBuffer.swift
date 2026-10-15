@@ -7,6 +7,9 @@ public struct TokenBuffer: ~Copyable {
     public var flags: Column<TokenId, UInt8>
     public var starts: Column<TokenId, UInt32>
     public var ends: Column<TokenId, UInt32>
+    /// `#pragma pack` state changes, in token order: from `token` on, the maximum member alignment is `alignment`
+    /// (0: the target's default). Written by the C preprocessor, read by struct layout.
+    public var packChanges: [(token: TokenId, alignment: Int)] = []
 
     /// Initializes a TokenBuffer with reserved column capacity.
     public init(reservedCapacity: Int = 67_108_864) {
@@ -69,6 +72,16 @@ public struct TokenBuffer: ~Copyable {
     @inlinable
     public func end(of id: TokenId) -> SourceLocation {
         SourceLocation(ends[id])
+    }
+
+    /// The `#pragma pack` alignment in effect at `id` (nil when none is).
+    public func packAlignment(at id: TokenId) -> Int? {
+        var result = 0
+        for change in packChanges {
+            if change.token.rawIndex > id.rawIndex { break }
+            result = change.alignment
+        }
+        return result == 0 ? nil : result
     }
 
     /// Pre-commits capacity across all 4 columns.

@@ -157,7 +157,7 @@ public struct SemIRVerifier {
         case .switchStmt:
             // The listed labels are references, not uses: they are used by their parent statements
             return [(a0, false)] + (extra.first.map { [(SemInstId($0), nil)] } ?? [])
-        case .caseLabel, .defaultLabel, .label:
+        case .caseLabel, .caseRange, .defaultLabel, .label:
             return opt(a0, nil)
         case .returnStmt:
             return opt(a0, false)
@@ -509,13 +509,13 @@ public struct SemIRVerifier {
             guard extra.count >= 2 else { report(blockIndex, id, "switch: malformed"); return }
             var listed = Set(extra.dropFirst(2))
             if extra[1] != 0 { listed.insert(extra[1]) }
-            for label in listed where label >= c.block.count || ![.caseLabel, .defaultLabel].contains(c.block.kind(of: SemInstId(label))) {
+            for label in listed where label >= c.block.count || ![.caseLabel, .caseRange, .defaultLabel].contains(c.block.kind(of: SemInstId(label))) {
                 report(blockIndex, id, "switch lists %\(label), not a case or default label")
             }
             context.switches.append(listed)
             walk(SemInstId(extra[0]), &context)
             context.switches.removeLast()
-        case .caseLabel, .defaultLabel:
+        case .caseLabel, .caseRange, .defaultLabel:
             if context.switches.last?.contains(id.rawIndex) != true {
                 report(blockIndex, id, "\(kind.name) not listed by the enclosing switch")
             }

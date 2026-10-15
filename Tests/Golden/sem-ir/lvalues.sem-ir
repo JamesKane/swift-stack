@@ -1,0 +1,116 @@
+function id(i#7: int) -> int
+  %1 = decl @i#7 : int
+  %2 = load %1 : int
+  %3 = return %2
+  %4 = compound [%3]
+function lvalues(s#9: struct S *, n#10: int) -> int
+  %1 = decl @n#10 : int
+  %2 = load %1 : int
+  %3 = assign_convert %2 int_to_int : unsigned long
+  %4 = local @vla#11: int [*] vla type 45 length %3
+  %5 = decl @s#9 : struct S *
+  %6 = load %5 : struct S *
+  %7 = deref %6 : struct S
+  %8 = bitfield %7 +4 bit 0 width 3 unsigned unit 4 : unsigned int
+  %9 = int 5 : int
+  %10 = compound_assign %8 add= %9 in int : unsigned int
+  %11 = expr %10
+  %12 = decl @s#9 : struct S *
+  %13 = load %12 : struct S *
+  %14 = deref %13 : struct S
+  %15 = member %14 +8 : int [2]
+  %16 = int 1 : int
+  %17 = array_decay %15 : int *
+  %18 = arith_convert %16 int_to_int : long
+  %19 = ptradd %17, %18 : int *
+  %20 = deref %19 : int
+  %21 = postinc %20 : int
+  %22 = expr %21
+  %23 = decl @s#9 : struct S *
+  %24 = load %23 : struct S *
+  %25 = deref %24 : struct S
+  %26 = member %25 +0 : int
+  %27 = addr %26 : int *
+  %28 = local @p#12: int * = %27
+  %29 = decl @p#12 : int *
+  %30 = int 2 : int
+  %31 = arith_convert %30 int_to_int : long
+  %32 = compound_assign %29 ptradd= %31 in int * : int *
+  %33 = expr %32
+  %34 = decl @p#12 : int *
+  %35 = decl @s#9 : struct S *
+  %36 = load %35 : struct S *
+  %37 = deref %36 : struct S
+  %38 = member %37 +0 : int
+  %39 = addr %38 : int *
+  %40 = load %34 : int *
+  %41 = ptrdiff %40, %39 : long
+  %42 = local @diff#13: long = %41
+  %43 = decl @make#4 : struct S (void)
+  %44 = function_decay %43 : struct S (*)(void)
+  %45 = call %44() direct @make#4 params 0 : struct S
+  %46 = materialize %45 : struct S
+  %47 = member %46 +8 : int [2]
+  %48 = int 1 : int
+  %49 = array_decay %47 : int *
+  %50 = arith_convert %48 int_to_int : long
+  %51 = ptradd %49, %50 : int *
+  %52 = deref %51 : int
+  %53 = load %52 : int
+  %54 = local @t#14: int = %53
+  %55 = int 1 : int
+  %56 = int 2 : int
+  %57 = int 3 : int
+  %58 = init_list {[0] %55, [1] %56, [2] %57} : int [3]
+  %59 = compound_literal @_#16 = %58 : int [3]
+  %60 = array_decay %59 : int *
+  %61 = local @lit#15: int * = %60
+  %62 = vla_sizeof type 45 : unsigned long
+  %63 = local @size#17: unsigned long = %62
+  %64 = decl @n#10 : int
+  %65 = int 2 : int
+  %66 = load %64 : int
+  %67 = mul %66, %65 : int
+  %68 = local @y#19: int = %67
+  %69 = decl @y#19 : int
+  %70 = int 1 : int
+  %71 = load %69 : int
+  %72 = add %71, %70 : int
+  %73 = compound [%68]
+  %74 = stmt_expr %73 value %72 : int
+  %75 = local @g#18: int = %74
+  %76 = int 3 : int
+  %77 = int 1 : int
+  %78 = add %76, %77 : int
+  %79 = local @sel#20: int = %78
+  %80 = decl @p#12 : int *
+  %81 = load %80 : int *
+  %82 = deref %81 : int
+  %83 = decl @diff#13 : long
+  %84 = load %83 : long
+  %85 = cast %84 int_to_int : int
+  %86 = load %82 : int
+  %87 = add %86, %85 : int
+  %88 = decl @t#14 : int
+  %89 = load %88 : int
+  %90 = add %87, %89 : int
+  %91 = decl @lit#15 : int *
+  %92 = int 2 : int
+  %93 = load %91 : int *
+  %94 = arith_convert %92 int_to_int : long
+  %95 = ptradd %93, %94 : int *
+  %96 = deref %95 : int
+  %97 = load %96 : int
+  %98 = add %90, %97 : int
+  %99 = decl @size#17 : unsigned long
+  %100 = load %99 : unsigned long
+  %101 = cast %100 int_to_int : int
+  %102 = add %98, %101 : int
+  %103 = decl @g#18 : int
+  %104 = load %103 : int
+  %105 = add %102, %104 : int
+  %106 = decl @sel#20 : int
+  %107 = load %106 : int
+  %108 = add %105, %107 : int
+  %109 = return %108
+  %110 = compound [%4, %11, %22, %28, %33, %42, %54, %61, %63, %75, %79, %109]

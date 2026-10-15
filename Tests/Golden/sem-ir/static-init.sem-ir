@@ -1,0 +1,108 @@
+function keep() -> int *
+  %1 = int 3 : int
+  %2 = decl @local#25 : int
+  %3 = addr %2 : int *
+  %4 = return %3
+  %5 = compound [%4]
+file scope
+  %1 = int 7 : int
+  %2 = float 0x3fff_8000000000000000 : long double
+  %3 = int 3 : int
+  %4 = arith_convert %3 int_to_float : long double
+  %5 = div %2, %4 : long double
+  %6 = float 0x3dcccccd : float
+  %7 = string "hi\x00" : char [3]
+  %8 = string "hi\x00" : char [3]
+  %9 = decl @counter#7 : int
+  %10 = addr %9 : int *
+  %11 = string "string\x00" : char [7]
+  %12 = int 3 : int
+  %13 = array_decay %11 : char *
+  %14 = arith_convert %12 int_to_int : long
+  %15 = ptradd %13, %14 : char *
+  %16 = int 9 : int
+  %17 = int 1 : int
+  %18 = init_list {[1...+3] %16, [5] %17} : int [6]
+  %19 = int 1 : int
+  %20 = assign_convert %19 int_to_int : long
+  %21 = int 2 : int
+  %22 = assign_convert %21 int_to_int : long
+  %23 = int 3 : int
+  %24 = assign_convert %23 int_to_int : long
+  %25 = int 4 : int
+  %26 = assign_convert %25 int_to_int : long
+  %27 = int 5 : int
+  %28 = assign_convert %27 int_to_int : long
+  %29 = init_list {[0] %20, [1] %22} : long [2]
+  %30 = init_list {[0] %29, [1] %24} : struct P
+  %31 = init_list {[0] %26, [1] %28} : long [2]
+  %32 = init_list {[0] %31} : struct P
+  %33 = init_list {[0] %30, [1] %32} : struct P [2]
+  %34 = int 1 : int
+  %35 = neg %34 : int
+  %36 = int 31 : int
+  %37 = assign_convert %36 int_to_int : unsigned int
+  %38 = int 2 : int
+  %39 = neg %38 : int
+  %40 = assign_convert %39 int_to_int : long long
+  %41 = init_list {[0] %35, [1] %37, [2] %40} : struct B
+  %42 = float 0x4004000000000000 : double
+  %43 = neg %42 : double
+  %44 = init_list {[1] %43} : union U
+  %45 = int 2 : int
+  %46 = int 10 : int
+  %47 = assign_convert %46 int_to_int : short
+  %48 = int 20 : int
+  %49 = assign_convert %48 int_to_int : short
+  %50 = init_list {[0] %47, [1] %49} : short []
+  %51 = init_list {[0] %45, [1] %50} : struct F
+  %52 = int 4 : int
+  %53 = int 5 : int
+  %54 = init_list {[0] %52, [1] %53} : int [2]
+  %55 = compound_literal @_#20 = %54 : int [2]
+  %56 = array_decay %55 : int *
+  %57 = decl @renamed#21 : int (int)
+  %58 = function_decay %57 : int (*)(int)
+  %59 = assign_convert %58 ptr_to_ptr : int (*)(int)
+  %60 = decl @counter#7 : int
+  %61 = addr %60 : int *
+  %62 = cast %61 ptr_to_int : long
+global counter: int align 4 init %1
+  bytes [07 00 00 00]
+global ld: long double align 16 init %5
+  bytes [ab aa aa aa aa aa aa aa fd 3f 00 00 00 00 00 00]
+global fl: float align 4 init %6
+  bytes [cd cc cc 3d]
+global text: char [3] align 1 init %7
+  bytes [68 69 00]
+global exact: char [2] align 1 init %8
+  bytes [68 69]
+global ptr: int * align 8 init %10
+  bytes [00 00 00 00 00 00 00 00]
+  reloc +0 8 bytes -> counter+0
+global mid: char * align 8 init %15
+  bytes [00 00 00 00 00 00 00 00]
+  reloc +0 8 bytes -> string#0 "string\x00"+3
+global range: int [6] align 4 init %18
+  bytes [00 00 00 00 09 00 00 00 09 00 00 00 09 00 00 00 00 00 00 00 01 00 00 00]
+global elided: struct P [2] align 8 init %33
+  bytes [01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 04 00 00 00 00 00 00 00 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
+global bits: struct B align 8 init %41
+  bytes [ff fe ff ff ff ff 00 00]
+global u: union U align 8 init %44
+  bytes [00 00 00 00 00 00 04 c0]
+global flex: struct F align 4 init %51
+  bytes [02 00 00 00 0a 00 14 00]
+global .compoundliteral: int [2] align 4 internal init %54
+  bytes [04 00 00 00 05 00 00 00]
+global cl: int * align 8 init %56
+  bytes [00 00 00 00 00 00 00 00]
+  reloc +0 8 bytes -> .compoundliteral+0
+global rp: int (*)(int) align 8 init %59
+  bytes [00 00 00 00 00 00 00 00]
+  reloc +0 8 bytes -> renamed_v2+0
+global addr: long align 8 init %62
+  bytes [00 00 00 00 00 00 00 00]
+  reloc +0 8 bytes -> counter+0
+global keep.local: int align 4 internal init %1 in block 1
+  bytes [03 00 00 00]

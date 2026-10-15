@@ -151,6 +151,9 @@ public enum SemInstKind: UInt16, BitwiseCopyable, Sendable, CaseIterable {
     case caseLabel = 88
     /// arg0: the labeled statement or 0.
     case defaultLabel = 89
+    /// GNU `case low ... high:`. arg0: the labeled statement or 0; extra: [index into `intConstants` of `low`, of
+    /// `high`] (converted as for `caseLabel`; an empty range, `low > high`, matches nothing).
+    case caseRange = 98
     /// arg0: the labeled statement or 0; arg1: label number (1-based, per function; names in `SemFunction.labels`).
     case label = 90
     /// arg0: label number.
@@ -255,6 +258,7 @@ public enum SemInstKind: UInt16, BitwiseCopyable, Sendable, CaseIterable {
         case .switchStmt: return "switch"
         case .caseLabel: return "case"
         case .defaultLabel: return "default"
+        case .caseRange: return "case_range"
         case .label: return "label"
         case .gotoStmt: return "goto"
         case .indirectGoto: return "goto_indirect"
