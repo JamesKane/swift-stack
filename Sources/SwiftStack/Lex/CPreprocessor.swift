@@ -372,15 +372,33 @@ public final class CPreprocessor {
         var processedTokens: [PPToken] = []
         processTokenStream(rawTokens, currentFilePath: sf.path, into: &processedTokens)
 
+        // Like `cpp`, keep each output line traceable to its source: a GNU line marker `# <line> "<file>"`
+        // precedes any line that does not directly follow the previous one (short gaps become blank lines),
+        // and the line's first token is indented to its original column. The assembler honours the markers,
+        // so its diagnostics report `file:line:col` in the `.S` file or header.
         var out = ""
-        out.reserveCapacity(sf.length)
+        out.reserveCapacity(sf.length + 256)
+        var currentFile: SourceFile? = nil
+        var currentLine = 0
         for (idx, tok) in processedTokens.enumerated() {
-            if idx > 0 {
-                if tok.isLeadingNewline {
-                    out.append("\n")
-                } else if tok.isLeadingSpace {
-                    out.append(" ")
+            if idx == 0 || tok.isLeadingNewline {
+                if idx > 0 { out.append("\n") }
+                if let (file, offset) = sourceManager.file(containing: tok.location), !file.path.hasPrefix("<scratch"), !file.path.hasPrefix("<predefined") {
+                    let (line, column) = file.lineTable().lineAndColumn(at: offset)
+                    if file !== currentFile || line <= currentLine || line > currentLine + 8 {
+                        let quoted = file.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                        out.append("# \(line) \"\(quoted)\"\n")
+                    } else {
+                        out.append(String(repeating: "\n", count: line - currentLine - 1))
+                    }
+                    currentFile = file
+                    currentLine = line
+                    out.append(String(repeating: " ", count: column - 1))
+                } else {
+                    currentLine += 1
                 }
+            } else if tok.isLeadingSpace {
+                out.append(" ")
             }
             out.append(tok.spelling)
         }
@@ -463,6 +481,10 @@ public final class CPreprocessor {
                         expandAllMacros(fullyExpanded, disabled: disabledSet, into: &reExpanded)
                         disabledSet.insert(last.spelling)
                         fullyExpanded = reExpanded
+                    }
+                    if assemblerMode, tok.isLeadingNewline || output.isEmpty, !fullyExpanded.isEmpty {
+                        // The line's position is the macro use, not the definition (`preprocessToText` line markers)
+                        fullyExpanded[0].location = tok.location
                     }
                     output.append(contentsOf: fullyExpanded)
                     continue

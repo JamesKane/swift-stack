@@ -34,8 +34,8 @@ enum ExternalTool {
         proc.arguments = args
         // Capture through temporary files: no pipe-buffer deadlocks and no concurrent draining needed.
         let outPath = temporaryPath(".out"), errPath = temporaryPath(".err")
-        FileManager.default.createFile(atPath: outPath, contents: nil)
-        FileManager.default.createFile(atPath: errPath, contents: nil)
+        _ = FileManager.default.createFile(atPath: outPath, contents: nil)
+        _ = FileManager.default.createFile(atPath: errPath, contents: nil)
         defer {
             try? FileManager.default.removeItem(atPath: outPath)
             try? FileManager.default.removeItem(atPath: errPath)
@@ -47,7 +47,7 @@ enum ExternalTool {
         var inPath: String? = nil
         if let stdin {
             let p = temporaryPath(".in")
-            FileManager.default.createFile(atPath: p, contents: Data(stdin.utf8))
+            _ = FileManager.default.createFile(atPath: p, contents: Data(stdin.utf8))
             proc.standardInput = try FileHandle(forReadingFrom: URL(fileURLWithPath: p))
             inPath = p
         }

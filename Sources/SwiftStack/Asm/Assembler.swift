@@ -118,7 +118,7 @@ public enum AsmExprValue: Sendable, Equatable {
     }
 }
 
-/// Evaluates GNU `as` integer and symbolic expressions with full C/GNU operator precedence.
+/// Evaluates GNU `as` integer and symbolic expressions with GNU `as` operator precedence (not C's).
 public enum AsmExprEvaluator {
 
     /// Evaluates an expression string using `constants` (from `.equ`/`.set`/`=`) and optional section symbol positions.
@@ -172,9 +172,10 @@ public enum AsmExprEvaluator {
             }
         }
 
-        var tokens = tokenizeExpr(trimmed)
+        let tokens = tokenizeExpr(trimmed)
         var pos = 0
-        guard let result = parseLogicalOr(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
+        let ctx = EvalContext(constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset)
+        guard let result = parseBinary(tokens, &pos, minRank: 0, ctx),
               pos == tokens.count else {
             return nil
         }
@@ -303,6 +304,7 @@ public enum AsmExprEvaluator {
                    (c == UInt8(ascii: "=") && c2 == UInt8(ascii: "=")) ||
                    (c == UInt8(ascii: "!") && c2 == UInt8(ascii: "=")) ||
                    (c == UInt8(ascii: "<") && c2 == UInt8(ascii: "=")) ||
+                   (c == UInt8(ascii: "<") && c2 == UInt8(ascii: ">")) ||
                    (c == UInt8(ascii: ">") && c2 == UInt8(ascii: "=")) ||
                    (c == UInt8(ascii: "&") && c2 == UInt8(ascii: "&")) ||
                    (c == UInt8(ascii: "|") && c2 == UInt8(ascii: "|")) {
@@ -409,289 +411,118 @@ public enum AsmExprEvaluator {
         return Int64(s, radix: 10)
     }
 
-    // Recursive descent parser
+    // Precedence-climbing parser with GNU `as` operator ranks (binutils `expr.c`), which differ from C:
+    //   5: `*` `/` `%` `<<` `>>`     4: `|` `&` `^` `!` (or-not)     3: `+` `-`
+    //   2: `==` `!=` `<>` `<` `>` `<=` `>=` (true is -1)     1: `&&`     0: `||` (1 or 0)
+    // All binary operators are left-associative; comparisons are signed; `>>` is a logical shift.
 
-    private static func parseLogicalOr(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseLogicalAnd(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count, tokens[pos] == .op("||") {
+    private struct EvalContext {
+        let constants: [String: Int64]
+        let currentSectionSymbols: [String: Int64]
+        let dotOffset: Int64?
+    }
+
+    private static func binaryRank(_ op: String) -> Int? {
+        switch op {
+        case "*", "/", "%", "<<", ">>":                   return 5
+        case "|", "&", "^", "!":                          return 4
+        case "+", "-":                                    return 3
+        case "==", "!=", "<>", "<", ">", "<=", ">=":      return 2
+        case "&&":                                        return 1
+        case "||":                                        return 0
+        default:                                          return nil
+        }
+    }
+
+    private static func parseBinary(_ tokens: [ExprToken], _ pos: inout Int, minRank: Int, _ ctx: EvalContext) -> AsmExprValue? {
+        guard var lhs = parseUnary(tokens, &pos, ctx) else { return nil }
+        while pos < tokens.count, case .op(let op) = tokens[pos], let rank = binaryRank(op), rank >= minRank {
             pos += 1
-            guard let rhs = parseLogicalAnd(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                  let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-            lhs = .constant((l != 0 || r != 0) ? 1 : 0)
+            guard let rhs = parseBinary(tokens, &pos, minRank: rank + 1, ctx),
+                  let combined = applyBinary(op, lhs, rhs, ctx) else { return nil }
+            lhs = combined
         }
         return lhs
     }
 
-    private static func parseLogicalAnd(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseBitwiseOr(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count, tokens[pos] == .op("&&") {
-            pos += 1
-            guard let rhs = parseBitwiseOr(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                  let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-            lhs = .constant((l != 0 && r != 0) ? 1 : 0)
-        }
-        return lhs
-    }
-
-    private static func parseBitwiseOr(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseBitwiseXor(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count, tokens[pos] == .op("|") {
-            pos += 1
-            guard let rhs = parseBitwiseXor(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                  let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-            lhs = .constant(l | r)
-        }
-        return lhs
-    }
-
-    private static func parseBitwiseXor(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseBitwiseAnd(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count, tokens[pos] == .op("^") {
-            pos += 1
-            guard let rhs = parseBitwiseAnd(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                  let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-            lhs = .constant(l ^ r)
-        }
-        return lhs
-    }
-
-    private static func parseBitwiseAnd(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseEquality(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count, tokens[pos] == .op("&") {
-            pos += 1
-            guard let rhs = parseEquality(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                  let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-            lhs = .constant(l & r)
-        }
-        return lhs
-    }
-
-    private static func parseEquality(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseRelational(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count {
-            if tokens[pos] == .op("==") || tokens[pos] == .op("!=") {
-                let isEq = (tokens[pos] == .op("=="))
-                pos += 1
-                guard let rhs = parseRelational(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                      let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-                lhs = .constant((isEq ? (l == r) : (l != r)) ? 1 : 0)
-            } else {
-                break
+    /// Applies a binary operator. Only `+` and `-` accept symbolic operands; everything else needs constants.
+    private static func applyBinary(_ op: String, _ lhs: AsmExprValue, _ rhs: AsmExprValue, _ ctx: EvalContext) -> AsmExprValue? {
+        if op == "+" {
+            switch (lhs, rhs) {
+            case (.constant(let a), .constant(let b)):
+                return .constant(a &+ b)
+            case (.symbolOffset(let s, let a, let m), .constant(let b)), (.constant(let b), .symbolOffset(let s, let a, let m)):
+                return .symbolOffset(symbol: s, addend: a &+ b, modifier: m)
+            case (.symbolDiff(let p, let m, let a), .constant(let b)), (.constant(let b), .symbolDiff(let p, let m, let a)):
+                return .symbolDiff(plusSymbol: p, minusSymbol: m, addend: a &+ b)
+            default:
+                return nil
             }
         }
-        return lhs
-    }
-
-    private static func parseRelational(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseShift(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count {
-            if case .op(let op) = tokens[pos], op == "<" || op == "<=" || op == ">" || op == ">=" {
-                pos += 1
-                guard let rhs = parseShift(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                      let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-                let b: Bool
-                switch op {
-                case "<":  b = l < r
-                case "<=": b = l <= r
-                case ">":  b = l > r
-                default:   b = l >= r
+        if op == "-" {
+            switch (lhs, rhs) {
+            case (.constant(let a), .constant(let b)):
+                return .constant(a &- b)
+            case (.symbolOffset(let s, let a, let m), .constant(let b)):
+                return .symbolOffset(symbol: s, addend: a &- b, modifier: m)
+            case (.symbolDiff(let p, let m, let a), .constant(let b)):
+                return .symbolDiff(plusSymbol: p, minusSymbol: m, addend: a &- b)
+            case (.symbolOffset(let s1, let a1, .none), .symbolOffset(let s2, let a2, .none)):
+                if s1 == s2 {
+                    return .constant(a1 &- a2)
+                } else if let v1 = ctx.currentSectionSymbols[s1], let v2 = ctx.currentSectionSymbols[s2] {
+                    return .constant((v1 &- v2) &+ (a1 &- a2))
                 }
-                lhs = .constant(b ? 1 : 0)
-            } else {
-                break
+                return .symbolDiff(plusSymbol: s1, minusSymbol: s2, addend: a1 &- a2)
+            default:
+                return nil
             }
         }
-        return lhs
-    }
-
-    private static func parseShift(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseAdditive(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count {
-            if tokens[pos] == .op("<<") || tokens[pos] == .op(">>") {
-                let isLeft = (tokens[pos] == .op("<<"))
-                pos += 1
-                guard let rhs = parseAdditive(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                      let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-                if isLeft {
-                    lhs = .constant(Int64(bitPattern: UInt64(bitPattern: l) << UInt64(r & 63)))
-                } else {
-                    lhs = .constant(Int64(bitPattern: UInt64(bitPattern: l) >> UInt64(r & 63)))
-                }
-            } else {
-                break
-            }
+        guard let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
+        let ul = UInt64(bitPattern: l)
+        switch op {
+        case "*":  return .constant(l &* r)
+        case "/":
+            guard r != 0 else { return nil }
+            return .constant(l.dividedReportingOverflow(by: r).partialValue)
+        case "%":
+            guard r != 0 else { return nil }
+            return .constant(l.remainderReportingOverflow(dividingBy: r).partialValue)
+        case "<<": return .constant((r < 0 || r >= 64) ? 0 : Int64(bitPattern: ul << UInt64(r)))
+        case ">>": return .constant((r < 0 || r >= 64) ? 0 : Int64(bitPattern: ul >> UInt64(r)))
+        case "|":  return .constant(l | r)
+        case "&":  return .constant(l & r)
+        case "^":  return .constant(l ^ r)
+        case "!":  return .constant(l | ~r)
+        case "==": return .constant(l == r ? -1 : 0)
+        case "!=", "<>": return .constant(l != r ? -1 : 0)
+        case "<":  return .constant(l < r ? -1 : 0)
+        case ">":  return .constant(l > r ? -1 : 0)
+        case "<=": return .constant(l <= r ? -1 : 0)
+        case ">=": return .constant(l >= r ? -1 : 0)
+        case "&&": return .constant((l != 0 && r != 0) ? 1 : 0)
+        case "||": return .constant((l != 0 || r != 0) ? 1 : 0)
+        default:   return nil
         }
-        return lhs
     }
 
-    private static func parseAdditive(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseMultiplicative(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count {
-            if tokens[pos] == .op("+") || tokens[pos] == .op("-") {
-                let isPlus = (tokens[pos] == .op("+"))
-                pos += 1
-                guard let rhs = parseMultiplicative(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-                if isPlus {
-                    switch (lhs, rhs) {
-                    case (.constant(let a), .constant(let b)):
-                        lhs = .constant(a &+ b)
-                    case (.symbolOffset(let s, let a, let m), .constant(let b)):
-                        lhs = .symbolOffset(symbol: s, addend: a &+ b, modifier: m)
-                    case (.constant(let a), .symbolOffset(let s, let b, let m)):
-                        lhs = .symbolOffset(symbol: s, addend: a &+ b, modifier: m)
-                    case (.symbolDiff(let p, let m, let a), .constant(let b)):
-                        lhs = .symbolDiff(plusSymbol: p, minusSymbol: m, addend: a &+ b)
-                    case (.constant(let a), .symbolDiff(let p, let m, let b)):
-                        lhs = .symbolDiff(plusSymbol: p, minusSymbol: m, addend: a &+ b)
-                    default:
-                        return nil
-                    }
-                } else {
-                    switch (lhs, rhs) {
-                    case (.constant(let a), .constant(let b)):
-                        lhs = .constant(a &- b)
-                    case (.symbolOffset(let s, let a, let m), .constant(let b)):
-                        lhs = .symbolOffset(symbol: s, addend: a &- b, modifier: m)
-                    case (.symbolDiff(let p, let m, let a), .constant(let b)):
-                        lhs = .symbolDiff(plusSymbol: p, minusSymbol: m, addend: a &- b)
-                    case (.symbolOffset(let s1, let a1, .none), .symbolOffset(let s2, let a2, .none)):
-                        if s1 == s2 {
-                            lhs = .constant(a1 &- a2)
-                        } else if let v1 = currentSectionSymbols[s1], let v2 = currentSectionSymbols[s2] {
-                            lhs = .constant((v1 &- v2) &+ (a1 &- a2))
-                        } else {
-                            lhs = .symbolDiff(plusSymbol: s1, minusSymbol: s2, addend: a1 &- a2)
-                        }
-                    default:
-                        return nil
-                    }
-                }
-            } else {
-                break
-            }
-        }
-        return lhs
-    }
-
-    private static func parseMultiplicative(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
-        guard var lhs = parseUnary(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset) else { return nil }
-        while pos < tokens.count {
-            if case .op(let op) = tokens[pos], op == "*" || op == "/" || op == "%" {
-                pos += 1
-                guard let rhs = parseUnary(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
-                      let l = lhs.constantValue, let r = rhs.constantValue else { return nil }
-                switch op {
-                case "*": lhs = .constant(l &* r)
-                case "/":
-                    guard r != 0 else { return nil }
-                    lhs = .constant(l / r)
-                default:
-                    guard r != 0 else { return nil }
-                    lhs = .constant(l % r)
-                }
-            } else {
-                break
-            }
-        }
-        return lhs
-    }
-
-    private static func parseUnary(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
+    private static func parseUnary(_ tokens: [ExprToken], _ pos: inout Int, _ ctx: EvalContext) -> AsmExprValue? {
         guard pos < tokens.count else { return nil }
-        if case .op(let op) = tokens[pos] {
-            if op == "+" {
-                pos += 1
-                return parseUnary(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset)
-            } else if op == "-" {
-                pos += 1
-                guard let v = parseUnary(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset)?.constantValue else { return nil }
-                return .constant(0 &- v)
-            } else if op == "~" {
-                pos += 1
-                guard let v = parseUnary(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset)?.constantValue else { return nil }
-                return .constant(~v)
-            } else if op == "!" {
-                pos += 1
-                guard let v = parseUnary(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset)?.constantValue else { return nil }
-                return .constant(v == 0 ? 1 : 0)
+        if case .op(let op) = tokens[pos], op == "+" || op == "-" || op == "~" || op == "!" {
+            pos += 1
+            guard let operand = parseUnary(tokens, &pos, ctx) else { return nil }
+            if op == "+" { return operand }
+            guard let v = operand.constantValue else { return nil }
+            switch op {
+            case "-": return .constant(0 &- v)
+            case "~": return .constant(~v)
+            default:  return .constant(v == 0 ? 1 : 0)
             }
         }
-        return parsePrimary(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset)
+        return parsePrimary(tokens, &pos, ctx)
     }
 
-    private static func parsePrimary(
-        _ tokens: inout [ExprToken],
-        _ pos: inout Int,
-        constants: [String: Int64],
-        currentSectionSymbols: [String: Int64],
-        dotOffset: Int64?
-    ) -> AsmExprValue? {
+    private static func parsePrimary(_ tokens: [ExprToken], _ pos: inout Int, _ ctx: EvalContext) -> AsmExprValue? {
         guard pos < tokens.count else { return nil }
         switch tokens[pos] {
         case .int(let v):
@@ -700,18 +531,18 @@ public enum AsmExprEvaluator {
         case .symbol(let sym, let mod):
             pos += 1
             if sym == "." {
-                if let dot = dotOffset {
+                if let dot = ctx.dotOffset {
                     return .constant(dot)
                 }
                 return .symbolOffset(symbol: ".", addend: 0, modifier: .none)
             }
-            if mod == .none, let c = constants[sym] {
+            if mod == .none, let c = ctx.constants[sym] {
                 return .constant(c)
             }
             return .symbolOffset(symbol: sym, addend: 0, modifier: mod)
         case .lparen:
             pos += 1
-            guard let inner = parseLogicalOr(&tokens, &pos, constants: constants, currentSectionSymbols: currentSectionSymbols, dotOffset: dotOffset),
+            guard let inner = parseBinary(tokens, &pos, minRank: 0, ctx),
                   pos < tokens.count, tokens[pos] == .rparen else { return nil }
             pos += 1
             return inner
@@ -723,89 +554,290 @@ public enum AsmExprEvaluator {
 
 // MARK: - 3. Statement Lexing, Macros, Conditionals, and Local Labels (`05-assembler.md` §4.4)
 
+/// Where a statement came from, for diagnostics: its `file:line:col` location plus one note per enclosing
+/// macro expansion (innermost first), so an error points at both the macro body line and the macro use.
+public struct AsmLoc: Sendable {
+    public var location: SourceLocation
+    public var notes: [DiagNote]
+
+    public init(_ location: SourceLocation = .invalid, notes: [DiagNote] = []) {
+        self.location = location
+        self.notes = notes
+    }
+
+    public static let unknown = AsmLoc()
+}
+
+extension DiagnosticBag {
+    /// Reports an assembler diagnostic at a statement location, attaching its macro-expansion notes.
+    mutating func report(_ id: DiagId, at loc: AsmLoc, args: [String] = []) {
+        report(id, at: GlobalLocation(unitId: UnitId(0), location: loc.location), args: args, notes: loc.notes)
+    }
+}
+
 /// A parsed line/statement of assembly after comment stripping and macro expansion.
 public struct AsmStatement: Sendable {
     public let text: String
-    public let lineNumber: Int
+    public let loc: AsmLoc
 
-    public init(text: String, lineNumber: Int) {
+    public init(text: String, loc: AsmLoc) {
         self.text = text
-        self.lineNumber = lineNumber
+        self.loc = loc
     }
+}
+
+/// Maps assembler input back to `SourceManager` files so statements carry real `file:line:col` locations
+/// through `.include`, the `# <line> "<file>"` markers emitted by `.S` preprocessing, and in-memory buffers.
+final class AsmSourceMap {
+    let sourceManager: SourceManager
+    private var fileIdsByPath: [String: FileId] = [:]
+
+    init(sourceManager: SourceManager) {
+        self.sourceManager = sourceManager
+    }
+
+    func register(_ fileId: FileId) {
+        fileIdsByPath[sourceManager[fileId].path] = fileId
+    }
+
+    /// The file named by a line marker or `.include`, loaded on first use; nil if it cannot be read.
+    func fileId(forPath path: String) -> FileId? {
+        if let id = fileIdsByPath[path] { return id }
+        guard let id = try? sourceManager.loadFile(path: path) else { return nil }
+        fileIdsByPath[path] = id
+        return id
+    }
+
+    func bytes(of fileId: FileId) -> [UInt8] {
+        let file = sourceManager[fileId]
+        guard let base = file.buffer.baseAddress else { return [] }
+        return Array(UnsafeBufferPointer(start: base, count: file.length))
+    }
+
+    /// Location of 1-based `line`, 0-based byte `column` in `fileId` (clamped to the line), or `.invalid`.
+    func location(fileId: FileId, line: Int, column: Int) -> SourceLocation {
+        let file = sourceManager[fileId]
+        guard file.id.isValid, file.length > 0 else { return .invalid }
+        let starts = file.lineTable().lineStarts
+        guard line >= 1 && line <= starts.count else { return .invalid }
+        let lineStart = Int(starts[line - 1])
+        let lineEnd = line < starts.count ? Int(starts[line]) - 1 : file.length
+        let offset = min(lineStart + max(0, column), max(lineStart, lineEnd), file.length - 1)
+        return SourceLocation(file.baseLocation.rawValue + UInt32(offset))
+    }
+
+    /// Directory of the file containing `location`, for resolving `.include`/`.incbin` relative paths.
+    func directory(containing location: SourceLocation) -> String? {
+        guard location.isValid, let (file, _) = sourceManager.file(containing: location) else { return nil }
+        let dir = URL(fileURLWithPath: file.path).deletingLastPathComponent().path
+        return dir.isEmpty ? nil : dir
+    }
+
+    /// Resolves an `.include`/`.incbin` operand: relative to the including file, then the working directory,
+    /// then each `-I` path (GNU `as` and LLVM MC search order).
+    func resolve(_ name: String, from location: SourceLocation, includePaths: [String]) -> String? {
+        let fm = FileManager.default
+        if name.hasPrefix("/") { return fm.fileExists(atPath: name) ? name : nil }
+        var candidates: [String] = []
+        if let dir = directory(containing: location) { candidates.append("\(dir)/\(name)") }
+        candidates.append(name)
+        candidates.append(contentsOf: includePaths.map { "\($0)/\(name)" })
+        return candidates.first { fm.fileExists(atPath: $0) }
+    }
+}
+
+/// Macro parameter: `name`, `name=default`, `name:req`, or `name:vararg`.
+private struct AsmMacroParam {
+    let name: String
+    let defaultValue: String
+    let required: Bool
+    let vararg: Bool
 }
 
 /// Macro definition for `.macro name params...` / `.endm`.
 private struct AsmMacroDef {
     let name: String
-    let params: [(name: String, defaultValue: String?)]
-    let bodyLines: [(String, Int)]
+    let params: [AsmMacroParam]
+    let body: [AsmStatement]
 }
 
-/// Expands comments, multi-statement `;` lines, `.macro`/`.endm`, `.rept`/`.endr`, `.irp`/`.endr`,
-/// `.if`/`.ifdef`/`.ifndef`/`.else`/`.endif`, and numeric local labels (`1:`, `1b`, `1f`).
+/// Expands comments, multi-statement `;` lines, `.include`, `.macro`/`.endm`, `.rept`/`.irp`/`.irpc`/`.endr`,
+/// `.if*`/`.else`/`.endif`, and numeric local labels (`1:`, `1b`, `1f`).
 public enum AsmMacroEngine {
 
-    /// Strips comments according to `arch`, splits statements, expands macros/conditionals/rept,
-    /// and rewrites numeric local labels (`0:`..`99:`, `0b`..`99b`, `0f`..`99f`) into unique synthetic labels.
-    public static func expandStatements(
-        source: String,
-        arch: AssemblerArch,
-        initialConstants: [String: Int64] = [:]
-    ) -> [AsmStatement] {
-        let rawLines = source.components(separatedBy: "\n")
-        var cleanedStatements: [AsmStatement] = []
-        cleanedStatements.reserveCapacity(rawLines.count)
-
-        var inBlockComment = false
-        for (idx, var line) in rawLines.enumerated() {
-            let lineNum = idx + 1
-            if line.hasSuffix("\r") {
-                line.removeLast()
-            }
-            let subStatements = stripCommentsAndSplit(line: line, arch: arch, inBlockComment: &inBlockComment)
-            for s in subStatements {
-                let trimmed = s.trimmingCharacters(in: .whitespaces)
-                if !trimmed.isEmpty {
-                    cleanedStatements.append(AsmStatement(text: trimmed, lineNumber: lineNum))
-                }
-            }
-        }
-
-        // Expand macros, .rept, .irp, and .if conditionals
+    /// Mutable state threaded through statement splitting and expansion.
+    fileprivate struct Context {
+        let arch: AssemblerArch
+        let sourceMap: AsmSourceMap
+        let includePaths: [String]
         var macros: [String: AsmMacroDef] = [:]
-        var constants = initialConstants
-        var definedSymbols: Set<String> = Set(initialConstants.keys)
-        var macroInvocationCounter = 0
+        var constants: [String: Int64] = [:]
+        var definedSymbols: Set<String> = []
+        var macroCounter = 0
+        /// Current macro expansion nesting (bounded like GNU `as`, so runaway recursion is diagnosed).
+        var macroDepth = 0
+        /// Set by `.exitm`; unwinds the enclosing `.if`/`.rept` blocks up to the macro boundary.
+        var exitRequested = false
+    }
 
-        let expanded = expandBlock(
-            cleanedStatements,
-            arch: arch,
-            macros: &macros,
-            constants: &constants,
-            definedSymbols: &definedSymbols,
-            macroCounter: &macroInvocationCounter
-        )
+    private static let maxIncludeDepth = 64
+    private static let maxMacroDepth = 100   // GNU `as` `max_macro_nest`
 
-        // Rewrite numeric local labels (`1:`, `1b`, `1f`)
+    /// Splits `text` into statements (`physicalFile` is the `SourceManager` buffer holding `text`, or nil for
+    /// preprocessor output whose locations come from line markers), expands includes, macros, repetitions and
+    /// conditionals, and rewrites numeric local labels (`1:`, `1b`, `1f`) into unique synthetic labels.
+    static func expandStatements(
+        text: String,
+        physicalFile: FileId?,
+        arch: AssemblerArch,
+        sourceMap: AsmSourceMap,
+        includePaths: [String],
+        initialConstants: [String: Int64] = [:],
+        diagnostics: inout DiagnosticBag
+    ) -> [AsmStatement] {
+        var ctx = Context(arch: arch, sourceMap: sourceMap, includePaths: includePaths)
+        ctx.constants = initialConstants
+        ctx.definedSymbols = Set(initialConstants.keys)
+
+        var cleaned: [AsmStatement] = []
+        splitLines(Array(text.utf8), physicalFile: physicalFile, depth: 0, ctx: ctx, into: &cleaned, diagnostics: &diagnostics)
+        let expanded = expandBlock(cleaned, ctx: &ctx, diagnostics: &diagnostics)
         return rewriteNumericLocalLabels(expanded)
     }
 
+    // MARK: Line splitting, line markers and `.include`
+
+    /// Splits source bytes into comment-free statements, honouring `# <line> "<file>"` / `#line` markers and
+    /// inlining `.include` files (each statement's location points into the file it was read from).
+    private static func splitLines(
+        _ bytes: [UInt8],
+        physicalFile: FileId?,
+        depth: Int,
+        ctx: Context,
+        into out: inout [AsmStatement],
+        diagnostics: inout DiagnosticBag
+    ) {
+        let physicalBase: UInt32? = physicalFile.map { ctx.sourceMap.sourceManager[$0].baseLocation.rawValue }
+        var logicalFile: FileId? = nil   // set by a line marker; nil means "use the physical position"
+        var logicalLine = 0
+        var markerSeen = false
+        var inBlockComment = false
+        var lineStart = 0
+        let n = bytes.count
+
+        while lineStart <= n {
+            var lineEnd = lineStart
+            while lineEnd < n && bytes[lineEnd] != 0x0A { lineEnd += 1 }
+            if lineStart == n && lineEnd == n { break }
+            var contentEnd = lineEnd
+            if contentEnd > lineStart && bytes[contentEnd - 1] == 0x0D { contentEnd -= 1 }
+            let line = bytes[lineStart..<contentEnd]
+
+            if !inBlockComment, let (markLine, markPath) = parseLineMarker(line) {
+                if let path = markPath { logicalFile = ctx.sourceMap.fileId(forPath: path) }
+                logicalLine = markLine
+                markerSeen = true
+            } else {
+                for (text, column) in stripCommentsAndSplit(line, arch: ctx.arch, inBlockComment: &inBlockComment) {
+                    let location: SourceLocation
+                    if markerSeen {
+                        location = logicalFile.map { ctx.sourceMap.location(fileId: $0, line: logicalLine, column: column) } ?? .invalid
+                    } else if let base = physicalBase {
+                        location = SourceLocation(base + UInt32(lineStart + column))
+                    } else {
+                        location = .invalid
+                    }
+                    let loc = AsmLoc(location)
+                    let (first, rest) = splitFirstWord(text)
+                    if first.lowercased() == ".include" {
+                        includeFile(rest, loc: loc, depth: depth, ctx: ctx, into: &out, diagnostics: &diagnostics)
+                    } else {
+                        out.append(AsmStatement(text: text, loc: loc))
+                    }
+                }
+                logicalLine += 1
+            }
+            lineStart = lineEnd + 1
+        }
+    }
+
+    private static func includeFile(
+        _ operand: String,
+        loc: AsmLoc,
+        depth: Int,
+        ctx: Context,
+        into out: inout [AsmStatement],
+        diagnostics: inout DiagnosticBag
+    ) {
+        guard let nameBytes = parseAsmStringLiteral(operand) else {
+            diagnostics.report(.asmInvalidExpression, at: loc, args: [operand])
+            return
+        }
+        let name = String(decoding: nameBytes, as: UTF8.self)
+        guard depth < maxIncludeDepth,
+              let path = ctx.sourceMap.resolve(name, from: loc.location, includePaths: ctx.includePaths),
+              let fileId = ctx.sourceMap.fileId(forPath: path) else {
+            diagnostics.report(.asmFileNotFound, at: loc, args: [name])
+            return
+        }
+        splitLines(ctx.sourceMap.bytes(of: fileId), physicalFile: fileId, depth: depth + 1, ctx: ctx, into: &out, diagnostics: &diagnostics)
+    }
+
+    /// Recognizes a GNU line marker `# <line> ["<file>" [flags]]` or `#line <line> ["<file>"]` (as emitted by
+    /// `cpp`), returning the line number of the *next* line and the optional file name.
+    private static func parseLineMarker(_ line: ArraySlice<UInt8>) -> (Int, String?)? {
+        var i = line.startIndex
+        let end = line.endIndex
+        guard i < end, line[i] == UInt8(ascii: "#") else { return nil }
+        i += 1
+        if end - i >= 4, line[i..<(i + 4)].elementsEqual("line".utf8) { i += 4 }
+        while i < end && (line[i] == 0x20 || line[i] == 0x09) { i += 1 }
+        let digitsStart = i
+        while i < end && line[i] >= 0x30 && line[i] <= 0x39 { i += 1 }
+        guard i > digitsStart, i == end || line[i] == 0x20 || line[i] == 0x09,
+              let number = Int(String(decoding: line[digitsStart..<i], as: UTF8.self)) else { return nil }
+        while i < end && (line[i] == 0x20 || line[i] == 0x09) { i += 1 }
+        guard i < end, line[i] == UInt8(ascii: "\"") else { return (number, nil) }
+        var path: [UInt8] = []
+        i += 1
+        while i < end && line[i] != UInt8(ascii: "\"") {
+            if line[i] == UInt8(ascii: "\\") && i + 1 < end { i += 1 }
+            path.append(line[i])
+            i += 1
+        }
+        return (number, String(decoding: path, as: UTF8.self))
+    }
+
+    /// Strips comments and splits a line on `;`, returning each statement with the byte column of its first
+    /// non-blank character.
     private static func stripCommentsAndSplit(
-        line: String,
+        _ line: ArraySlice<UInt8>,
         arch: AssemblerArch,
         inBlockComment: inout Bool
-    ) -> [String] {
-        var statements: [String] = []
-        var current = ""
-        let chars = Array(line)
-        let n = chars.count
-        var i = 0
+    ) -> [(text: String, column: Int)] {
+        var statements: [(text: String, column: Int)] = []
+        var current: [UInt8] = []
+        var currentColumn = -1
         var inString = false
+        let base = line.startIndex
+        var i = base
+        let n = line.endIndex
+
+        func flush() {
+            let text = String(decoding: current, as: UTF8.self).trimmingCharacters(in: .whitespaces)
+            if !text.isEmpty { statements.append((text, max(0, currentColumn))) }
+            current.removeAll(keepingCapacity: true)
+            currentColumn = -1
+        }
+        func append(_ c: UInt8, at index: Int) {
+            if currentColumn < 0 && c != 0x20 && c != 0x09 { currentColumn = index - base }
+            current.append(c)
+        }
 
         while i < n {
-            let c = chars[i]
+            let c = line[i]
             if inBlockComment {
-                if c == "*" && i + 1 < n && chars[i + 1] == "/" {
+                if c == UInt8(ascii: "*") && i + 1 < n && line[i + 1] == UInt8(ascii: "/") {
                     inBlockComment = false
                     i += 2
                 } else {
@@ -813,77 +845,85 @@ public enum AsmMacroEngine {
                 }
                 continue
             }
-
             if inString {
-                current.append(c)
-                if c == "\\" && i + 1 < n {
+                append(c, at: i)
+                if c == UInt8(ascii: "\\") && i + 1 < n {
                     i += 1
-                    current.append(chars[i])
-                } else if c == "\"" {
+                    append(line[i], at: i)
+                } else if c == UInt8(ascii: "\"") {
                     inString = false
                 }
                 i += 1
                 continue
             }
-
-            if c == "\"" {
+            switch c {
+            case UInt8(ascii: "\""):
                 inString = true
-                current.append(c)
+                append(c, at: i)
                 i += 1
                 continue
-            }
-
-            // C-style block comment /* ... */
-            if c == "/" && i + 1 < n && chars[i + 1] == "*" {
+            case UInt8(ascii: "'"):
+                // Character constant (`'a`, `'a'`, `'\n'`): its character is never a comment or separator.
+                append(c, at: i)
+                i += 1
+                if i < n {
+                    if line[i] == UInt8(ascii: "\\") && i + 1 < n { append(line[i], at: i); i += 1 }
+                    append(line[i], at: i)
+                    i += 1
+                    if i < n && line[i] == UInt8(ascii: "'") { append(line[i], at: i); i += 1 }
+                }
+                continue
+            case UInt8(ascii: "/") where i + 1 < n && line[i + 1] == UInt8(ascii: "*"):
                 inBlockComment = true
                 i += 2
                 continue
-            }
-
-            // C++-style line comment // ...
-            if c == "/" && i + 1 < n && chars[i + 1] == "/" {
-                break
-            }
-
-            // Architecture-specific comment & statement separator
-            if c == "#" {
-                if arch == .x86_64 || arch == .riscv64 {
-                    break
+            case UInt8(ascii: "/") where i + 1 < n && line[i + 1] == UInt8(ascii: "/"):
+                i = n
+                continue
+            case UInt8(ascii: "#"):
+                // x86-64 and RISC-V: `#` starts a comment anywhere. AArch64: only at the start of a statement,
+                // elsewhere it is the immediate prefix.
+                if arch == .x86_64 || arch == .riscv64 || currentColumn < 0 {
+                    i = n
+                    continue
                 }
-                // On AArch64, `#` is immediate prefix unless at very start of line
-                let trimmedSoFar = current.trimmingCharacters(in: .whitespaces)
-                if trimmedSoFar.isEmpty {
-                    break
-                }
-            }
-
-            if c == ";" {
-                // In GNU as for x86-64, AArch64, and RV64, `;` separates statements on the same line
-                // (e.g. `1: wfe; b 1b` in croi/kernel/arch/arm64/smp.S)
-                statements.append(current)
-                current = ""
+            case UInt8(ascii: ";"):
+                // `;` separates statements on the same line in GNU `as` for all three targets
+                // (e.g. `1: wfe; b 1b` in croi/kernel/arch/arm64/smp.S).
+                flush()
                 i += 1
                 continue
+            default:
+                break
             }
-
-            current.append(c)
+            append(c, at: i)
             i += 1
         }
-
-        if !current.isEmpty {
-            statements.append(current)
-        }
+        flush()
         return statements
     }
 
-    private static func expandBlock(
-        _ stmts: [AsmStatement],
-        arch: AssemblerArch,
-        macros: inout [String: AsmMacroDef],
-        constants: inout [String: Int64],
-        definedSymbols: inout Set<String>,
-        macroCounter: inout Int
-    ) -> [AsmStatement] {
+    // MARK: Block expansion
+
+    private static func blockEnd(_ stmts: [AsmStatement], from start: Int, opens: Set<String>, close: String) -> Int? {
+        var depth = 1
+        var i = start
+        while i < stmts.count {
+            let word = splitFirstWord(stmts[i].text).0.lowercased()
+            if opens.contains(word) {
+                depth += 1
+            } else if word == close {
+                depth -= 1
+                if depth == 0 { return i }
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    private static let repeatOpeners: Set<String> = [".rept", ".irp", ".irpc"]
+
+    private static func expandBlock(_ stmts: [AsmStatement], ctx: inout Context, diagnostics: inout DiagnosticBag) -> [AsmStatement] {
         var out: [AsmStatement] = []
         var i = 0
         while i < stmts.count {
@@ -891,178 +931,144 @@ public enum AsmMacroEngine {
             var lineAfterLabels = rawStmt.text
             while let (label, remainder) = extractLeadingLabel(lineAfterLabels) {
                 if !label.allSatisfy({ $0.isNumber }) {
-                    definedSymbols.insert(label)
+                    ctx.definedSymbols.insert(label)
                 }
-                out.append(AsmStatement(text: "\(label):", lineNumber: rawStmt.lineNumber))
+                out.append(AsmStatement(text: "\(label):", loc: rawStmt.loc))
                 lineAfterLabels = remainder
             }
             if lineAfterLabels.isEmpty {
                 i += 1
                 continue
             }
-            let stmt = (lineAfterLabels == rawStmt.text)
-                ? rawStmt
-                : AsmStatement(text: lineAfterLabels, lineNumber: rawStmt.lineNumber)
-            let text = stmt.text
-            let (firstWord, restText) = splitFirstWord(text)
+            let stmt = (lineAfterLabels == rawStmt.text) ? rawStmt : AsmStatement(text: lineAfterLabels, loc: rawStmt.loc)
+            let (firstWord, restText) = splitFirstWord(stmt.text)
             let lowerFirst = firstWord.lowercased()
 
-            // 1. `.macro` definition
-            if lowerFirst == ".macro" {
-                let (mName, params) = parseMacroHeader(restText)
-                var body: [(String, Int)] = []
-                i += 1
-                var depth = 1
-                while i < stmts.count {
-                    let bFirst = splitFirstWord(stmts[i].text).0.lowercased()
-                    if bFirst == ".macro" {
-                        depth += 1
-                    } else if bFirst == ".endm" {
-                        depth -= 1
-                        if depth == 0 {
-                            i += 1
-                            break
-                        }
-                    }
-                    body.append((stmts[i].text, stmts[i].lineNumber))
-                    i += 1
+            switch lowerFirst {
+            case ".macro":
+                guard let end = blockEnd(stmts, from: i + 1, opens: [".macro"], close: ".endm") else {
+                    diagnostics.report(.asmUnterminatedBlock, at: stmt.loc, args: [".endm", ".macro"])
+                    return out
                 }
-                if !mName.isEmpty {
-                    macros[mName] = AsmMacroDef(name: mName, params: params, bodyLines: body)
+                let (name, params) = parseMacroHeader(restText)
+                if !name.isEmpty {
+                    ctx.macros[name] = AsmMacroDef(name: name, params: params, body: Array(stmts[(i + 1)..<end]))
                 }
+                i = end + 1
                 continue
-            }
 
-            // 2. `.rept count` ... `.endr`
-            if lowerFirst == ".rept" {
-                let countVal = Int(AsmExprEvaluator.evaluate(restText, constants: constants)?.constantValue ?? 0)
-                var body: [AsmStatement] = []
+            case ".purgem":
+                ctx.macros[restText.trimmingCharacters(in: .whitespaces)] = nil
                 i += 1
-                var depth = 1
-                while i < stmts.count {
-                    let bFirst = splitFirstWord(stmts[i].text).0.lowercased()
-                    if bFirst == ".rept" || bFirst == ".irp" || bFirst == ".irpc" {
-                        depth += 1
-                    } else if bFirst == ".endr" {
-                        depth -= 1
-                        if depth == 0 {
-                            i += 1
-                            break
-                        }
-                    }
-                    body.append(stmts[i])
-                    i += 1
-                }
-                if countVal > 0 {
-                    for _ in 0..<countVal {
-                        let expandedBody = expandBlock(body, arch: arch, macros: &macros, constants: &constants, definedSymbols: &definedSymbols, macroCounter: &macroCounter)
-                        out.append(contentsOf: expandedBody)
-                    }
-                }
                 continue
-            }
 
-            // 3. `.irp param, val1, val2, ...` ... `.endr`
-            if lowerFirst == ".irp" {
-                let parts = splitCommaSeparated(restText)
-                let paramName = parts.first?.trimmingCharacters(in: .whitespaces) ?? ""
-                let values = parts.count > 1 ? Array(parts.dropFirst()) : []
-                var body: [AsmStatement] = []
-                i += 1
-                var depth = 1
-                while i < stmts.count {
-                    let bFirst = splitFirstWord(stmts[i].text).0.lowercased()
-                    if bFirst == ".rept" || bFirst == ".irp" || bFirst == ".irpc" {
-                        depth += 1
-                    } else if bFirst == ".endr" {
-                        depth -= 1
-                        if depth == 0 {
-                            i += 1
-                            break
-                        }
-                    }
-                    body.append(stmts[i])
-                    i += 1
-                }
-                for val in values {
-                    let substituted = body.map { s in
-                        AsmStatement(
-                            text: substituteMacroParams(in: s.text, bindings: [paramName: val], counter: macroCounter),
-                            lineNumber: s.lineNumber
-                        )
-                    }
-                    let expandedBody = expandBlock(substituted, arch: arch, macros: &macros, constants: &constants, definedSymbols: &definedSymbols, macroCounter: &macroCounter)
-                    out.append(contentsOf: expandedBody)
-                }
-                continue
-            }
+            case ".exitm":
+                ctx.exitRequested = true
+                return out
 
-            // 4. `.if`, `.ifdef`, `.ifndef`, `.ifeq`, `.ifne` ... `.else` / `.elseif` / `.endif`
-            if lowerFirst == ".if" || lowerFirst == ".ifdef" || lowerFirst == ".ifndef" ||
-               lowerFirst == ".ifeq" || lowerFirst == ".ifne" || lowerFirst == ".ifc" || lowerFirst == ".ifnc" {
-                var branches: [(condKind: String, condArg: String, body: [AsmStatement])] = []
-                var currentCondKind = lowerFirst
-                var currentCondArg = restText
-                var currentBody: [AsmStatement] = []
-                i += 1
-                var depth = 1
-                while i < stmts.count {
-                    let (bFirstRaw, bRest) = splitFirstWord(stmts[i].text)
-                    let bFirst = bFirstRaw.lowercased()
-                    if bFirst.hasPrefix(".if") {
-                        depth += 1
-                        currentBody.append(stmts[i])
-                    } else if bFirst == ".endif" {
-                        depth -= 1
-                        if depth == 0 {
-                            branches.append((currentCondKind, currentCondArg, currentBody))
-                            i += 1
-                            break
-                        } else {
-                            currentBody.append(stmts[i])
-                        }
-                    } else if depth == 1 && (bFirst == ".else" || bFirst == ".elseif") {
-                        branches.append((currentCondKind, currentCondArg, currentBody))
-                        currentCondKind = bFirst == ".else" ? ".else" : ".if"
-                        currentCondArg = bRest
-                        currentBody = []
+            case ".rept", ".irp", ".irpc":
+                guard let end = blockEnd(stmts, from: i + 1, opens: repeatOpeners, close: ".endr") else {
+                    diagnostics.report(.asmUnterminatedBlock, at: stmt.loc, args: [".endr", lowerFirst])
+                    return out
+                }
+                let body = Array(stmts[(i + 1)..<end])
+                i = end + 1
+                var iterations: [[String: String]] = []
+                if lowerFirst == ".rept" {
+                    guard let count = AsmExprEvaluator.evaluate(restText, constants: ctx.constants)?.constantValue else {
+                        diagnostics.report(.asmInvalidExpression, at: stmt.loc, args: [restText])
+                        continue
+                    }
+                    iterations = Array(repeating: [:], count: Int(max(0, min(count, 1 << 20))))
+                } else {
+                    let parts = splitCommaSeparated(restText)
+                    let param = parts.first?.trimmingCharacters(in: .whitespaces) ?? ""
+                    let values = Array(parts.dropFirst())
+                    if lowerFirst == ".irp" {
+                        iterations = values.map { [param: $0] }
                     } else {
-                        currentBody.append(stmts[i])
+                        let chars = values.joined(separator: ",").filter { !$0.isWhitespace }
+                        iterations = chars.map { [param: String($0)] }
                     }
-                    i += 1
                 }
-
-                for branch in branches {
-                    if evaluateConditional(kind: branch.condKind, arg: branch.condArg, constants: constants, definedSymbols: definedSymbols) {
-                        let expandedBranch = expandBlock(branch.body, arch: arch, macros: &macros, constants: &constants, definedSymbols: &definedSymbols, macroCounter: &macroCounter)
-                        out.append(contentsOf: expandedBranch)
-                        break
+                for bindings in iterations {
+                    let substituted = bindings.isEmpty ? body : body.map {
+                        AsmStatement(text: substituteMacroParams(in: $0.text, bindings: bindings, counter: ctx.macroCounter), loc: $0.loc)
                     }
+                    out.append(contentsOf: expandBlock(substituted, ctx: &ctx, diagnostics: &diagnostics))
+                    if ctx.exitRequested { return out }
                 }
                 continue
-            }
 
-            // Track `.equ` / `.set` constants so macros and `.rept` / `.if` can reference them
-            if lowerFirst == ".equ" || lowerFirst == ".set" {
+            case _ where lowerFirst.hasPrefix(".if") && conditionalKinds.contains(lowerFirst):
+                var branches: [(kind: String, arg: String, body: [AsmStatement])] = []
+                var kind = lowerFirst
+                var arg = restText
+                var body: [AsmStatement] = []
+                var depth = 1
+                var j = i + 1
+                var closed = false
+                while j < stmts.count {
+                    let (wordRaw, wordRest) = splitFirstWord(stmts[j].text)
+                    let word = wordRaw.lowercased()
+                    if conditionalKinds.contains(word) {
+                        depth += 1
+                    } else if word == ".endif" {
+                        depth -= 1
+                        if depth == 0 { closed = true; break }
+                    } else if depth == 1 && (word == ".else" || word == ".elseif") {
+                        branches.append((kind, arg, body))
+                        kind = word == ".else" ? ".else" : ".if"
+                        arg = wordRest
+                        body = []
+                        j += 1
+                        continue
+                    }
+                    body.append(stmts[j])
+                    j += 1
+                }
+                guard closed else {
+                    diagnostics.report(.asmUnterminatedBlock, at: stmt.loc, args: [".endif", lowerFirst])
+                    return out
+                }
+                branches.append((kind, arg, body))
+                i = j + 1
+                for branch in branches where evaluateConditional(kind: branch.kind, arg: branch.arg, ctx: ctx) {
+                    out.append(contentsOf: expandBlock(branch.body, ctx: &ctx, diagnostics: &diagnostics))
+                    break
+                }
+                if ctx.exitRequested { return out }
+                continue
+
+            case ".equ", ".set":
+                // Track constants so `.rept`/`.if` can reference them (the session handles the directive itself)
                 let parts = splitCommaSeparated(restText)
                 if parts.count == 2 {
                     let sym = parts[0].trimmingCharacters(in: .whitespaces)
-                    if let val = AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue {
-                        constants[sym] = val
-                        definedSymbols.insert(sym)
+                    ctx.definedSymbols.insert(sym)
+                    if let val = AsmExprEvaluator.evaluate(parts[1], constants: ctx.constants)?.constantValue {
+                        ctx.constants[sym] = val
                     }
                 }
-            }
 
-            // Check if `firstWord` is a macro invocation
-            if let macro = macros[firstWord] {
-                macroCounter += 1
-                let myCount = macroCounter
-                let expandedMacro = instantiateMacro(macro, arch: arch, argsText: restText, counter: myCount, lineNumber: stmt.lineNumber)
-                let recursive = expandBlock(expandedMacro, arch: arch, macros: &macros, constants: &constants, definedSymbols: &definedSymbols, macroCounter: &macroCounter)
-                out.append(contentsOf: recursive)
-                i += 1
-                continue
+            default:
+                if let macro = ctx.macros[firstWord] {
+                    guard ctx.macroDepth < maxMacroDepth else {
+                        // Only the outermost use: one note per level would be 100 notes
+                        let outermost = AsmLoc(stmt.loc.location, notes: Array(stmt.loc.notes.suffix(1)))
+                        diagnostics.report(.asmMacroNestedTooDeeply, at: outermost, args: [macro.name])
+                        i += 1
+                        continue
+                    }
+                    ctx.macroCounter += 1
+                    let body = instantiateMacro(macro, arch: ctx.arch, argsText: restText, invocation: stmt, counter: ctx.macroCounter, diagnostics: &diagnostics)
+                    ctx.macroDepth += 1
+                    out.append(contentsOf: expandBlock(body, ctx: &ctx, diagnostics: &diagnostics))
+                    ctx.macroDepth -= 1
+                    ctx.exitRequested = false
+                    i += 1
+                    continue
+                }
             }
 
             out.append(stmt)
@@ -1071,154 +1077,275 @@ public enum AsmMacroEngine {
         return out
     }
 
-    private static func evaluateConditional(
-        kind: String,
-        arg: String,
-        constants: [String: Int64],
-        definedSymbols: Set<String>
-    ) -> Bool {
+    private static let conditionalKinds: Set<String> = [
+        ".if", ".ifdef", ".ifndef", ".ifeq", ".ifne", ".ifge", ".ifgt", ".ifle", ".iflt",
+        ".ifc", ".ifnc", ".ifeqs", ".ifnes", ".ifb", ".ifnb", ".ifnotdef",
+    ]
+
+    private static func evaluateConditional(kind: String, arg: String, ctx: Context) -> Bool {
+        let trimmed = arg.trimmingCharacters(in: .whitespaces)
+        func value() -> Int64? { AsmExprEvaluator.evaluate(trimmed, constants: ctx.constants)?.constantValue }
         switch kind {
-        case ".else":
-            return true
-        case ".ifdef":
-            return definedSymbols.contains(arg.trimmingCharacters(in: .whitespaces))
-        case ".ifndef":
-            return !definedSymbols.contains(arg.trimmingCharacters(in: .whitespaces))
-        case ".ifeq":
-            guard let v = AsmExprEvaluator.evaluate(arg, constants: constants)?.constantValue else { return false }
-            return v == 0
-        case ".ifne":
-            guard let v = AsmExprEvaluator.evaluate(arg, constants: constants)?.constantValue else { return false }
-            return v != 0
-        case ".ifc", ".ifnc":
-            let parts = splitCommaSeparated(arg)
+        case ".else":                  return true
+        case ".ifdef":                 return ctx.definedSymbols.contains(trimmed)
+        case ".ifndef", ".ifnotdef":   return !ctx.definedSymbols.contains(trimmed)
+        case ".ifb":                   return trimmed.isEmpty
+        case ".ifnb":                  return !trimmed.isEmpty
+        case ".ifeq":                  return value().map { $0 == 0 } ?? false
+        case ".ifge":                  return value().map { $0 >= 0 } ?? false
+        case ".ifgt":                  return value().map { $0 > 0 } ?? false
+        case ".ifle":                  return value().map { $0 <= 0 } ?? false
+        case ".iflt":                  return value().map { $0 < 0 } ?? false
+        case ".ifc", ".ifnc", ".ifeqs", ".ifnes":
+            let parts = splitCommaSeparated(trimmed)
             guard parts.count == 2 else { return false }
-            let eq = parts[0].trimmingCharacters(in: .whitespaces) == parts[1].trimmingCharacters(in: .whitespaces)
-            return kind == ".ifc" ? eq : !eq
-        default:
-            guard let v = AsmExprEvaluator.evaluate(arg, constants: constants)?.constantValue else { return false }
-            return v != 0
+            let unquote = { (s: String) -> String in parseAsmStringLiteral(s).map { String(decoding: $0, as: UTF8.self) } ?? s }
+            let eq = unquote(parts[0]) == unquote(parts[1])
+            return (kind == ".ifc" || kind == ".ifeqs") ? eq : !eq
+        default:                       return value().map { $0 != 0 } ?? false   // `.if`, `.ifne`
         }
     }
 
-    private static func parseMacroHeader(_ header: String) -> (String, [(name: String, defaultValue: String?)]) {
-        let trimmed = header.trimmingCharacters(in: .whitespaces)
-        let (name, argsPart) = splitFirstWord(trimmed)
-        guard !argsPart.isEmpty else { return (name, []) }
+    // MARK: Macros
 
-        // Macro parameters in GNU as can be comma-separated or whitespace-separated
-        let rawTokens: [String]
-        if argsPart.contains(",") {
-            rawTokens = splitCommaSeparated(argsPart)
-        } else {
-            rawTokens = argsPart.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+    /// Parses `.macro name[,] p1[=default], p2:req, rest:vararg` (parameters separated by commas or blanks).
+    private static func parseMacroHeader(_ header: String) -> (String, [AsmMacroParam]) {
+        var trimmed = header.trimmingCharacters(in: .whitespaces)
+        // `p = 5` and `p=5` are the same parameter; join them before splitting on blanks
+        while let r = trimmed.range(of: #"\s*=\s*"#, options: .regularExpression) {
+            let replaced = trimmed.replacingCharacters(in: r, with: "\u{1}")
+            if replaced == trimmed { break }
+            trimmed = replaced
         }
-
-        var params: [(name: String, defaultValue: String?)] = []
-        for tok in rawTokens {
-            var p = tok.trimmingCharacters(in: .whitespaces)
-            guard !p.isEmpty else { continue }
-            var defVal: String? = nil
-            if let eqIdx = p.firstIndex(of: "=") {
-                defVal = String(p[p.index(after: eqIdx)...]).trimmingCharacters(in: .whitespaces)
-                p = String(p[..<eqIdx]).trimmingCharacters(in: .whitespaces)
+        let tokens = trimmed.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map {
+            String($0).replacingOccurrences(of: "\u{1}", with: "=")
+        }
+        guard let name = tokens.first else { return ("", []) }
+        var params: [AsmMacroParam] = []
+        for tok in tokens.dropFirst() {
+            var spec = tok
+            var defaultValue = ""
+            if let eq = spec.firstIndex(of: "=") {
+                defaultValue = String(spec[spec.index(after: eq)...])
+                spec = String(spec[..<eq])
             }
-            if let colonIdx = p.firstIndex(of: ":") {
-                p = String(p[..<colonIdx]).trimmingCharacters(in: .whitespaces)
+            var qualifier = ""
+            if let colon = spec.firstIndex(of: ":") {
+                qualifier = spec[spec.index(after: colon)...].lowercased()
+                spec = String(spec[..<colon])
             }
-            params.append((name: p, defaultValue: defVal))
+            guard !spec.isEmpty else { continue }
+            params.append(AsmMacroParam(name: spec, defaultValue: defaultValue, required: qualifier == "req", vararg: qualifier == "vararg"))
         }
         return (name, params)
     }
 
+    /// Binds positional and `name=value` keyword arguments (GNU `as` semantics: quoted arguments lose their
+    /// quotes, an empty argument takes the default, and a `:vararg` parameter takes all remaining arguments),
+    /// then substitutes them into the body. Each produced statement keeps its body location plus a note
+    /// pointing at the invocation.
     private static func instantiateMacro(
         _ macro: AsmMacroDef,
         arch: AssemblerArch,
         argsText: String,
+        invocation: AsmStatement,
         counter: Int,
-        lineNumber: Int
+        diagnostics: inout DiagnosticBag
     ) -> [AsmStatement] {
-        let trimmedArgs = argsText.trimmingCharacters(in: .whitespaces)
-        let supplied: [String]
-        if trimmedArgs.isEmpty {
-            supplied = []
-        } else if trimmedArgs.contains(",") {
-            supplied = splitCommaSeparated(trimmedArgs)
-        } else {
-            supplied = trimmedArgs.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        }
-
+        let chars = Array(argsText.trimmingCharacters(in: .whitespaces))
+        let supplied = splitMacroArguments(chars)
         var bindings: [String: String] = [:]
-        for (idx, param) in macro.params.enumerated() {
-            if idx < supplied.count {
-                bindings[param.name] = supplied[idx].trimmingCharacters(in: .whitespaces)
-            } else if let def = param.defaultValue {
-                bindings[param.name] = def
-            } else {
-                bindings[param.name] = ""
+        var bound: Set<String> = []
+        for p in macro.params { bindings[p.name] = p.defaultValue }
+        var positional = 0
+        var argIndex = 0
+        while argIndex < supplied.count {
+            let arg = supplied[argIndex].text
+            argIndex += 1
+            if let eq = arg.firstIndex(of: "="),
+               case let key = arg[..<eq].trimmingCharacters(in: .whitespaces),
+               macro.params.contains(where: { $0.name == key }) {
+                let value = unquoteMacroArgument(String(arg[arg.index(after: eq)...]).trimmingCharacters(in: .whitespaces))
+                if !value.isEmpty { bindings[key] = value; bound.insert(key) }
+                continue
             }
-        }
-
-        var result: [AsmStatement] = []
-        for (line, bodyLineNum) in macro.bodyLines {
-            if splitFirstWord(line).0.lowercased() == ".exitm" {
+            guard positional < macro.params.count else {
+                diagnostics.report(.asmMacroBadArgument, at: invocation.loc, args: ["too many positional arguments", macro.name])
                 break
             }
-            let sub = substituteMacroParams(in: line, bindings: bindings, counter: counter)
-            // Split on `;` if macro expansion introduced multiple statements
-            var dummyBlock = false
-            let subStmts = stripCommentsAndSplit(line: sub, arch: arch, inBlockComment: &dummyBlock)
-            for s in subStmts {
-                let t = s.trimmingCharacters(in: .whitespaces)
-                if !t.isEmpty {
-                    result.append(AsmStatement(text: t, lineNumber: bodyLineNum > 0 ? bodyLineNum : lineNumber))
-                }
+            let param = macro.params[positional]
+            positional += 1
+            if param.vararg {
+                // The rest of the line verbatim, separators included (`emit 1 2, 3` gives `rest` = `2, 3`)
+                bindings[param.name] = String(chars[supplied[argIndex - 1].start...])
+                bound.insert(param.name)
+                break
+            }
+            let value = unquoteMacroArgument(arg)
+            if !value.isEmpty { bindings[param.name] = value; bound.insert(param.name) }
+        }
+        for p in macro.params where p.required && !bound.contains(p.name) {
+            diagnostics.report(.asmMacroMissingArgument, at: invocation.loc, args: [p.name, macro.name])
+        }
+
+        let note = DiagNote(message: "in expansion of macro '\(macro.name)'", location: GlobalLocation(unitId: UnitId(0), location: invocation.loc.location))
+        let notes = [note] + invocation.loc.notes
+        var result: [AsmStatement] = []
+        for bodyStmt in macro.body {
+            let sub = substituteMacroParams(in: bodyStmt.text, bindings: bindings, counter: counter)
+            // A substituted argument may introduce further `;`-separated statements
+            var inBlockComment = false
+            for (text, _) in stripCommentsAndSplit(ArraySlice(sub.utf8), arch: arch, inBlockComment: &inBlockComment) {
+                result.append(AsmStatement(text: text, loc: AsmLoc(bodyStmt.loc.location, notes: notes)))
             }
         }
         return result
     }
 
-    private static func substituteMacroParams(
-        in line: String,
-        bindings: [String: String],
-        counter: Int
-    ) -> String {
-        var s = line.replacingOccurrences(of: "\\@", with: "\(counter)")
-        // Sort parameter names longest-first so `\vector` doesn't partially match `\vec`
-        let sortedKeys = bindings.keys.sorted { $0.count > $1.count }
-        for key in sortedKeys {
-            let val = bindings[key] ?? ""
-            s = s.replacingOccurrences(of: "\\\(key)\\()", with: val)
-            s = s.replacingOccurrences(of: "\\\(key)", with: val)
+    private static func unquoteMacroArgument(_ arg: String) -> String {
+        if arg.count >= 2, arg.first == "\"", arg.last == "\"", let bytes = parseAsmStringLiteral(arg) {
+            return String(decoding: bytes, as: UTF8.self)
         }
-        s = s.replacingOccurrences(of: "\\()", with: "")
-        return s
+        return arg
     }
 
+    /// Splits macro arguments as GNU `as` does after its input scrubber: commas separate arguments, and so do
+    /// blanks between two complete terms (`m 4 5`, `m x -5`), but not blanks next to a binary operator
+    /// (`m 1 + 2` is one argument). Quoted strings and parenthesized/bracketed groups are kept together.
+    /// Each argument is returned trimmed, with the offset in `chars` where it starts.
+    private static func splitMacroArguments(_ chars: [Character]) -> [(text: String, start: Int)] {
+        guard !chars.isEmpty else { return [] }
+        func endsTerm(_ c: Character) -> Bool {
+            c.isLetter || c.isNumber || c == "_" || c == "." || c == "$" || c == ")" || c == "]" || c == "\"" || c == "'"
+        }
+        func startsTerm(at j: Int) -> Bool {
+            let c = chars[j]
+            if c == "-" { return j + 1 < chars.count && !chars[j + 1].isWhitespace }
+            return c.isLetter || c.isNumber || c == "_" || c == "." || c == "$" || c == "(" || c == "["
+                || c == "\"" || c == "'" || c == "%" || c == "#" || c == "\\"
+        }
+        var parts: [(text: String, start: Int)] = []
+        var current = ""
+        var start = 0
+        var depth = 0
+        var inString = false
+        func finish(nextStart: Int) {
+            parts.append((current.trimmingCharacters(in: .whitespaces), start))
+            current = ""
+            start = nextStart
+        }
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if inString {
+                current.append(c)
+                if c == "\\" && i + 1 < chars.count {
+                    i += 1
+                    current.append(chars[i])
+                } else if c == "\"" {
+                    inString = false
+                }
+                i += 1
+                continue
+            }
+            switch c {
+            case "\"": inString = true; current.append(c)
+            case "(", "[": depth += 1; current.append(c)
+            case ")", "]": depth = max(0, depth - 1); current.append(c)
+            case "'":
+                current.append(c)
+                if i + 1 < chars.count { i += 1; current.append(chars[i]) }
+            case "," where depth == 0:
+                var j = i + 1
+                while j < chars.count && chars[j].isWhitespace { j += 1 }
+                finish(nextStart: j)
+                i = j
+                continue
+            case _ where c.isWhitespace && depth == 0:
+                var j = i
+                while j < chars.count && chars[j].isWhitespace { j += 1 }
+                if j < chars.count, chars[j] != ",", let last = current.last, endsTerm(last), startsTerm(at: j) {
+                    finish(nextStart: j)
+                    i = j
+                    continue
+                }
+                current.append(contentsOf: chars[i..<j])
+                i = j
+                continue
+            default: current.append(c)
+            }
+            i += 1
+        }
+        finish(nextStart: chars.count)
+        return parts
+    }
+
+    private static func isMacroNameByte(_ c: UInt8) -> Bool {
+        (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F || c == 0x2E || c == 0x24
+    }
+
+    /// Substitutes `\name` (longest name, as GNU `as` scans it), `\@` (invocation counter), and removes the `\()`
+    /// separator (`\reg\().4s`). A `\name` that is not a parameter is left untouched.
+    private static func substituteMacroParams(in line: String, bindings: [String: String], counter: Int) -> String {
+        let bytes = Array(line.utf8)
+        guard bytes.contains(UInt8(ascii: "\\")) else { return line }
+        let n = bytes.count
+        var out: [UInt8] = []
+        out.reserveCapacity(n + 16)
+        var i = 0
+        func isEmptyGroup(_ at: Int) -> Bool {
+            at + 2 < n && bytes[at] == UInt8(ascii: "\\") && bytes[at + 1] == UInt8(ascii: "(") && bytes[at + 2] == UInt8(ascii: ")")
+        }
+        while i < n {
+            if bytes[i] == UInt8(ascii: "\\") && i + 1 < n {
+                let c = bytes[i + 1]
+                if c == UInt8(ascii: "@") {
+                    out.append(contentsOf: String(counter).utf8)
+                    i += 2
+                    continue
+                }
+                if i + 2 < n && c == UInt8(ascii: "(") && bytes[i + 2] == UInt8(ascii: ")") {
+                    i += 3
+                    continue
+                }
+                if isMacroNameByte(c) {
+                    var j = i + 1
+                    while j < n && isMacroNameByte(bytes[j]) { j += 1 }
+                    if let value = bindings[String(decoding: bytes[(i + 1)..<j], as: UTF8.self)] {
+                        out.append(contentsOf: value.utf8)
+                        i = j
+                        if isEmptyGroup(i) { i += 3 }
+                        continue
+                    }
+                }
+            }
+            out.append(bytes[i])
+            i += 1
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    // MARK: Numeric local labels
+
     private static func rewriteNumericLocalLabels(_ stmts: [AsmStatement]) -> [AsmStatement] {
-        // First pass: split out any inline labels (`1: in %dx, %al`) into separate label statements,
-        // and count how many times each numeric label `N` is defined.
+        // First pass: split out any inline labels (`1: in %dx, %al`) into separate label statements.
         var normalized: [AsmStatement] = []
         normalized.reserveCapacity(stmts.count + 16)
 
         for stmt in stmts {
             var text = stmt.text
             while let (lbl, rest) = extractLeadingLabel(text) {
-                normalized.append(AsmStatement(text: "\(lbl):", lineNumber: stmt.lineNumber))
+                normalized.append(AsmStatement(text: "\(lbl):", loc: stmt.loc))
                 text = rest
             }
             if !text.isEmpty && !text.hasSuffix(":") {
-                normalized.append(AsmStatement(text: text, lineNumber: stmt.lineNumber))
-            } else if text == stmt.text && text.hasSuffix(":") {
-                // Already handled by extractLeadingLabel when rest is empty
+                normalized.append(AsmStatement(text: text, loc: stmt.loc))
             }
         }
 
-        // Second pass: assign instance numbers to each numeric label definition `N:`
-        // `currentInstance[N]` = number of definitions of `N` seen so far (1..k).
-        // Therefore:
-        // - at statement index `i`, `Nb` refers to `.L_local_\(N)_\(currentInstance[N])`
-        // - at statement index `i`, `Nf` refers to `.L_local_\(N)_\(currentInstance[N] + 1)`
+        // Second pass: assign instance numbers to each numeric label definition `N:`.
+        // `currentInstance[N]` = number of definitions of `N` seen so far (1..k), so at statement `i`,
+        // `Nb` refers to `.L_local_N_<currentInstance[N]>` and `Nf` to `.L_local_N_<currentInstance[N] + 1>`.
         var currentInstance: [Int: Int] = [:]
         var out: [AsmStatement] = []
         out.reserveCapacity(normalized.count)
@@ -1230,12 +1357,11 @@ public enum AsmMacroEngine {
                 if let num = Int(lblName), lblName.allSatisfy({ $0.isNumber }) {
                     let nextInst = (currentInstance[num] ?? 0) + 1
                     currentInstance[num] = nextInst
-                    out.append(AsmStatement(text: ".L_local_\(num)_\(nextInst):", lineNumber: stmt.lineNumber))
+                    out.append(AsmStatement(text: ".L_local_\(num)_\(nextInst):", loc: stmt.loc))
                     continue
                 }
             }
-            let rewritten = rewriteNumericRefsInLine(text, currentInstance: currentInstance)
-            out.append(AsmStatement(text: rewritten, lineNumber: stmt.lineNumber))
+            out.append(AsmStatement(text: rewriteNumericRefsInLine(text, currentInstance: currentInstance), loc: stmt.loc))
         }
         return out
     }
@@ -1502,17 +1628,17 @@ public enum AsmRelaxableBranch: Sendable {
 /// Fragment inside an assembling section (`05-assembler.md` §4.5).
 public enum AsmFragment: Sendable {
     /// Fixed encoded bytes with zero or more symbolic fixups/relocations.
-    case inst(bytes: [UInt8], fixups: [AsmInstFixup], lineNumber: Int)
+    case inst(bytes: [UInt8], fixups: [AsmInstFixup], loc: AsmLoc)
     /// Label definition at the current position in the section.
     case label(name: String)
     /// Relaxable branch instruction (`form` grows monotonically; see `AsmSession.relaxableSize`).
-    case relaxable(branch: AsmRelaxableBranch, form: Int, lineNumber: Int)
+    case relaxable(branch: AsmRelaxableBranch, form: Int, loc: AsmLoc)
     /// Alignment directive (`.balign`, `.p2align`, `.align`).
     case align(alignBytes: Int, fillByte: UInt8?, maxBytes: Int)
     /// Data expression (`.byte`, `.short`, `.long`, `.quad`).
-    case dataExpr(width: Int, expr: String, lineNumber: Int)
+    case dataExpr(width: Int, expr: String, loc: AsmLoc)
     /// Zero or byte fill (`.zero`, `.space`, `.skip`, `.fill`).
-    case fill(countExpr: String, unitSize: Int, fillValue: Int64, lineNumber: Int)
+    case fill(countExpr: String, unitSize: Int, fillValue: Int64, loc: AsmLoc)
 }
 
 /// State of a single section during assembly.
@@ -1532,12 +1658,12 @@ public final class AsmSectionBuilder {
         self.alignLog2 = alignLog2
     }
 
-    public func emitBytes(_ bytes: [UInt8], fixups: [AsmInstFixup] = [], lineNumber: Int = 0) {
-        fragments.append(.inst(bytes: bytes, fixups: fixups, lineNumber: lineNumber))
+    public func emitBytes(_ bytes: [UInt8], fixups: [AsmInstFixup] = [], loc: AsmLoc = .unknown) {
+        fragments.append(.inst(bytes: bytes, fixups: fixups, loc: loc))
     }
 
-    public func emitRelaxable(_ branch: AsmRelaxableBranch, lineNumber: Int = 0) {
-        fragments.append(.relaxable(branch: branch, form: 0, lineNumber: lineNumber))
+    public func emitRelaxable(_ branch: AsmRelaxableBranch, loc: AsmLoc = .unknown) {
+        fragments.append(.relaxable(branch: branch, form: 0, loc: loc))
     }
 
     public func recordAlignment(alignBytes: Int) {
@@ -1551,148 +1677,378 @@ public final class AsmSectionBuilder {
 
 // MARK: - 6. CFI & `.eh_frame` Builder (`05-assembler.md` §4.9)
 
-/// Tracks `.cfi_*` directives and synthesizes `.eh_frame` CIE + FDE records.
+/// Tracks `.cfi_*` directives and synthesizes `.eh_frame` CIE + FDE records byte-identical to GNU `as` and
+/// LLVM MC: each directive's DWARF CFA instruction is placed after a `DW_CFA_advance_loc{,1,2,4}` from the
+/// previous directive's address (resolved after layout), CIEs are shared between FDEs with the same
+/// augmentation/return column and emitted before their first FDE (FDEs stay in source order, as in GNU `as`),
+/// and records are padded with `DW_CFA_nop` to 4 bytes, the last one so the section size is a multiple of 8.
 public final class AsmCFIBuilder {
-    public struct ProcedureCFI {
-        public let sectionName: String
-        public let startLabel: String
-        public var endLabel: String = ""
-        public var isSignalFrame: Bool = false
-        public var cfaReg: UInt8 = 7 // RSP on x86-64, SP(31) on AArch64, SP(2) on RV64
-        public var cfaOffset: Int32 = 8
-        public var instructions: [UInt8] = []
+    /// CIE-level properties; FDEs with equal keys share one CIE.
+    struct CIEKey: Hashable {
+        var signalFrame = false
+        var returnColumn: UInt64
+        /// `.cfi_startproc simple`: no default initial instructions.
+        var simple = false
+    }
+
+    /// One DWARF CFA instruction, emitted at the address of `label`.
+    struct Op {
+        let label: String
+        let bytes: [UInt8]
+    }
+
+    struct ProcedureCFI {
+        let sectionIndex: Int
+        let startLabel: String
+        var endLabel: String = ""
+        var key: CIEKey
+        var ops: [Op] = []
     }
 
     private let arch: AssemblerArch
-    public private(set) var procedures: [ProcedureCFI] = []
+    private(set) var procedures: [ProcedureCFI] = []
     private var activeProcIndex: Int? = nil
     private var labelCounter: Int = 0
+    /// Assembler-tracked CFA (for `.cfi_adjust_cfa_offset` / `.cfi_rel_offset`) and its remember/restore stack.
+    private var cfaRegister: UInt64 = 0
+    private var cfaOffset: Int64 = 0
+    private var stateStack: [(UInt64, Int64)] = []
+    /// `.cfi_sections` without `.eh_frame` suppresses `.eh_frame` output.
+    private(set) var emitEhFrame = true
 
-    public init(arch: AssemblerArch) {
+    init(arch: AssemblerArch) {
         self.arch = arch
     }
 
-    public var hasActiveProcedure: Bool {
+    var hasActiveProcedure: Bool {
         activeProcIndex != nil
     }
 
-    public func startProc(in section: AsmSectionBuilder) {
-        labelCounter += 1
-        let startLbl = ".Lcfi_start_\(labelCounter)"
-        section.fragments.append(.label(name: startLbl))
-        let defaultReg: UInt8 = (arch == .x86_64) ? 7 : ((arch == .aarch64) ? 31 : 2)
-        let defaultOff: Int32 = (arch == .x86_64) ? 8 : 0
-        let proc = ProcedureCFI(
-            sectionName: section.name,
-            startLabel: startLbl,
-            cfaReg: defaultReg,
-            cfaOffset: defaultOff
-        )
-        procedures.append(proc)
-        activeProcIndex = procedures.count - 1
+    // MARK: Target conventions (identical in GNU `as` and LLVM MC)
+
+    var dataAlignmentFactor: Int64 {
+        switch arch {
+        case .x86_64, .riscv64: return -8
+        case .aarch64:          return -4
+        }
     }
 
-    public func endProc(in section: AsmSectionBuilder) {
+    var defaultReturnColumn: UInt64 {
+        switch arch {
+        case .x86_64:  return 16   // %rip
+        case .aarch64: return 30   // x30 (lr)
+        case .riscv64: return 1    // ra
+        }
+    }
+
+    /// Initial CFA rule: `rsp + 8` on x86-64 (the call pushed the return address), `sp + 0` elsewhere.
+    private var initialCFA: (register: UInt64, offset: Int64) {
+        switch arch {
+        case .x86_64:  return (7, 8)
+        case .aarch64: return (31, 0)
+        case .riscv64: return (2, 0)
+        }
+    }
+
+    // MARK: Directives
+
+    private func makeLabel(in section: AsmSectionBuilder, prefix: String) -> String {
+        labelCounter += 1
+        let name = ".Lcfi_\(prefix)\(labelCounter)"
+        section.fragments.append(.label(name: name))
+        return name
+    }
+
+    func startProc(in section: AsmSectionBuilder, sectionIndex: Int, args: String) {
+        let start = makeLabel(in: section, prefix: "start")
+        let simple = args.trimmingCharacters(in: .whitespaces).lowercased() == "simple"
+        procedures.append(ProcedureCFI(
+            sectionIndex: sectionIndex,
+            startLabel: start,
+            key: CIEKey(returnColumn: defaultReturnColumn, simple: simple)
+        ))
+        activeProcIndex = procedures.count - 1
+        (cfaRegister, cfaOffset) = initialCFA
+        stateStack.removeAll()
+    }
+
+    func endProc(in section: AsmSectionBuilder) {
         guard let idx = activeProcIndex else { return }
-        let endLbl = ".Lcfi_end_\(labelCounter)"
-        section.fragments.append(.label(name: endLbl))
-        procedures[idx].endLabel = endLbl
+        procedures[idx].endLabel = makeLabel(in: section, prefix: "end")
         activeProcIndex = nil
     }
 
-    public func handleDirective(_ directive: String, args: String) {
-        guard let idx = activeProcIndex else { return }
+    /// Handles a `.cfi_*` directive other than `startproc`/`endproc`. Returns false for an unknown or
+    /// unsupported directive or malformed operands (the caller reports it).
+    func handleDirective(_ directive: String, args: String, in section: AsmSectionBuilder, constants: [String: Int64]) -> Bool {
+        if directive == ".cfi_sections" {
+            emitEhFrame = splitCommaSeparated(args).contains { $0.trimmingCharacters(in: .whitespaces) == ".eh_frame" }
+            return true
+        }
+        guard let idx = activeProcIndex else {
+            // GNU `as` rejects CFI outside `.cfi_startproc`; accept it silently like the previous behavior
+            return true
+        }
         let parts = splitCommaSeparated(args)
+        func value(_ i: Int) -> Int64? {
+            guard i < parts.count else { return nil }
+            return AsmExprEvaluator.evaluate(parts[i], constants: constants)?.constantValue
+        }
+        func reg(_ i: Int) -> UInt64? {
+            guard i < parts.count else { return nil }
+            return parseDwarfReg(parts[i])
+        }
+        var bytes: [UInt8] = []
+
         switch directive {
         case ".cfi_signal_frame":
-            procedures[idx].isSignalFrame = true
+            procedures[idx].key.signalFrame = true
+            return true
+        case ".cfi_return_column":
+            guard let r = reg(0) else { return false }
+            procedures[idx].key.returnColumn = r
+            return true
+        case ".cfi_personality", ".cfi_lsda":
+            // Encoding 0xff (DW_EH_PE_omit) means "none"; real personality/LSDA augmentation is unsupported.
+            return value(0) == 0xFF
         case ".cfi_def_cfa":
-            if parts.count == 2,
-               let reg = parseDwarfReg(parts[0]),
-               let off = Int32(parts[1].trimmingCharacters(in: .whitespaces)) {
-                procedures[idx].cfaReg = reg
-                procedures[idx].cfaOffset = off
-                procedures[idx].instructions.append(0x0C) // DW_CFA_def_cfa
-                appendULEB128(UInt64(reg), to: &procedures[idx].instructions)
-                appendULEB128(UInt64(max(0, off)), to: &procedures[idx].instructions)
-            }
+            guard parts.count == 2, let r = reg(0), let off = value(1) else { return false }
+            (cfaRegister, cfaOffset) = (r, off)
+            encodeDefCFA(r, off, into: &bytes)
         case ".cfi_def_cfa_offset":
-            if let off = Int32( args.trimmingCharacters(in: .whitespaces) ) {
-                procedures[idx].cfaOffset = off
-                procedures[idx].instructions.append(0x0E) // DW_CFA_def_cfa_offset
-                appendULEB128(UInt64(max(0, off)), to: &procedures[idx].instructions)
-            }
+            guard parts.count == 1, let off = value(0) else { return false }
+            cfaOffset = off
+            encodeDefCFAOffset(off, into: &bytes)
         case ".cfi_adjust_cfa_offset":
-            if let delta = Int32(args.trimmingCharacters(in: .whitespaces)) {
-                procedures[idx].cfaOffset += delta
-                procedures[idx].instructions.append(0x0E) // DW_CFA_def_cfa_offset
-                appendULEB128(UInt64(max(0, procedures[idx].cfaOffset)), to: &procedures[idx].instructions)
-            }
+            guard parts.count == 1, let delta = value(0) else { return false }
+            cfaOffset &+= delta
+            encodeDefCFAOffset(cfaOffset, into: &bytes)
         case ".cfi_def_cfa_register":
-            if let reg = parseDwarfReg(args) {
-                procedures[idx].cfaReg = reg
-                procedures[idx].instructions.append(0x0D) // DW_CFA_def_cfa_register
-                appendULEB128(UInt64(reg), to: &procedures[idx].instructions)
+            guard parts.count == 1, let r = reg(0) else { return false }
+            cfaRegister = r
+            bytes.append(0x0D)
+            appendULEB128(r, to: &bytes)
+        case ".cfi_offset", ".cfi_rel_offset":
+            guard parts.count == 2, let r = reg(0), var off = value(1) else { return false }
+            if directive == ".cfi_rel_offset" { off &-= cfaOffset }
+            let factored = off / dataAlignmentFactor
+            if factored >= 0 && r < 64 {
+                bytes.append(0x80 | UInt8(r))                // DW_CFA_offset
+                appendULEB128(UInt64(factored), to: &bytes)
+            } else if factored >= 0 {
+                bytes.append(0x05)                           // DW_CFA_offset_extended
+                appendULEB128(r, to: &bytes)
+                appendULEB128(UInt64(factored), to: &bytes)
+            } else {
+                bytes.append(0x11)                           // DW_CFA_offset_extended_sf
+                appendULEB128(r, to: &bytes)
+                appendSLEB128(factored, to: &bytes)
             }
-        case ".cfi_offset":
-            if parts.count == 2,
-               let reg = parseDwarfReg(parts[0]),
-               let off = Int32(parts[1].trimmingCharacters(in: .whitespaces)) {
-                let factored = UInt64(abs(off) / 8)
-                if reg < 64 {
-                    procedures[idx].instructions.append(0x80 | reg) // DW_CFA_offset
-                } else {
-                    procedures[idx].instructions.append(0x05) // DW_CFA_offset_extended
-                    appendULEB128(UInt64(reg), to: &procedures[idx].instructions)
-                }
-                appendULEB128(factored, to: &procedures[idx].instructions)
-            }
-        case ".cfi_undefined":
-            if let reg = parseDwarfReg(args) {
-                procedures[idx].instructions.append(0x07) // DW_CFA_undefined
-                appendULEB128(UInt64(reg), to: &procedures[idx].instructions)
-            }
+        case ".cfi_val_offset":
+            guard parts.count == 2, let r = reg(0), let off = value(1) else { return false }
+            let factored = off / dataAlignmentFactor
+            bytes.append(factored >= 0 ? 0x14 : 0x15)        // DW_CFA_val_offset{,_sf}
+            appendULEB128(r, to: &bytes)
+            if factored >= 0 { appendULEB128(UInt64(factored), to: &bytes) } else { appendSLEB128(factored, to: &bytes) }
         case ".cfi_restore":
-            if let reg = parseDwarfReg(args) {
-                if reg < 64 {
-                    procedures[idx].instructions.append(0xC0 | reg) // DW_CFA_restore
-                } else {
-                    procedures[idx].instructions.append(0x06) // DW_CFA_restore_extended
-                    appendULEB128(UInt64(reg), to: &procedures[idx].instructions)
-                }
+            guard parts.count == 1, let r = reg(0) else { return false }
+            if r < 64 {
+                bytes.append(0xC0 | UInt8(r))                // DW_CFA_restore
+            } else {
+                bytes.append(0x06)                           // DW_CFA_restore_extended
+                appendULEB128(r, to: &bytes)
             }
+        case ".cfi_undefined", ".cfi_same_value":
+            guard parts.count == 1, let r = reg(0) else { return false }
+            bytes.append(directive == ".cfi_undefined" ? 0x07 : 0x08)
+            appendULEB128(r, to: &bytes)
+        case ".cfi_register":
+            guard parts.count == 2, let r1 = reg(0), let r2 = reg(1) else { return false }
+            bytes.append(0x09)                               // DW_CFA_register
+            appendULEB128(r1, to: &bytes)
+            appendULEB128(r2, to: &bytes)
         case ".cfi_remember_state":
-            procedures[idx].instructions.append(0x0A) // DW_CFA_remember_state
+            stateStack.append((cfaRegister, cfaOffset))
+            bytes.append(0x0A)
         case ".cfi_restore_state":
-            procedures[idx].instructions.append(0x0B) // DW_CFA_restore_state
+            if let saved = stateStack.popLast() { (cfaRegister, cfaOffset) = saved }
+            bytes.append(0x0B)
+        case ".cfi_window_save", ".cfi_negate_ra_state":
+            bytes.append(0x2D)                               // DW_CFA_GNU_window_save / AARCH64_negate_ra_state
+        case ".cfi_escape":
+            for i in parts.indices {
+                guard let b = value(i) else { return false }
+                bytes.append(UInt8(truncatingIfNeeded: b))
+            }
         default:
-            break
+            return false
+        }
+
+        // Reuse the label of an immediately preceding CFI directive at the same address
+        let label: String
+        if case .label(let name)? = section.fragments.last, name.hasPrefix(".Lcfi_") {
+            label = name
+        } else {
+            label = makeLabel(in: section, prefix: "")
+        }
+        procedures[idx].ops.append(Op(label: label, bytes: bytes))
+        return true
+    }
+
+    private func encodeDefCFA(_ r: UInt64, _ off: Int64, into bytes: inout [UInt8]) {
+        if off >= 0 {
+            bytes.append(0x0C)                               // DW_CFA_def_cfa
+            appendULEB128(r, to: &bytes)
+            appendULEB128(UInt64(off), to: &bytes)
+        } else {
+            bytes.append(0x12)                               // DW_CFA_def_cfa_sf
+            appendULEB128(r, to: &bytes)
+            appendSLEB128(off / dataAlignmentFactor, to: &bytes)
         }
     }
 
-    private func parseDwarfReg(_ raw: String) -> UInt8? {
+    private func encodeDefCFAOffset(_ off: Int64, into bytes: inout [UInt8]) {
+        if off >= 0 {
+            bytes.append(0x0E)                               // DW_CFA_def_cfa_offset
+            appendULEB128(UInt64(off), to: &bytes)
+        } else {
+            bytes.append(0x13)                               // DW_CFA_def_cfa_offset_sf
+            appendSLEB128(off / dataAlignmentFactor, to: &bytes)
+        }
+    }
+
+    /// DWARF register number of `raw` (a register name or a plain number).
+    private func parseDwarfReg(_ raw: String) -> UInt64? {
         var s = raw.trimmingCharacters(in: .whitespaces).lowercased()
         if s.hasPrefix("%") { s.removeFirst() }
-        if let num = UInt8(s) { return num }
-        switch arch {
-        case .x86_64:
-            let map: [String: UInt8] = [
-                "rax": 0, "rdx": 1, "rcx": 2, "rbx": 3, "rsi": 4, "rdi": 5, "rbp": 6, "rsp": 7,
-                "r8": 8, "r9": 9, "r10": 10, "r11": 11, "r12": 12, "r13": 13, "r14": 14, "r15": 15, "rip": 16,
-            ]
-            return map[s]
-        case .aarch64:
-            if s == "sp" { return 31 }
-            if s == "lr" { return 30 }
-            if s == "fp" { return 29 }
-            if (s.hasPrefix("x") || s.hasPrefix("w")), let n = UInt8(s.dropFirst()), n <= 30 {
-                return n
+        if let num = UInt64(s) { return num }
+        func indexed(_ prefixes: [String], max: UInt64) -> UInt64? {
+            for p in prefixes where s.hasPrefix(p) {
+                if let n = UInt64(s.dropFirst(p.count)), n <= max { return n }
             }
             return nil
+        }
+        switch arch {
+        case .x86_64:
+            let gprs = ["rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp"]
+            if let i = gprs.firstIndex(of: s) { return UInt64(i) }
+            if s == "rip" { return 16 }
+            if let n = indexed(["r"], max: 15), n >= 8 { return n }
+            if let n = indexed(["xmm"], max: 15) { return 17 + n }
+            if let n = indexed(["st"], max: 7) { return 33 + n }
+            if let n = indexed(["mm"], max: 7) { return 41 + n }
+            return nil
+        case .aarch64:
+            switch s {
+            case "sp", "wsp": return 31
+            case "lr":        return 30
+            case "fp":        return 29
+            default: break
+            }
+            if let n = indexed(["x", "w"], max: 30) { return n }
+            if let n = indexed(["v", "q", "d", "s", "h", "b"], max: 31) { return 64 + n }
+            return nil
         case .riscv64:
-            if let gpr = RVGPR(name: s) { return gpr.rawValue }
+            if let gpr = RVGPR(name: s) { return UInt64(gpr.rawValue) }
+            if let fpr = RVFPR(name: s) { return 32 + UInt64(fpr.rawValue) }
             return nil
         }
+    }
+
+    // MARK: `.eh_frame` synthesis (after layout)
+
+    /// One `.eh_frame` record (CIE or FDE) plus the offset of its `pc_begin` field and target label, if any.
+    struct Record {
+        let bytes: [UInt8]
+        let pcBeginLabel: String?
+    }
+
+    /// Builds the `.eh_frame` records. `labelOffset` gives a label's (section index, offset) after layout.
+    func buildEhFrame(labelOffset: (String) -> (Int, Int64)?) -> [Record] {
+        let procs = procedures.filter { !$0.endLabel.isEmpty }
+        guard emitEhFrame, !procs.isEmpty else { return [] }
+
+        var records: [Record] = []
+        var size = 0
+        var cieOffsets: [CIEKey: Int] = [:]
+
+        for (procIdx, proc) in procs.enumerated() {
+            guard let start = labelOffset(proc.startLabel), let end = labelOffset(proc.endLabel) else { continue }
+            let isLast = procIdx == procs.count - 1
+
+            if cieOffsets[proc.key] == nil {
+                cieOffsets[proc.key] = size
+                let cie = padded(cieBody(proc.key), alignment: 4, at: size)
+                records.append(Record(bytes: cie, pcBeginLabel: nil))
+                size += cie.count
+            }
+
+            var body: [UInt8] = []
+            appendLE(UInt64(size + 4 - cieOffsets[proc.key]!), width: 4, to: &body)  // CIE_pointer (relative)
+            appendLE(0, width: 4, to: &body)                                         // pc_begin (relocated)
+            appendLE(UInt64(max(0, end.1 - start.1)), width: 4, to: &body)           // pc_range
+            body.append(0)                                                           // augmentation data length
+            var location = start.1
+            for op in proc.ops {
+                if let (sec, target) = labelOffset(op.label), sec == start.0, target > location {
+                    appendAdvance(UInt64(target - location), to: &body)
+                    location = target
+                }
+                body.append(contentsOf: op.bytes)
+            }
+            let fde = padded(body, alignment: isLast ? 8 : 4, at: size)
+            records.append(Record(bytes: fde, pcBeginLabel: proc.startLabel))
+            size += fde.count
+        }
+        return records
+    }
+
+    private func cieBody(_ key: CIEKey) -> [UInt8] {
+        var body: [UInt8] = [0, 0, 0, 0, 1]                   // CIE_id = 0 (.eh_frame), version 1
+        body.append(contentsOf: Array((key.signalFrame ? "zRS" : "zR").utf8))
+        body.append(0)
+        appendULEB128(1, to: &body)                           // code_alignment_factor
+        appendSLEB128(dataAlignmentFactor, to: &body)         // data_alignment_factor
+        appendULEB128(key.returnColumn, to: &body)            // return_address_register
+        body.append(1)                                        // augmentation data length
+        body.append(0x1B)                                     // FDE encoding: DW_EH_PE_pcrel | DW_EH_PE_sdata4
+        if !key.simple {
+            let cfa = initialCFA
+            encodeDefCFA(cfa.register, cfa.offset, into: &body)
+            if arch == .x86_64 {
+                body.append(contentsOf: [0x80 | 16, 1])       // DW_CFA_offset %rip, cfa-8
+            }
+        }
+        return body
+    }
+
+    /// Prefixes the 4-byte length and pads the record (starting at section offset `offset`) with `DW_CFA_nop`
+    /// so that it ends on a multiple of `alignment`.
+    private func padded(_ body: [UInt8], alignment: Int, at offset: Int) -> [UInt8] {
+        var b = body
+        while (offset + b.count + 4) % alignment != 0 { b.append(0) }
+        var out: [UInt8] = []
+        appendLE(UInt64(b.count), width: 4, to: &out)
+        return out + b
+    }
+
+    private func appendAdvance(_ delta: UInt64, to bytes: inout [UInt8]) {
+        if delta < 64 {
+            bytes.append(0x40 | UInt8(delta))                 // DW_CFA_advance_loc
+        } else if delta <= 0xFF {
+            bytes.append(0x02)                                // DW_CFA_advance_loc1
+            appendLE(delta, width: 1, to: &bytes)
+        } else if delta <= 0xFFFF {
+            bytes.append(0x03)                                // DW_CFA_advance_loc2
+            appendLE(delta, width: 2, to: &bytes)
+        } else {
+            bytes.append(0x04)                                // DW_CFA_advance_loc4
+            appendLE(delta, width: 4, to: &bytes)
+        }
+    }
+
+    private func appendLE(_ value: UInt64, width: Int, to buf: inout [UInt8]) {
+        for i in 0..<width { buf.append(UInt8(truncatingIfNeeded: value >> (8 * UInt64(i)))) }
     }
 
     private func appendULEB128(_ value: UInt64, to buf: inout [UInt8]) {
@@ -1704,6 +2060,19 @@ public final class AsmCFIBuilder {
             buf.append(byte)
         } while v != 0
     }
+
+    private func appendSLEB128(_ value: Int64, to buf: inout [UInt8]) {
+        var v = value
+        while true {
+            let byte = UInt8(truncatingIfNeeded: v & 0x7F)
+            v >>= 7
+            if (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0) {
+                buf.append(byte)
+                return
+            }
+            buf.append(byte | 0x80)
+        }
+    }
 }
 
 // MARK: - 7. Top-Level Assembler (`Assembler`, `05-assembler.md`)
@@ -1711,7 +2080,8 @@ public final class AsmCFIBuilder {
 /// Top-level native assembler for x86-64, AArch64, and RV64 (RVA23).
 public enum Assembler {
 
-    /// Assembles a `.s` or `.S` file from disk into a `RelocatableObject`.
+    /// Assembles a `.s` or `.S` file from disk into a `RelocatableObject`. Diagnostic locations refer to
+    /// `sourceManager` (pass one to render them).
     public static func assembleFile(
         path: String,
         arch: AssemblerArch,
@@ -1722,83 +2092,78 @@ public enum Assembler {
     ) throws -> RelocatableObject {
         let sm = sourceManager ?? SourceManager()
         let fileId = try sm.loadFile(path: path)
-        let shouldPreprocess = path.hasSuffix(".S")
-
-        if shouldPreprocess {
-            let pp = makeAssemblerPreprocessor(sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines)
-            let expandedText = pp.preprocessToText(fileId: fileId)
-            return assemble(
-                source: expandedText,
-                arch: arch,
-                fileName: URL(fileURLWithPath: path).lastPathComponent,
-                preprocess: false,
-                includePaths: includePaths,
-                defines: defines,
-                sourceManager: sm,
-                diagnostics: &diagnostics
-            )
-        } else {
-            let sf = sm[fileId]
-            let rawText: String
-            if let base = sf.buffer.baseAddress {
-                let slice = UnsafeBufferPointer(start: base, count: sf.length)
-                rawText = String(decoding: slice, as: UTF8.self)
-            } else {
-                rawText = ""
-            }
-            return assemble(
-                source: rawText,
-                arch: arch,
-                fileName: URL(fileURLWithPath: path).lastPathComponent,
-                preprocess: false,
-                includePaths: includePaths,
-                defines: defines,
-                sourceManager: sm,
-                diagnostics: &diagnostics
-            )
+        let sourceMap = AsmSourceMap(sourceManager: sm)
+        sourceMap.register(fileId)
+        if path.hasSuffix(".S") {
+            let text = preprocess(fileId: fileId, sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines, diagnostics: &diagnostics)
+            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, diagnostics: &diagnostics)
         }
+        let text = String(decoding: sourceMap.bytes(of: fileId), as: UTF8.self)
+        return assembleText(text, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, diagnostics: &diagnostics)
     }
 
-    /// Creates the `assembler-with-cpp` preprocessor for `.S` input: target-architecture predefined macros
-    /// replace the host defaults, then user `-D` definitions are applied so they can override them.
-    private static func makeAssemblerPreprocessor(
+    /// Runs the `assembler-with-cpp` preprocessor: target-architecture predefined macros replace the host
+    /// defaults, then user `-D` definitions are applied so they can override them. The output carries
+    /// `# <line> "<file>"` markers, so assembler diagnostics point into the original `.S` and headers.
+    private static func preprocess(
+        fileId: FileId,
         sourceManager sm: SourceManager,
         arch: AssemblerArch,
         includePaths: [String],
-        defines: [(name: String, value: String)]
-    ) -> CPreprocessor {
+        defines: [(name: String, value: String)],
+        diagnostics: inout DiagnosticBag
+    ) -> String {
         let pp = CPreprocessor(sourceManager: sm)
         pp.enableAssemblerMode(arch: arch.description)
         pp.includePaths.append(contentsOf: includePaths)
         for def in defines {
             pp.defineMacro(def.name, replacement: def.value)
         }
-        return pp
+        let text = pp.preprocessToText(fileId: fileId)
+        diagnostics.absorb(pp.diagnostics)
+        return text
     }
 
-    /// Assembles in-memory assembly source text into a `RelocatableObject`.
+    /// Assembles in-memory assembly source text into a `RelocatableObject`. The text is registered in
+    /// `sourceManager` as `fileName` so diagnostics carry `file:line:col` locations.
     public static func assemble(
         source: String,
         arch: AssemblerArch,
         fileName: String = "<asm>",
-        preprocess: Bool = false,
+        preprocess runPreprocessor: Bool = false,
         includePaths: [String] = [],
         defines: [(name: String, value: String)] = [],
         sourceManager: SourceManager? = nil,
         diagnostics: inout DiagnosticBag
     ) -> RelocatableObject {
-        let effectiveSource: String
-        if preprocess {
-            let sm = sourceManager ?? SourceManager()
-            let fileId = sm.addBuffer(bytes: Array(source.utf8), path: fileName)
-            let pp = makeAssemblerPreprocessor(sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines)
-            effectiveSource = pp.preprocessToText(fileId: fileId)
-        } else {
-            effectiveSource = source
+        let sm = sourceManager ?? SourceManager()
+        let fileId = sm.addBuffer(bytes: Array(source.utf8), path: fileName)
+        let sourceMap = AsmSourceMap(sourceManager: sm)
+        sourceMap.register(fileId)
+        if runPreprocessor {
+            let text = preprocess(fileId: fileId, sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines, diagnostics: &diagnostics)
+            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, diagnostics: &diagnostics)
         }
+        return assembleText(source, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, diagnostics: &diagnostics)
+    }
 
-        let statements = AsmMacroEngine.expandStatements(source: effectiveSource, arch: arch)
-        let session = AsmSession(arch: arch)
+    private static func assembleText(
+        _ text: String,
+        physicalFile: FileId?,
+        arch: AssemblerArch,
+        sourceMap: AsmSourceMap,
+        includePaths: [String],
+        diagnostics: inout DiagnosticBag
+    ) -> RelocatableObject {
+        let statements = AsmMacroEngine.expandStatements(
+            text: text,
+            physicalFile: physicalFile,
+            arch: arch,
+            sourceMap: sourceMap,
+            includePaths: includePaths,
+            diagnostics: &diagnostics
+        )
+        let session = AsmSession(arch: arch, sourceMap: sourceMap, includePaths: includePaths)
         session.processStatements(statements, diagnostics: &diagnostics)
         return session.buildRelocatableObject(diagnostics: &diagnostics)
     }
@@ -1811,6 +2176,7 @@ internal struct AsmSymbolAttrs {
     var visibility: SymbolVisibility = .defaultVisibility
     var kind: SymbolKind = .notype
     var sizeExpr: String? = nil
+    var sizeLoc: AsmLoc = .unknown
 }
 
 internal final class AsmSession {
@@ -1823,8 +2189,15 @@ internal final class AsmSession {
     var sectionStack: [Int] = []
     var previousSectionIndex: Int = 0
 
-    // Constants (`.equ` / `.set` / `=`)
+    // Constants (`.equ` / `.set` / `=`) known at parse time, plus label-dependent assignments
+    // (`.equ len, end - start`, forward references) that are resolved after layout.
     var constants: [String: Int64] = [:]
+    var deferredAssignments: [String: (expr: String, loc: AsmLoc)] = [:]
+    /// Assignments that resolved to an undefined symbol plus addend (`.set alias, extern + 4`).
+    var externalAliases: [String: (symbol: String, addend: Int64)] = [:]
+
+    let sourceMap: AsmSourceMap?
+    let includePaths: [String]
 
     // Symbol attributes & order of first mention/definition
     var symbolAttrs: [String: AsmSymbolAttrs] = [:]
@@ -1842,8 +2215,10 @@ internal final class AsmSession {
     // CFI state
     let cfiBuilder: AsmCFIBuilder
 
-    init(arch: AssemblerArch) {
+    init(arch: AssemblerArch, sourceMap: AsmSourceMap? = nil, includePaths: [String] = []) {
         self.arch = arch
+        self.sourceMap = sourceMap
+        self.includePaths = includePaths
         self.cfiBuilder = AsmCFIBuilder(arch: arch)
         // GNU `as` / LLVM MC always creates `.text` as the initial section
         _ = getOrCreateSection(
@@ -1899,7 +2274,7 @@ internal final class AsmSession {
         sec.recordAlignment(alignBytes: 8)
         for entry in entries {
             sec.fragments.append(.label(name: entry.label))
-            sec.fragments.append(.dataExpr(width: 8, expr: entry.expr, lineNumber: 0))
+            sec.fragments.append(.dataExpr(width: 8, expr: entry.expr, loc: .unknown))
         }
     }
 
@@ -1926,16 +2301,14 @@ internal final class AsmSession {
             return
         }
 
-        // 2. Direct symbol assignment `SYM = EXPR`
-        if let eqIdx = text.firstIndex(of: "="), !text.hasPrefix(".") {
+        // 2. Direct symbol assignment `SYM = EXPR` (not `==`)
+        if let eqIdx = text.firstIndex(of: "="), !text.hasPrefix("."),
+           text[text.index(after: eqIdx)...].first != "=" {
             let lhs = String(text[..<eqIdx]).trimmingCharacters(in: .whitespaces)
             let rhs = String(text[text.index(after: eqIdx)...]).trimmingCharacters(in: .whitespaces)
             if !lhs.isEmpty && lhs.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "$" }) {
-                if let val = AsmExprEvaluator.evaluate(rhs, constants: constants)?.constantValue {
-                    constants[lhs] = val
-                    noteSymbol(lhs)
-                    return
-                }
+                assignSymbol(lhs, rhs, loc: stmt.loc, diagnostics: &diagnostics)
+                return
             }
         }
 
@@ -1943,7 +2316,7 @@ internal final class AsmSession {
 
         // 3. Assembler directive `.foo`
         if mnemonic.hasPrefix(".") {
-            handleDirective(mnemonic.lowercased(), args: args, lineNumber: stmt.lineNumber, diagnostics: &diagnostics)
+            handleDirective(mnemonic.lowercased(), args: args, loc: stmt.loc, diagnostics: &diagnostics)
             return
         }
 
@@ -1958,20 +2331,20 @@ internal final class AsmSession {
             if currentSectionIndex == sectionBefore,
                currentSection.fragments.count == fragmentsBefore,
                diagnostics.errorCount == errorsBefore {
-                diagnostics.report(.asmInvalidOperands, at: SourceLocation(rawValue: UInt32(max(1, stmt.lineNumber))), args: [mnemonic])
+                diagnostics.report(.asmInvalidOperands, at: stmt.loc, args: [mnemonic])
             }
         }
         switch arch {
         case .x86_64:
-            X86Asm.parseInstruction(mnemonic: mnemonic, args: args, lineNumber: stmt.lineNumber, session: self, diagnostics: &diagnostics)
+            X86Asm.parseInstruction(mnemonic: mnemonic, args: args, loc: stmt.loc, session: self, diagnostics: &diagnostics)
         case .aarch64:
-            A64Asm.parseInstruction(mnemonic: mnemonic, args: args, lineNumber: stmt.lineNumber, session: self, diagnostics: &diagnostics)
+            A64Asm.parseInstruction(mnemonic: mnemonic, args: args, loc: stmt.loc, session: self, diagnostics: &diagnostics)
         case .riscv64:
-            RVAsm.parseInstruction(mnemonic: mnemonic, args: args, lineNumber: stmt.lineNumber, session: self, diagnostics: &diagnostics)
+            RVAsm.parseInstruction(mnemonic: mnemonic, args: args, loc: stmt.loc, session: self, diagnostics: &diagnostics)
         }
     }
 
-    private func handleDirective(_ dir: String, args: String, lineNumber: Int, diagnostics: inout DiagnosticBag) {
+    private func handleDirective(_ dir: String, args: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) {
         switch dir {
         case ".text":
             let idx = getOrCreateSection(name: ".text", kind: .text, flags: [.alloc, .execInstr], alignLog2: arch.defaultTextAlignLog2)
@@ -2068,18 +2441,16 @@ internal final class AsmSession {
                 noteSymbol(sym)
                 // The expression is evaluated after layout, so pin `.` to a temporary label here.
                 symbolAttrs[sym, default: AsmSymbolAttrs()].sizeExpr = bindLocationCounter(in: parts[1])
+                symbolAttrs[sym, default: AsmSymbolAttrs()].sizeLoc = loc
             }
 
-        case ".equ", ".set":
+        case ".equ", ".set", ".equiv", ".eqv":
             let parts = splitCommaSeparated(args)
-            if parts.count == 2 {
-                let sym = parts[0]
-                if let val = AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue {
-                    constants[sym] = val
-                    // Like GNU `as`/LLVM MC, an assigned symbol is emitted as a local `SHN_ABS` symbol.
-                    noteSymbol(sym)
-                }
+            guard parts.count == 2 else {
+                diagnostics.report(.asmInvalidExpression, at: loc, args: [args])
+                return
             }
+            assignSymbol(parts[0], parts[1], loc: loc, diagnostics: &diagnostics)
 
         case ".balign":
             let parts = splitCommaSeparated(args)
@@ -2117,35 +2488,27 @@ internal final class AsmSession {
             }
 
         case ".byte", ".1byte":
-            for expr in splitCommaSeparated(args) {
-                currentSection.fragments.append(.dataExpr(width: 1, expr: expr, lineNumber: lineNumber))
-            }
+            emitData(args, width: 1, loc: loc)
 
         case ".short", ".hword", ".value", ".2byte":
-            for expr in splitCommaSeparated(args) {
-                currentSection.fragments.append(.dataExpr(width: 2, expr: expr, lineNumber: lineNumber))
-            }
+            emitData(args, width: 2, loc: loc)
 
         case ".word":
-            let w = (arch == .x86_64) ? 2 : 4
-            for expr in splitCommaSeparated(args) {
-                currentSection.fragments.append(.dataExpr(width: w, expr: expr, lineNumber: lineNumber))
-            }
+            emitData(args, width: (arch == .x86_64) ? 2 : 4, loc: loc)
 
         case ".long", ".int", ".4byte":
-            for expr in splitCommaSeparated(args) {
-                currentSection.fragments.append(.dataExpr(width: 4, expr: expr, lineNumber: lineNumber))
-            }
+            emitData(args, width: 4, loc: loc)
 
         case ".quad", ".dword", ".8byte":
-            for expr in splitCommaSeparated(args) {
-                currentSection.fragments.append(.dataExpr(width: 8, expr: expr, lineNumber: lineNumber))
-            }
+            emitData(args, width: 8, loc: loc)
+
+        case ".incbin":
+            emitIncbin(args, loc: loc, diagnostics: &diagnostics)
 
         case ".ascii":
             for item in splitCommaSeparated(args) {
                 if let bytes = parseAsmStringLiteral(item) {
-                    currentSection.emitBytes(bytes, lineNumber: lineNumber)
+                    currentSection.emitBytes(bytes, loc: loc)
                 }
             }
 
@@ -2153,7 +2516,7 @@ internal final class AsmSession {
             for item in splitCommaSeparated(args) {
                 if var bytes = parseAsmStringLiteral(item) {
                     bytes.append(0)
-                    currentSection.emitBytes(bytes, lineNumber: lineNumber)
+                    currentSection.emitBytes(bytes, loc: loc)
                 }
             }
 
@@ -2161,7 +2524,7 @@ internal final class AsmSession {
             let parts = splitCommaSeparated(args)
             if let countExpr = parts.first {
                 let fillVal: Int64 = (parts.count >= 2) ? (AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue ?? 0) : 0
-                currentSection.fragments.append(.fill(countExpr: countExpr, unitSize: 1, fillValue: fillVal, lineNumber: lineNumber))
+                currentSection.fragments.append(.fill(countExpr: countExpr, unitSize: 1, fillValue: fillVal, loc: loc))
             }
 
         case ".fill":
@@ -2169,7 +2532,7 @@ internal final class AsmSession {
             if let repeatExpr = parts.first {
                 let unitSize = (parts.count >= 2) ? Int(AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue ?? 1) : 1
                 let fillVal: Int64 = (parts.count >= 3) ? (AsmExprEvaluator.evaluate(parts[2], constants: constants)?.constantValue ?? 0) : 0
-                currentSection.fragments.append(.fill(countExpr: repeatExpr, unitSize: max(1, unitSize), fillValue: fillVal, lineNumber: lineNumber))
+                currentSection.fragments.append(.fill(countExpr: repeatExpr, unitSize: max(1, unitSize), fillValue: fillVal, loc: loc))
             }
 
         case ".ltorg", ".pool":
@@ -2208,26 +2571,119 @@ internal final class AsmSession {
             }
 
         case ".cfi_startproc":
-            cfiBuilder.startProc(in: currentSection)
+            cfiBuilder.startProc(in: currentSection, sectionIndex: currentSectionIndex, args: args)
         case ".cfi_endproc":
             cfiBuilder.endProc(in: currentSection)
         case _ where dir.hasPrefix(".cfi_"):
-            cfiBuilder.handleDirective(dir, args: args)
+            if !cfiBuilder.handleDirective(dir, args: args, in: currentSection, constants: constants) {
+                diagnostics.report(.asmUnsupportedDirective, at: loc, args: ["\(dir) \(args)"])
+            }
 
         case ".inst":
             for expr in splitCommaSeparated(args) {
-                currentSection.fragments.append(.dataExpr(width: 4, expr: expr, lineNumber: lineNumber))
+                currentSection.fragments.append(.dataExpr(width: 4, expr: expr, loc: loc))
             }
 
         case ".arch", ".arch_extension", ".cpu", ".fpu", ".file", ".loc", ".ident", ".addrsig", ".addrsig_sym", ".attribute", ".insn":
             // Metadata / target attribute directives accepted as no-ops in v1 (`.insn` for RV64 is handled in `RVAsm` if needed)
             if dir == ".insn" && arch == .riscv64 {
-                RVAsm.parseInsnDirective(args: args, lineNumber: lineNumber, session: self, diagnostics: &diagnostics)
+                RVAsm.parseInsnDirective(args: args, loc: loc, session: self, diagnostics: &diagnostics)
             }
 
         default:
-            diagnostics.report(.asmUnknownDirective, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [dir])
+            diagnostics.report(.asmUnknownDirective, at: loc, args: [dir])
         }
+    }
+
+    /// Emits `.byte`/`.short`/`.long`/`.quad` operands. Values already constant are encoded now, like GNU `as`
+    /// (so a later `.set` of the same symbol does not change them); the rest are resolved after layout.
+    private func emitData(_ args: String, width: Int, loc: AsmLoc) {
+        for expr in splitCommaSeparated(args) {
+            if let v = AsmExprEvaluator.evaluate(expr, constants: constants)?.constantValue {
+                var bytes: [UInt8] = []
+                appendLittleEndian(v, width: width, to: &bytes)
+                currentSection.emitBytes(bytes, loc: loc)
+            } else {
+                currentSection.fragments.append(.dataExpr(width: width, expr: expr, loc: loc))
+            }
+        }
+    }
+
+    /// `.incbin "file"[, skip[, count]]`, searched like `.include`.
+    private func emitIncbin(_ args: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) {
+        let parts = splitCommaSeparated(args)
+        guard let first = parts.first, let nameBytes = parseAsmStringLiteral(first) else {
+            diagnostics.report(.asmInvalidExpression, at: loc, args: [args])
+            return
+        }
+        let name = String(decoding: nameBytes, as: UTF8.self)
+        let path = sourceMap?.resolve(name, from: loc.location, includePaths: includePaths)
+            ?? (FileManager.default.fileExists(atPath: name) ? name : nil)
+        guard let path, let data = FileManager.default.contents(atPath: path) else {
+            diagnostics.report(.asmFileNotFound, at: loc, args: [name])
+            return
+        }
+        let skip = parts.count >= 2 ? AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue : 0
+        let count = parts.count >= 3 ? AsmExprEvaluator.evaluate(parts[2], constants: constants)?.constantValue : Int64(data.count)
+        guard let skip, let count, skip >= 0, count >= 0, skip <= Int64(data.count) else {
+            diagnostics.report(.asmInvalidExpression, at: loc, args: [args])
+            return
+        }
+        let end = Int(min(Int64(data.count), skip + count))
+        currentSection.emitBytes([UInt8](data[Int(skip)..<end]), loc: loc)
+    }
+
+    /// `.equ`/`.set`/`=`. A value known now becomes a constant for the statements that follow (like GNU `as`);
+    /// one that depends on label positions not yet final (a forward reference, `. - msg` across an alignment)
+    /// is resolved after layout. Like GNU `as`/LLVM MC, an assigned constant is a local `SHN_ABS` symbol.
+    private func assignSymbol(_ rawSym: String, _ rawExpr: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) {
+        let sym = rawSym.trimmingCharacters(in: .whitespaces)
+        noteSymbol(sym)
+        let expr = bindLocationCounter(in: rawExpr)
+        if let v = evaluateWithFixedLayout(expr) {
+            constants[sym] = v
+            deferredAssignments[sym] = nil
+        } else if AsmExprEvaluator.evaluate(expr, constants: constants) != nil {
+            constants[sym] = nil
+            deferredAssignments[sym] = (expr, loc)
+        } else {
+            diagnostics.report(.asmInvalidExpression, at: loc, args: [rawExpr])
+        }
+    }
+
+    /// Evaluates `expr` to a constant using the label offsets of the current section that are already final:
+    /// within a run of fixed-size fragments (no alignment or relaxable branch in between) label differences
+    /// cannot change, which is exactly when GNU `as` resolves them immediately.
+    private func evaluateWithFixedLayout(_ expr: String) -> Int64? {
+        if let v = AsmExprEvaluator.evaluate(expr, constants: constants)?.constantValue { return v }
+        var runs: [[String: Int64]] = [[:]]
+        var offset: Int64 = 0
+        for frag in currentSection.fragments {
+            switch frag {
+            case .label(let name):
+                runs[runs.count - 1][name] = offset
+            case .inst(let bytes, _, _):
+                offset += Int64(bytes.count)
+            case .dataExpr(let width, _, _):
+                offset += Int64(width)
+            case .fill(let countExpr, let unitSize, _, _):
+                if let c = AsmExprEvaluator.evaluate(countExpr, constants: constants)?.constantValue {
+                    offset += max(0, c) * Int64(unitSize)
+                } else {
+                    runs.append([:])
+                    offset = 0
+                }
+            case .align, .relaxable:
+                runs.append([:])
+                offset = 0
+            }
+        }
+        for labels in runs.reversed() where !labels.isEmpty {
+            if let v = AsmExprEvaluator.evaluate(expr, constants: constants, currentSectionSymbols: labels)?.constantValue {
+                return v
+            }
+        }
+        return nil
     }
 
     /// Replaces each standalone `.` (the location counter) in `expr` with a temporary label defined at the
@@ -2331,15 +2787,24 @@ internal final class AsmSession {
     // MARK: - 9. Fixpoint Layout, Branch Relaxation & `RelocatableObject` Construction (`05-assembler.md` §4.5)
 
     func buildRelocatableObject(diagnostics: inout DiagnosticBag) -> RelocatableObject {
-        // 1. Run fixpoint layout and branch relaxation per section (05-assembler.md §4.5)
+        // 1. Run fixpoint layout and branch relaxation per section (05-assembler.md §4.5). `.fill`/`.space`
+        //    counts may refer to labels further down or to label-dependent assignments; those are evaluated
+        //    against the previous iteration's layout, so iteration continues until the labels are stable.
         var sectionSymbolOffsets: [[String: Int64]] = Array(repeating: [:], count: sections.count)
         var sectionTotalSizes: [Int] = Array(repeating: 0, count: sections.count)
 
         for secIdx in 0..<sections.count {
             let sec = sections[secIdx]
-            var changed = true
-            while changed {
-                changed = false
+            var previousLabels: [String: Int64] = [:]
+            var iteration = 0
+            while true {
+                iteration += 1
+                let layoutConstants = deferredAssignments.isEmpty ? constants : constantsResolvingDeferred(labels: previousLabels)
+                func fillCount(_ expr: String, at offset: Int, labels: [String: Int64]) -> Int {
+                    let known = previousLabels.merging(labels) { _, new in new }
+                    return Int(AsmExprEvaluator.evaluate(expr, constants: layoutConstants, currentSectionSymbols: known, dotOffset: Int64(offset))?.constantValue ?? 0)
+                }
+                var changed = false
                 var offset = 0
                 var localLabels: [String: Int64] = [:]
 
@@ -2357,23 +2822,23 @@ internal final class AsmSession {
                     case .dataExpr(let width, _, _):
                         offset += width
                     case .fill(let countExpr, let unitSize, _, _):
-                        let cnt = Int(AsmExprEvaluator.evaluate(countExpr, constants: constants, currentSectionSymbols: localLabels, dotOffset: Int64(offset))?.constantValue ?? 0)
-                        offset += max(0, cnt) * unitSize
+                        offset += max(0, fillCount(countExpr, at: offset, labels: localLabels)) * unitSize
                     }
                 }
 
                 // Pass B: check if any short relaxable branch needs to grow (monotonic: never shrinks)
                 var checkOffset = 0
+                var partialLabels: [String: Int64] = [:]
                 for fIdx in 0..<sec.fragments.count {
                     switch sec.fragments[fIdx] {
-                    case .label:
-                        break
+                    case .label(let name):
+                        partialLabels[name] = Int64(checkOffset)
                     case .inst(let bytes, _, _):
                         checkOffset += bytes.count
-                    case .relaxable(let branch, let form, let lineNum):
+                    case .relaxable(let branch, let form, let loc):
                         let curSize = relaxableSize(branch: branch, form: form)
                         if let next = grownForm(branch: branch, form: form, instOffset: Int64(checkOffset), localLabels: localLabels) {
-                            sec.fragments[fIdx] = .relaxable(branch: branch, form: next, lineNumber: lineNum)
+                            sec.fragments[fIdx] = .relaxable(branch: branch, form: next, loc: loc)
                             changed = true
                         }
                         checkOffset += curSize
@@ -2382,15 +2847,16 @@ internal final class AsmSession {
                     case .dataExpr(let width, _, _):
                         checkOffset += width
                     case .fill(let countExpr, let unitSize, _, _):
-                        let cnt = Int(AsmExprEvaluator.evaluate(countExpr, constants: constants, currentSectionSymbols: localLabels, dotOffset: Int64(checkOffset))?.constantValue ?? 0)
-                        checkOffset += max(0, cnt) * unitSize
+                        checkOffset += max(0, fillCount(countExpr, at: checkOffset, labels: partialLabels)) * unitSize
                     }
                 }
 
-                if !changed {
+                if !changed && (localLabels == previousLabels || iteration >= 64) {
                     sectionSymbolOffsets[secIdx] = localLabels
                     sectionTotalSizes[secIdx] = offset
+                    break
                 }
+                previousLabels = localLabels
             }
 
             // Record global label lookup table
@@ -2398,6 +2864,8 @@ internal final class AsmSession {
                 definedLabels[lbl] = (sectionIndex: secIdx, offset: off)
             }
         }
+
+        resolveDeferredAssignments(sectionSymbolOffsets: sectionSymbolOffsets, diagnostics: &diagnostics)
 
         // Synthesize `.eh_frame` if any `.cfi_startproc` procedures were recorded
         synthesizeEhFrameIfNeeded(sectionSymbolOffsets: &sectionSymbolOffsets, sectionTotalSizes: &sectionTotalSizes)
@@ -2503,6 +2971,11 @@ internal final class AsmSession {
                             if fix.kind == .riscv_pcrel_hi20 {
                                 resolvedPCRelHi20 = true
                             }
+                        } else if fix.minusSymbol == nil, let value = constants[fix.symbol], let width = absoluteFixupWidth(fix.kind) {
+                            let u = UInt64(bitPattern: value &+ fix.addend)
+                            for bIdx in 0..<width where fix.offsetInInst + bIdx < patched.count {
+                                patched[fix.offsetInInst + bIdx] = UInt8(truncatingIfNeeded: u >> (8 * UInt64(bIdx)))
+                            }
                         } else {
                             noteSymbol(fix.symbol)
                             pendingRelocs.append(
@@ -2518,7 +2991,7 @@ internal final class AsmSession {
                     }
                     bytes.append(contentsOf: patched)
 
-                case .relaxable(let branch, let form, let lineNum):
+                case .relaxable(let branch, let form, let loc):
                     var outOfRange = false
                     let (instBytes, relocOpt) = encodeRelaxedBranch(
                         branch: branch,
@@ -2528,7 +3001,7 @@ internal final class AsmSession {
                         outOfRange: &outOfRange
                     )
                     if outOfRange {
-                        diagnostics.report(.asmBranchOutOfRange, at: SourceLocation(rawValue: UInt32(max(1, lineNum))), args: [])
+                        diagnostics.report(.asmBranchOutOfRange, at: loc)
                     }
                     if let r = relocOpt {
                         noteSymbol(r.symbol)
@@ -2550,7 +3023,7 @@ internal final class AsmSession {
                         appendAlignmentPadding(&bytes, count: padCount, fillByte: fillByte, isExec: sec.flags.contains(.execInstr))
                     }
 
-                case .dataExpr(let width, let exprStr, let lineNum):
+                case .dataExpr(let width, let exprStr, let loc):
                     // `.` stays symbolic (it is a location, not a constant) so that `sym - .` becomes a
                     // PC-relative relocation; differences against same-section labels still fold.
                     var dotLabels = localLabels
@@ -2571,7 +3044,7 @@ internal final class AsmSession {
                         pendingRelocs.append(PendingReloc(sectionIndex: secIdx, offset: UInt64(fragOffset), kind: kind, symbol: sym, addend: addend))
                     }
                     func reportInvalid() {
-                        diagnostics.report(.asmInvalidExpression, at: SourceLocation(rawValue: UInt32(max(1, lineNum))), args: [exprStr])
+                        diagnostics.report(.asmInvalidExpression, at: loc, args: [exprStr])
                     }
                     switch valOpt {
                     case .constant(let v):
@@ -2619,6 +3092,15 @@ internal final class AsmSession {
             }
 
             obj.appendSectionBytes(sHandle, bytes)
+        }
+
+        // Relocations against `.set alias, extern + c` refer to `extern` with the addend folded in
+        if !externalAliases.isEmpty {
+            pendingRelocs = pendingRelocs.map { r in
+                guard let alias = externalAliases[r.symbol] else { return r }
+                noteSymbol(alias.symbol)
+                return PendingReloc(sectionIndex: r.sectionIndex, offset: r.offset, kind: r.kind, symbol: alias.symbol, addend: r.addend &+ alias.addend)
+            }
         }
 
         // 4. Populate Symbol Table
@@ -2669,7 +3151,7 @@ internal final class AsmSession {
                 if let c = AsmExprEvaluator.evaluate(sizeExpr, constants: constants, currentSectionSymbols: secLabels)?.constantValue {
                     symSize = UInt64(bitPattern: c)
                 } else {
-                    diagnostics.report(.asmInvalidExpression, at: SourceLocation(rawValue: 1), args: [".size \(symName), \(sizeExpr)"])
+                    diagnostics.report(.asmInvalidExpression, at: attrs.sizeLoc, args: [".size \(symName), \(sizeExpr)"])
                 }
             }
 
@@ -2699,6 +3181,77 @@ internal final class AsmSession {
         }
 
         return obj
+    }
+
+    // MARK: - Deferred `.equ`/`.set` Resolution
+
+    /// `constants` plus each label-dependent assignment that `labels` (one section's layout) resolves.
+    private func constantsResolvingDeferred(labels: [String: Int64]) -> [String: Int64] {
+        var result = constants
+        for _ in 0..<2 {   // a second round resolves assignments that refer to other assignments
+            for (sym, entry) in deferredAssignments where result[sym] == nil {
+                if let v = AsmExprEvaluator.evaluate(entry.expr, constants: result, currentSectionSymbols: labels)?.constantValue {
+                    result[sym] = v
+                }
+            }
+        }
+        return result
+    }
+
+    /// Resolves label-dependent assignments after layout: to a constant (`SHN_ABS` symbol, like GNU `as`), to a
+    /// label plus offset in a section (an alias defined there), or to an undefined symbol plus addend (references
+    /// are redirected to that symbol). Anything else is an invalid expression.
+    private func resolveDeferredAssignments(sectionSymbolOffsets: [[String: Int64]], diagnostics: inout DiagnosticBag) {
+        var pending = deferredAssignments
+        var progress = true
+        while progress && !pending.isEmpty {
+            progress = false
+            for sym in pending.keys.sorted() {
+                guard let entry = pending[sym] else { continue }
+                var value: AsmExprValue? = AsmExprEvaluator.evaluate(entry.expr, constants: constants)
+                for labels in sectionSymbolOffsets {
+                    if case .constant = value { break }
+                    if case .constant(let c)? = AsmExprEvaluator.evaluate(entry.expr, constants: constants, currentSectionSymbols: labels) {
+                        value = .constant(c)
+                    }
+                }
+                switch value {
+                case .constant(let c)?:
+                    constants[sym] = c
+                case .symbolOffset(let target, let addend, .none)?:
+                    if pending[target] != nil && target != sym { continue }
+                    if let def = definedLabels[target] {
+                        definedLabels[sym] = (sectionIndex: def.sectionIndex, offset: def.offset + addend)
+                    } else if let alias = externalAliases[target] {
+                        externalAliases[sym] = (alias.symbol, alias.addend + addend)
+                    } else {
+                        externalAliases[sym] = (target, addend)
+                    }
+                default:
+                    continue
+                }
+                pending[sym] = nil
+                progress = true
+            }
+        }
+        for sym in pending.keys.sorted() {
+            if let entry = pending[sym] {
+                diagnostics.report(.asmInvalidExpression, at: entry.loc, args: [entry.expr])
+            }
+        }
+        deferredAssignments = [:]
+    }
+
+    /// Width of an absolute x86-64 fixup that can be patched in place when its symbol is an assembly-time
+    /// constant (e.g. `movl $len, %eax` before `.equ len, end - start`); nil for every other kind.
+    private func absoluteFixupWidth(_ kind: RelocKind) -> Int? {
+        switch kind {
+        case .x86_64_64:              return 8
+        case .x86_64_32, .x86_64_32s: return 4
+        case .x86_64_16:              return 2
+        case .x86_64_8:               return 1
+        default:                      return nil
+        }
     }
 
     // MARK: - Relaxation & Patching Helpers
@@ -3083,81 +3636,32 @@ internal final class AsmSession {
         sectionSymbolOffsets: inout [[String: Int64]],
         sectionTotalSizes: inout [Int]
     ) {
-        let procs = cfiBuilder.procedures.filter { !$0.endLabel.isEmpty }
-        guard !procs.isEmpty else { return }
+        let records = cfiBuilder.buildEhFrame { label in
+            self.definedLabels[label].map { ($0.sectionIndex, $0.offset) }
+        }
+        guard !records.isEmpty else { return }
 
         let ehIdx = getOrCreateSection(name: ".eh_frame", kind: .ehFrame, flags: [.alloc], alignLog2: 3)
         let ehSec = sections[ehIdx]
-
-        // Build standard 64-bit DWARF CIE with "zR" augmentation (PC-relative 32-bit FDE encoding = 0x1B)
-        var cieBody: [UInt8] = [
-            0, 0, 0, 0,             // CIE_id = 0 for .eh_frame
-            1,                      // version = 1
-            0x7A, 0x52, 0x00,       // augmentation string "zR\0"
-            1,                      // code_alignment_factor = 1 (ULEB128)
-            0x78,                   // data_alignment_factor = -8 (SLEB128)
-            arch == .x86_64 ? 16 : (arch == .aarch64 ? 30 : 1), // return_address_register
-            1,                      // augmentation data length = 1
-            0x1B,                   // FDE pointer encoding: DW_EH_PE_pcrel | DW_EH_PE_sdata4
-        ]
-        // Initial instructions: DW_CFA_def_cfa (rsp/sp, 8/0)
-        if arch == .x86_64 {
-            cieBody.append(contentsOf: [0x0C, 7, 8])
-        } else if arch == .aarch64 {
-            cieBody.append(contentsOf: [0x0C, 31, 0])
-        } else {
-            cieBody.append(contentsOf: [0x0C, 2, 0])
+        let pcRel32: RelocKind
+        switch arch {
+        case .x86_64:  pcRel32 = .x86_64_pc32
+        case .aarch64: pcRel32 = .aarch64_prel32
+        case .riscv64: pcRel32 = .riscv_32_pcrel
         }
-        while (cieBody.count + 4) % 8 != 0 {
-            cieBody.append(0) // DW_CFA_nop
+        var size = 0
+        for record in records {
+            // FDE `pc_begin` (after the length and CIE_pointer words) is a PC-relative reference to the function
+            let fixups = record.pcBeginLabel.map { [AsmInstFixup(offsetInInst: 8, kind: pcRel32, symbol: $0, addend: 0)] } ?? []
+            ehSec.emitBytes(record.bytes, fixups: fixups)
+            size += record.bytes.count
         }
-
-        var ehBytes: [UInt8] = []
-        appendLittleEndian(Int64(cieBody.count), width: 4, to: &ehBytes)
-        ehBytes.append(contentsOf: cieBody)
-
-        for proc in procs {
-            guard let startDef = definedLabels[proc.startLabel],
-                  let endDef = definedLabels[proc.endLabel] else { continue }
-            let rangeLen = max(0, endDef.offset - startDef.offset)
-            let fdeStartOffset = ehBytes.count
-            let ciePointer = UInt32(fdeStartOffset + 4) // offset from FDE's CIE_pointer field back to CIE at 0
-
-            var fdeBody: [UInt8] = []
-            appendLittleEndian(Int64(ciePointer), width: 4, to: &fdeBody)
-            appendLittleEndian(0, width: 4, to: &fdeBody) // pc_begin placeholder
-            appendLittleEndian(rangeLen, width: 4, to: &fdeBody) // pc_range
-            fdeBody.append(0) // augmentation data length = 0
-            fdeBody.append(contentsOf: proc.instructions)
-            while (fdeBody.count + 4) % 8 != 0 {
-                fdeBody.append(0)
-            }
-
-            var fdeRecord: [UInt8] = []
-            appendLittleEndian(Int64(fdeBody.count), width: 4, to: &fdeRecord)
-            fdeRecord.append(contentsOf: fdeBody)
-
-            let fixup = AsmInstFixup(
-                offsetInInst: 8, // 4 (length) + 4 (CIE_pointer)
-                kind: arch == .x86_64 ? .x86_64_pc32 : (arch == .aarch64 ? .aarch64_prel32 : .riscv_32_pcrel),
-                symbol: proc.startLabel,
-                addend: 0
-            )
-            ehSec.emitBytes(fdeRecord, fixups: [fixup])
-            ehBytes.append(contentsOf: fdeRecord)
-        }
-
-        // Emit header CIE at start of .eh_frame
-        var cieHeader: [UInt8] = []
-        appendLittleEndian(Int64(cieBody.count), width: 4, to: &cieHeader)
-        cieHeader.append(contentsOf: cieBody)
-        ehSec.fragments.insert(.inst(bytes: cieHeader, fixups: [], lineNumber: 0), at: 0)
 
         if ehIdx >= sectionSymbolOffsets.count {
             sectionSymbolOffsets.append([:])
-            sectionTotalSizes.append(ehBytes.count)
+            sectionTotalSizes.append(size)
         } else {
-            sectionTotalSizes[ehIdx] = ehBytes.count
+            sectionTotalSizes[ehIdx] += size
         }
     }
 }

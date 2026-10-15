@@ -178,6 +178,12 @@ public final class DiagnosticRegistry: @unchecked Sendable {
         register(DiagnosticInfo(id: .asmUndefinedSymbol, name: "assembler.undefined_symbol", severity: .error, category: .assembler, messageTemplate: "undefined local symbol '%@'"))
         register(DiagnosticInfo(id: .asmBranchOutOfRange, name: "assembler.branch_out_of_range", severity: .error, category: .assembler, messageTemplate: "branch target out of range"))
         register(DiagnosticInfo(id: .asmInvalidOperands, name: "assembler.invalid_operands", severity: .error, category: .assembler, messageTemplate: "invalid operands or out-of-range immediate for '%@'"))
+        register(DiagnosticInfo(id: .asmMacroMissingArgument, name: "assembler.macro_missing_argument", severity: .error, category: .assembler, messageTemplate: "missing value for required parameter '%@' of macro '%@'"))
+        register(DiagnosticInfo(id: .asmMacroBadArgument, name: "assembler.macro_bad_argument", severity: .error, category: .assembler, messageTemplate: "%@ in invocation of macro '%@'"))
+        register(DiagnosticInfo(id: .asmUnterminatedBlock, name: "assembler.unterminated_block", severity: .error, category: .assembler, messageTemplate: "missing '%@' for '%@'"))
+        register(DiagnosticInfo(id: .asmFileNotFound, name: "assembler.file_not_found", severity: .error, category: .assembler, messageTemplate: "cannot open '%@'"))
+        register(DiagnosticInfo(id: .asmUnsupportedDirective, name: "assembler.unsupported_directive", severity: .error, category: .assembler, messageTemplate: "unsupported directive '%@'"))
+        register(DiagnosticInfo(id: .asmMacroNestedTooDeeply, name: "assembler.macro_nested_too_deeply", severity: .error, category: .assembler, messageTemplate: "macros nested too deeply expanding '%@'"))
     }
 }
 
@@ -247,6 +253,12 @@ extension DiagId {
     public static let asmUndefinedSymbol        = DiagId(103)
     public static let asmBranchOutOfRange       = DiagId(104)
     public static let asmInvalidOperands        = DiagId(105)
+    public static let asmMacroMissingArgument   = DiagId(106)
+    public static let asmMacroBadArgument       = DiagId(107)
+    public static let asmUnterminatedBlock      = DiagId(108)
+    public static let asmFileNotFound           = DiagId(109)
+    public static let asmUnsupportedDirective   = DiagId(110)
+    public static let asmMacroNestedTooDeeply   = DiagId(111)
 }
 
 /// A secondary attached note pointing to an auxiliary location.
@@ -382,13 +394,31 @@ public struct DiagnosticBag: ~Copyable {
         report(id, at: GlobalLocation(unitId: unit, location: loc), args: args, notes: notes, fixIts: fixIts)
     }
 
+    /// Appends every diagnostic in `other` (e.g. a nested preprocessor's bag) to this bag.
+    public mutating func absorb(_ other: borrowing DiagnosticBag) {
+        guard other.count > 0 else { return }
+        for i in 1...other.count {
+            let row = DiagRowId(UInt32(i))
+            let aOff = Int(other.argOffsets[row]), aCnt = Int(other.argCounts[row])
+            let nOff = Int(other.notesOffsets[row]), nCnt = Int(other.notesCounts[row])
+            let fOff = Int(other.fixItsOffsets[row]), fCnt = Int(other.fixItsCounts[row])
+            report(
+                DiagId(UInt32(other.ids[row])),
+                at: other.locs[row],
+                args: Array(other.argsPool[aOff..<(aOff + aCnt)]),
+                notes: Array(other.notesPool[nOff..<(nOff + nCnt)]),
+                fixIts: Array(other.fixItsPool[fOff..<(fOff + fCnt)])
+            )
+        }
+    }
+
     /// Extracts all diagnostics resolved as records.
     public func records() -> [DiagnosticRecord] {
         var results: [DiagnosticRecord] = []
         let n = count
         results.reserveCapacity(n)
 
-        for i in 1...n {
+        for i in stride(from: 1, through: n, by: 1) {
             let row = DiagRowId(UInt32(i))
             let idVal = UInt32(ids[row])
             let id = DiagId(idVal)

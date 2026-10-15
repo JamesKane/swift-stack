@@ -27,7 +27,7 @@ public enum RVAsm {
     static func parseInstruction(
         mnemonic rawMnemonic: String,
         args operandsStr: String,
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) {
@@ -36,7 +36,7 @@ public enum RVAsm {
         let rvc = session.rvOptions.rvcEnabled
 
         // 1. Handle Pseudoinstructions & Aliases
-        if tryHandlePseudo(mnemonic: m, ops: ops, rvc: rvc, lineNumber: lineNumber, session: session, diagnostics: &diagnostics) {
+        if tryHandlePseudo(mnemonic: m, ops: ops, rvc: rvc, loc: loc, session: session, diagnostics: &diagnostics) {
             return
         }
 
@@ -66,19 +66,19 @@ public enum RVAsm {
         }
 
         guard let opcode = mnemonicToOpcode[baseMnemonic] else {
-            diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [rawMnemonic])
+            diagnostics.report(.asmInvalidInstruction, at: loc, args: [rawMnemonic])
             return
         }
 
         let desc = RV64InstructionTable.descriptor(for: opcode)
-        encodeByFormat(desc: desc, ops: ops, aq: aq, rl: rl, rvc: rvc, lineNumber: lineNumber, session: session, diagnostics: &diagnostics)
+        encodeByFormat(desc: desc, ops: ops, aq: aq, rl: rl, rvc: rvc, loc: loc, session: session, diagnostics: &diagnostics)
     }
 
     // MARK: - `.insn` Directive Parser
 
     static func parseInsnDirective(
         args: String,
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) {
@@ -107,7 +107,7 @@ public enum RVAsm {
                         | ((UInt32(bitPattern: Int32(truncatingIfNeeded: f3)) & 0x7) << 12)
                         | (UInt32(rd.rawValue) << 7)
                         | (UInt32(bitPattern: Int32(truncatingIfNeeded: opc)) & 0x7F)
-                    emitWord32(word, session: session, lineNumber: lineNumber)
+                    emitWord32(word, session: session, loc: loc)
                     return
                 }
             case "r":
@@ -125,7 +125,7 @@ public enum RVAsm {
                         | ((UInt32(bitPattern: Int32(truncatingIfNeeded: f3)) & 0x7) << 12)
                         | (UInt32(rd.rawValue) << 7)
                         | (UInt32(bitPattern: Int32(truncatingIfNeeded: opc)) & 0x7F)
-                    emitWord32(word, session: session, lineNumber: lineNumber)
+                    emitWord32(word, session: session, loc: loc)
                     return
                 }
             default:
@@ -137,9 +137,9 @@ public enum RVAsm {
         if let val = evalConst(trimmed, session: session) {
             if (val & 0x3) != 0x3 && val >= 0 && val <= 0xFFFF {
                 let hw = UInt16(truncatingIfNeeded: val)
-                session.currentSection.emitBytes([UInt8(hw & 0xFF), UInt8((hw >> 8) & 0xFF)], lineNumber: lineNumber)
+                session.currentSection.emitBytes([UInt8(hw & 0xFF), UInt8((hw >> 8) & 0xFF)], loc: loc)
             } else {
-                emitWord32(UInt32(truncatingIfNeeded: UInt64(bitPattern: val)), session: session, lineNumber: lineNumber)
+                emitWord32(UInt32(truncatingIfNeeded: UInt64(bitPattern: val)), session: session, loc: loc)
             }
         }
     }
@@ -150,38 +150,38 @@ public enum RVAsm {
         mnemonic: String,
         ops: [String],
         rvc: Bool,
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) -> Bool {
         switch mnemonic {
         case "nop":
-            emitInst(.gpr(.addi, rd: .zero, rs1: .zero, imm: 0), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.addi, rd: .zero, rs1: .zero, imm: 0), rvc: rvc, session: session, loc: loc)
             return true
 
         case "unimp":
             if rvc {
-                emitInst(RV64Instruction(opcode: .c_unimp), rvc: true, session: session, lineNumber: lineNumber)
+                emitInst(RV64Instruction(opcode: .c_unimp), rvc: true, session: session, loc: loc)
             } else {
-                emitWord32(0xC000_1073, session: session, lineNumber: lineNumber)
+                emitWord32(0xC000_1073, session: session, loc: loc)
             }
             return true
 
         case "ret":
-            emitInst(.gpr(.jalr, rd: .zero, rs1: .ra, imm: 0), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.jalr, rd: .zero, rs1: .ra, imm: 0), rvc: rvc, session: session, loc: loc)
             return true
 
         case "li":
             guard ops.count == 2, let rd = parseGPR(ops[0]),
                   let exprVal = AsmExprEvaluator.evaluate(ops[1].trimmingCharacters(in: .whitespaces), constants: session.constants) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [mnemonic])
                 return true
             }
             switch exprVal {
             case .constant(let imm):
                 let seq = RV64Encoder.expandLi(rd: rd, imm: imm, rvcEnabled: rvc)
                 for inst in seq {
-                    emitInst(inst, rvc: rvc, session: session, lineNumber: lineNumber)
+                    emitInst(inst, rvc: rvc, session: session, loc: loc)
                 }
             case .symbolDiff(let plusSym, let minusSym, let addend):
                 let bytes = RV64Encoder.encode(.gpr(.addi, rd: rd, rs1: .zero, imm: 0), rvcEnabled: false)
@@ -193,15 +193,15 @@ public enum RVAsm {
                     addend: addend,
                     width: 4
                 )
-                session.currentSection.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
             default:
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [mnemonic])
             }
             return true
 
         case "lla", "la":
             guard ops.count == 2, let rd = parseGPR(ops[0]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [mnemonic])
                 return true
             }
             let (sym, addend) = parseSymbolTarget(ops[1], session: session)
@@ -233,113 +233,113 @@ public enum RVAsm {
                 width: 4,
                 resolveIfSameSection: !useGOT
             )
-            session.currentSection.emitBytes(auipcBytes + secondBytes, fixups: [hiFixup, loFixup], lineNumber: lineNumber)
+            session.currentSection.emitBytes(auipcBytes + secondBytes, fixups: [hiFixup, loFixup], loc: loc)
             return true
 
         case "mv":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.addi, rd: rd, rs1: rs, imm: 0), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.addi, rd: rd, rs1: rs, imm: 0), rvc: rvc, session: session, loc: loc)
             return true
 
         case "not":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
             // Standard RV64GC encodes `not` as 32-bit `xori rd, rs, -1`
-            emitInst(.gpr(.xori, rd: rd, rs1: rs, imm: -1), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.xori, rd: rd, rs1: rs, imm: -1), rvc: false, session: session, loc: loc)
             return true
 
         case "neg":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.sub, rd: rd, rs1: .zero, rs2: rs), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.sub, rd: rd, rs1: .zero, rs2: rs), rvc: rvc, session: session, loc: loc)
             return true
 
         case "negw":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.subw, rd: rd, rs1: .zero, rs2: rs), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.subw, rd: rd, rs1: .zero, rs2: rs), rvc: rvc, session: session, loc: loc)
             return true
 
         case "sext.w":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.addiw, rd: rd, rs1: rs, imm: 0), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.addiw, rd: rd, rs1: rs, imm: 0), rvc: rvc, session: session, loc: loc)
             return true
 
         case "zext.b":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.andi, rd: rd, rs1: rs, imm: 255), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.andi, rd: rd, rs1: rs, imm: 255), rvc: false, session: session, loc: loc)
             return true
 
         case "zext.w":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.add_uw, rd: rd, rs1: rs, rs2: .zero), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.add_uw, rd: rd, rs1: rs, rs2: .zero), rvc: false, session: session, loc: loc)
             return true
 
         case "seqz":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.sltiu, rd: rd, rs1: rs, imm: 1), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.sltiu, rd: rd, rs1: rs, imm: 1), rvc: false, session: session, loc: loc)
             return true
 
         case "snez":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.sltu, rd: rd, rs1: .zero, rs2: rs), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.sltu, rd: rd, rs1: .zero, rs2: rs), rvc: false, session: session, loc: loc)
             return true
 
         case "sltz":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.slt, rd: rd, rs1: rs, rs2: .zero), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.slt, rd: rd, rs1: rs, rs2: .zero), rvc: false, session: session, loc: loc)
             return true
 
         case "sgtz":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.slt, rd: rd, rs1: .zero, rs2: rs), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.slt, rd: rd, rs1: .zero, rs2: rs), rvc: false, session: session, loc: loc)
             return true
 
         case "beqz":
             guard ops.count == 2, let rs = parseGPR(ops[0]) else { return false }
-            emitBranch(opcode: (rvc && rs.isCompressedReg) ? .c_beqz : .beq, rs1: rs, rs2: .zero, targetExpr: ops[1], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: (rvc && rs.isCompressedReg) ? .c_beqz : .beq, rs1: rs, rs2: .zero, targetExpr: ops[1], rvc: rvc, loc: loc, session: session)
             return true
 
         case "bnez":
             guard ops.count == 2, let rs = parseGPR(ops[0]) else { return false }
-            emitBranch(opcode: (rvc && rs.isCompressedReg) ? .c_bnez : .bne, rs1: rs, rs2: .zero, targetExpr: ops[1], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: (rvc && rs.isCompressedReg) ? .c_bnez : .bne, rs1: rs, rs2: .zero, targetExpr: ops[1], rvc: rvc, loc: loc, session: session)
             return true
 
         case "blez":
             guard ops.count == 2, let rs = parseGPR(ops[0]) else { return false }
-            emitBranch(opcode: .bge, rs1: .zero, rs2: rs, targetExpr: ops[1], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: .bge, rs1: .zero, rs2: rs, targetExpr: ops[1], rvc: rvc, loc: loc, session: session)
             return true
 
         case "bgez":
             guard ops.count == 2, let rs = parseGPR(ops[0]) else { return false }
-            emitBranch(opcode: .bge, rs1: rs, rs2: .zero, targetExpr: ops[1], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: .bge, rs1: rs, rs2: .zero, targetExpr: ops[1], rvc: rvc, loc: loc, session: session)
             return true
 
         case "bltz":
             guard ops.count == 2, let rs = parseGPR(ops[0]) else { return false }
-            emitBranch(opcode: .blt, rs1: rs, rs2: .zero, targetExpr: ops[1], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: .blt, rs1: rs, rs2: .zero, targetExpr: ops[1], rvc: rvc, loc: loc, session: session)
             return true
 
         case "bgtz":
             guard ops.count == 2, let rs = parseGPR(ops[0]) else { return false }
-            emitBranch(opcode: .blt, rs1: .zero, rs2: rs, targetExpr: ops[1], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: .blt, rs1: .zero, rs2: rs, targetExpr: ops[1], rvc: rvc, loc: loc, session: session)
             return true
 
         case "bgt":
             guard ops.count == 3, let rs = parseGPR(ops[0]), let rt = parseGPR(ops[1]) else { return false }
-            emitBranch(opcode: .blt, rs1: rt, rs2: rs, targetExpr: ops[2], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: .blt, rs1: rt, rs2: rs, targetExpr: ops[2], rvc: rvc, loc: loc, session: session)
             return true
 
         case "ble":
             guard ops.count == 3, let rs = parseGPR(ops[0]), let rt = parseGPR(ops[1]) else { return false }
-            emitBranch(opcode: .bge, rs1: rt, rs2: rs, targetExpr: ops[2], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: .bge, rs1: rt, rs2: rs, targetExpr: ops[2], rvc: rvc, loc: loc, session: session)
             return true
 
         case "bgtu":
             guard ops.count == 3, let rs = parseGPR(ops[0]), let rt = parseGPR(ops[1]) else { return false }
-            emitBranch(opcode: .bltu, rs1: rt, rs2: rs, targetExpr: ops[2], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: .bltu, rs1: rt, rs2: rs, targetExpr: ops[2], rvc: rvc, loc: loc, session: session)
             return true
 
         case "bleu":
             guard ops.count == 3, let rs = parseGPR(ops[0]), let rt = parseGPR(ops[1]) else { return false }
-            emitBranch(opcode: .bgeu, rs1: rt, rs2: rs, targetExpr: ops[2], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: .bgeu, rs1: rt, rs2: rs, targetExpr: ops[2], rvc: rvc, loc: loc, session: session)
             return true
 
         case "j":
@@ -350,18 +350,18 @@ public enum RVAsm {
                 .relaxable(
                     branch: .rvBranch(baseInst: baseInst, rvcAllowed: rvc, targetSymbol: sym, addend: addend),
                     form: rvc ? 0 : 1,
-                    lineNumber: lineNumber
+                    loc: loc
                 )
             )
             return true
 
         case "jr":
             if ops.count == 1, let rs = parseGPR(ops[0]) {
-                emitInst(.gpr(.jalr, rd: .zero, rs1: rs, imm: 0), rvc: rvc, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.jalr, rd: .zero, rs1: rs, imm: 0), rvc: rvc, session: session, loc: loc)
                 return true
             }
             if ops.count == 1, let (imm, base) = parseMemOperand(ops[0], session: session) {
-                emitInst(.gpr(.jalr, rd: .zero, rs1: base, imm: imm), rvc: rvc, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.jalr, rd: .zero, rs1: base, imm: imm), rvc: rvc, session: session, loc: loc)
                 return true
             }
             return false
@@ -379,7 +379,7 @@ public enum RVAsm {
                 width: 8,
                 resolveIfSameSection: false
             )
-            session.currentSection.emitBytes(auipcBytes + jalrBytes, fixups: [fixup], lineNumber: lineNumber)
+            session.currentSection.emitBytes(auipcBytes + jalrBytes, fixups: [fixup], loc: loc)
             return true
 
         case "tail":
@@ -395,135 +395,135 @@ public enum RVAsm {
                 width: 8,
                 resolveIfSameSection: false
             )
-            session.currentSection.emitBytes(auipcBytes + jalrBytes, fixups: [fixup], lineNumber: lineNumber)
+            session.currentSection.emitBytes(auipcBytes + jalrBytes, fixups: [fixup], loc: loc)
             return true
 
         case "csrr":
             guard ops.count == 2, let rd = parseGPR(ops[0]), let csr = parseCSR(ops[1], session: session) else { return false }
-            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "csrw":
             guard ops.count == 2, let csr = parseCSR(ops[0], session: session), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.csrrw, rd: .zero, rs1: rs, imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrw, rd: .zero, rs1: rs, imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "csrs":
             guard ops.count == 2, let csr = parseCSR(ops[0], session: session), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.csrrs, rd: .zero, rs1: rs, imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrs, rd: .zero, rs1: rs, imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "csrc":
             guard ops.count == 2, let csr = parseCSR(ops[0], session: session), let rs = parseGPR(ops[1]) else { return false }
-            emitInst(.gpr(.csrrc, rd: .zero, rs1: rs, imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrc, rd: .zero, rs1: rs, imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "csrwi":
             guard ops.count == 2, let csr = parseCSR(ops[0], session: session), let uimm = evalConst(ops[1], session: session) else { return false }
-            emitInst(RV64Instruction(opcode: .csrrwi, rd: 0, rs1: UInt8(uimm & 0x1F), imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: .csrrwi, rd: 0, rs1: UInt8(uimm & 0x1F), imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "csrsi":
             guard ops.count == 2, let csr = parseCSR(ops[0], session: session), let uimm = evalConst(ops[1], session: session) else { return false }
-            emitInst(RV64Instruction(opcode: .csrrsi, rd: 0, rs1: UInt8(uimm & 0x1F), imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: .csrrsi, rd: 0, rs1: UInt8(uimm & 0x1F), imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "csrci":
             guard ops.count == 2, let csr = parseCSR(ops[0], session: session), let uimm = evalConst(ops[1], session: session) else { return false }
-            emitInst(RV64Instruction(opcode: .csrrci, rd: 0, rs1: UInt8(uimm & 0x1F), imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: .csrrci, rd: 0, rs1: UInt8(uimm & 0x1F), imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "rdcycle":
             guard ops.count == 1, let rd = parseGPR(ops[0]) else { return false }
-            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.cycle.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.cycle.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "rdtime":
             guard ops.count == 1, let rd = parseGPR(ops[0]) else { return false }
-            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.time.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.time.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "rdinstret":
             guard ops.count == 1, let rd = parseGPR(ops[0]) else { return false }
-            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.instret.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.instret.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "frcsr", "frsr":
             guard ops.count == 1, let rd = parseGPR(ops[0]) else { return false }
-            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.fcsr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.fcsr.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "fscsr", "fssr":
             if ops.count == 1, let rs = parseGPR(ops[0]) {
-                emitInst(.gpr(.csrrw, rd: .zero, rs1: rs, imm: Int64(RVCSR.fcsr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.csrrw, rd: .zero, rs1: rs, imm: Int64(RVCSR.fcsr.rawValue)), rvc: false, session: session, loc: loc)
                 return true
             }
             if ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) {
-                emitInst(.gpr(.csrrw, rd: rd, rs1: rs, imm: Int64(RVCSR.fcsr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.csrrw, rd: rd, rs1: rs, imm: Int64(RVCSR.fcsr.rawValue)), rvc: false, session: session, loc: loc)
                 return true
             }
             return false
 
         case "frrm":
             guard ops.count == 1, let rd = parseGPR(ops[0]) else { return false }
-            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.frm.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.frm.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "fsrm":
             if ops.count == 1, let rs = parseGPR(ops[0]) {
-                emitInst(.gpr(.csrrw, rd: .zero, rs1: rs, imm: Int64(RVCSR.frm.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.csrrw, rd: .zero, rs1: rs, imm: Int64(RVCSR.frm.rawValue)), rvc: false, session: session, loc: loc)
                 return true
             }
             if ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) {
-                emitInst(.gpr(.csrrw, rd: rd, rs1: rs, imm: Int64(RVCSR.frm.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.csrrw, rd: rd, rs1: rs, imm: Int64(RVCSR.frm.rawValue)), rvc: false, session: session, loc: loc)
                 return true
             }
             return false
 
         case "frflags":
             guard ops.count == 1, let rd = parseGPR(ops[0]) else { return false }
-            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.fflags.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.csrrs, rd: rd, rs1: .zero, imm: Int64(RVCSR.fflags.rawValue)), rvc: false, session: session, loc: loc)
             return true
 
         case "fsflags":
             if ops.count == 1, let rs = parseGPR(ops[0]) {
-                emitInst(.gpr(.csrrw, rd: .zero, rs1: rs, imm: Int64(RVCSR.fflags.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.csrrw, rd: .zero, rs1: rs, imm: Int64(RVCSR.fflags.rawValue)), rvc: false, session: session, loc: loc)
                 return true
             }
             if ops.count == 2, let rd = parseGPR(ops[0]), let rs = parseGPR(ops[1]) {
-                emitInst(.gpr(.csrrw, rd: rd, rs1: rs, imm: Int64(RVCSR.fflags.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.csrrw, rd: rd, rs1: rs, imm: Int64(RVCSR.fflags.rawValue)), rvc: false, session: session, loc: loc)
                 return true
             }
             return false
 
         case "fmv.s":
             guard ops.count == 2, let fd = parseFPR(ops[0]), let fs = parseFPR(ops[1]) else { return false }
-            emitInst(.fp(.fsgnj_s, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(.fsgnj_s, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, loc: loc)
             return true
 
         case "fabs.s":
             guard ops.count == 2, let fd = parseFPR(ops[0]), let fs = parseFPR(ops[1]) else { return false }
-            emitInst(.fp(.fsgnjx_s, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(.fsgnjx_s, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, loc: loc)
             return true
 
         case "fneg.s":
             guard ops.count == 2, let fd = parseFPR(ops[0]), let fs = parseFPR(ops[1]) else { return false }
-            emitInst(.fp(.fsgnjn_s, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(.fsgnjn_s, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, loc: loc)
             return true
 
         case "fmv.d":
             guard ops.count == 2, let fd = parseFPR(ops[0]), let fs = parseFPR(ops[1]) else { return false }
-            emitInst(.fp(.fsgnj_d, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(.fsgnj_d, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, loc: loc)
             return true
 
         case "fabs.d":
             guard ops.count == 2, let fd = parseFPR(ops[0]), let fs = parseFPR(ops[1]) else { return false }
-            emitInst(.fp(.fsgnjx_d, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(.fsgnjx_d, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, loc: loc)
             return true
 
         case "fneg.d":
             guard ops.count == 2, let fd = parseFPR(ops[0]), let fs = parseFPR(ops[1]) else { return false }
-            emitInst(.fp(.fsgnjn_d, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(.fsgnjn_d, rd: fd.rawValue, rs1: fs.rawValue, rs2: fs.rawValue), rvc: false, session: session, loc: loc)
             return true
 
         default:
@@ -539,37 +539,37 @@ public enum RVAsm {
         aq: Bool,
         rl: Bool,
         rvc: Bool,
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) {
         let opcode = desc.opcode
         switch desc.format {
         case .systemFixed, .cFixed:
-            emitInst(RV64Instruction(opcode: opcode), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: opcode), rvc: rvc, session: session, loc: loc)
 
         case .fence:
             if ops.isEmpty {
                 let imm = Int64((Int(RVFenceMask.iorw.rawValue) << 4) | Int(RVFenceMask.iorw.rawValue))
-                emitInst(RV64Instruction(opcode: .fence, imm: imm), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(RV64Instruction(opcode: .fence, imm: imm), rvc: false, session: session, loc: loc)
             } else if ops.count == 2,
                       let pred = RVFenceMask(name: ops[0]),
                       let succ = RVFenceMask(name: ops[1]) {
                 let imm = Int64((Int(pred.rawValue) << 4) | Int(succ.rawValue))
-                emitInst(RV64Instruction(opcode: .fence, imm: imm), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(RV64Instruction(opcode: .fence, imm: imm), rvc: false, session: session, loc: loc)
             } else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
             }
 
         case .sfenceVMA:
             if ops.isEmpty {
-                emitInst(.gpr(.sfence_vma, rs1: .zero, rs2: .zero), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.sfence_vma, rs1: .zero, rs2: .zero), rvc: false, session: session, loc: loc)
             } else if ops.count == 1, let rs1 = parseGPR(ops[0]) {
-                emitInst(.gpr(.sfence_vma, rs1: rs1, rs2: .zero), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.sfence_vma, rs1: rs1, rs2: .zero), rvc: false, session: session, loc: loc)
             } else if ops.count == 2, let rs1 = parseGPR(ops[0]), let rs2 = parseGPR(ops[1]) {
-                emitInst(.gpr(.sfence_vma, rs1: rs1, rs2: rs2), rvc: false, session: session, lineNumber: lineNumber)
+                emitInst(.gpr(.sfence_vma, rs1: rs1, rs2: rs2), rvc: false, session: session, loc: loc)
             } else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
             }
 
         case .r:
@@ -581,38 +581,38 @@ public enum RVAsm {
                let mod = parseRelocModifier(ops[3], session: session) {
                 let bytes = RV64Encoder.encode(.gpr(.add, rd: rd, rs1: rs1, rs2: rs2), rvcEnabled: false)
                 let fixup = AsmInstFixup(offsetInInst: 0, kind: mod.kind, symbol: mod.symbol, addend: mod.addend, width: 4)
-                session.currentSection.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
                 return
             }
             guard ops.count == 3,
                   let rd = parseGPR(ops[0]),
                   let rs1 = parseGPR(ops[1]),
                   let rs2 = parseGPR(ops[2]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             // Note: in RV64GC (without Zcb), `mul` is 32-bit; keep `mul` uncompressed unless explicitly `c.mul`.
             let allowCompress = rvc && opcode != .mul && opcode != .add_uw
-            emitInst(.gpr(opcode, rd: rd, rs1: rs1, rs2: rs2), rvc: allowCompress, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, rs1: rs1, rs2: rs2), rvc: allowCompress, session: session, loc: loc)
 
         case .rUnary:
             guard ops.count == 2,
                   let rd = parseGPR(ops[0]),
                   let rs1 = parseGPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.gpr(opcode, rd: rd, rs1: rs1), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, rs1: rs1), rvc: false, session: session, loc: loc)
 
         case .rShift64, .rShift32:
             guard ops.count == 3,
                   let rd = parseGPR(ops[0]),
                   let rs1 = parseGPR(ops[1]),
                   let shamt = evalConst(ops[2], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.gpr(opcode, rd: rd, rs1: rs1, imm: shamt), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, rs1: rs1, imm: shamt), rvc: rvc, session: session, loc: loc)
 
         case .i:
             // Special case for `jalr`:
@@ -622,16 +622,16 @@ public enum RVAsm {
             // - `jalr rd, rs1, imm` -> `jalr rd, rs1, imm`
             if opcode == .jalr {
                 if ops.count == 1, let rs1 = parseGPR(ops[0]) {
-                    emitInst(.gpr(.jalr, rd: .ra, rs1: rs1, imm: 0), rvc: rvc, session: session, lineNumber: lineNumber)
+                    emitInst(.gpr(.jalr, rd: .ra, rs1: rs1, imm: 0), rvc: rvc, session: session, loc: loc)
                     return
                 }
                 if ops.count == 2, let rd = parseGPR(ops[0]) {
                     if let rs1 = parseGPR(ops[1]) {
-                        emitInst(.gpr(.jalr, rd: rd, rs1: rs1, imm: 0), rvc: rvc, session: session, lineNumber: lineNumber)
+                        emitInst(.gpr(.jalr, rd: rd, rs1: rs1, imm: 0), rvc: rvc, session: session, loc: loc)
                         return
                     }
                     if let (imm, rs1) = parseMemOperand(ops[1], session: session) {
-                        emitInst(.gpr(.jalr, rd: rd, rs1: rs1, imm: imm), rvc: rvc, session: session, lineNumber: lineNumber)
+                        emitInst(.gpr(.jalr, rd: rd, rs1: rs1, imm: imm), rvc: rvc, session: session, loc: loc)
                         return
                     }
                 }
@@ -639,85 +639,85 @@ public enum RVAsm {
             guard ops.count == 3,
                   let rd = parseGPR(ops[0]),
                   let rs1 = parseGPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             if let mod = parseRelocModifier(ops[2], session: session) {
                 let bytes = RV64Encoder.encode(.gpr(opcode, rd: rd, rs1: rs1, imm: 0), rvcEnabled: false)
                 let fixup = AsmInstFixup(offsetInInst: 0, kind: mod.kind, symbol: mod.symbol, addend: mod.addend, width: 4)
-                session.currentSection.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
                 return
             }
             guard let imm = evalConst(ops[2], session: session) else {
-                diagnostics.report(.asmInvalidExpression, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [ops[2]])
+                diagnostics.report(.asmInvalidExpression, at: loc, args: [ops[2]])
                 return
             }
             // Note: in RV64GC without Zcb, `andi rd, rd, 255` and `xori rd, rd, -1` stay 32-bit
             let allowCompress = rvc && !(opcode == .andi && imm == 255) && opcode != .xori
-            emitInst(.gpr(opcode, rd: rd, rs1: rs1, imm: imm), rvc: allowCompress, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, rs1: rs1, imm: imm), rvc: allowCompress, session: session, loc: loc)
 
         case .iLoad:
             guard ops.count == 2, let rd = parseGPR(ops[0]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             if let (mod, base) = parseRelocMemOperand(ops[1], session: session) {
                 let bytes = RV64Encoder.encode(.gpr(opcode, rd: rd, rs1: base, imm: 0), rvcEnabled: false)
                 let fixup = AsmInstFixup(offsetInInst: 0, kind: mod.kind, symbol: mod.symbol, addend: mod.addend, width: 4)
-                session.currentSection.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
                 return
             }
             guard let (imm, base) = parseMemOperand(ops[1], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             // In RV64GC (standard C extension), only `lw` and `ld` have compressed forms (`c.lw`, `c.lwsp`, `c.ld`, `c.ldsp`).
             let allowCompress = rvc && (opcode == .lw || opcode == .ld)
-            emitInst(.gpr(opcode, rd: rd, rs1: base, imm: imm), rvc: allowCompress, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, rs1: base, imm: imm), rvc: allowCompress, session: session, loc: loc)
 
         case .iFPLoad:
             guard ops.count == 2,
                   let fd = parseFPR(ops[0]),
                   let (imm, base) = parseMemOperand(ops[1], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.fp(opcode, rd: fd.rawValue, rs1: base.rawValue, imm: imm), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: fd.rawValue, rs1: base.rawValue, imm: imm), rvc: rvc, session: session, loc: loc)
 
         case .s:
             guard ops.count == 2, let rs2 = parseGPR(ops[0]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             if let (mod, base) = parseRelocMemOperand(ops[1], session: session) {
                 let sKind: RelocKind = (mod.kind == .riscv_pcrel_lo12_i) ? .riscv_pcrel_lo12_s : mod.kind
                 let bytes = RV64Encoder.encode(.gpr(opcode, rs1: base, rs2: rs2, imm: 0), rvcEnabled: false)
                 let fixup = AsmInstFixup(offsetInInst: 0, kind: sKind, symbol: mod.symbol, addend: mod.addend, width: 4)
-                session.currentSection.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
                 return
             }
             guard let (imm, base) = parseMemOperand(ops[1], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             // In RV64GC (standard C extension), only `sw` and `sd` have compressed forms (`c.sw`, `c.swsp`, `c.sd`, `c.sdsp`).
             let allowCompress = rvc && (opcode == .sw || opcode == .sd)
-            emitInst(.gpr(opcode, rs1: base, rs2: rs2, imm: imm), rvc: allowCompress, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rs1: base, rs2: rs2, imm: imm), rvc: allowCompress, session: session, loc: loc)
 
         case .sFP:
             guard ops.count == 2,
                   let fs2 = parseFPR(ops[0]),
                   let (imm, base) = parseMemOperand(ops[1], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.fp(opcode, rs1: base.rawValue, rs2: fs2.rawValue, imm: imm), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rs1: base.rawValue, rs2: fs2.rawValue, imm: imm), rvc: rvc, session: session, loc: loc)
 
         case .b:
             guard ops.count == 3,
                   let rs1 = parseGPR(ops[0]),
                   let rs2 = parseGPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             var branchOp = opcode
@@ -725,24 +725,24 @@ public enum RVAsm {
                 if opcode == .beq { branchOp = .c_beqz }
                 else if opcode == .bne { branchOp = .c_bnez }
             }
-            emitBranch(opcode: branchOp, rs1: rs1, rs2: rs2, targetExpr: ops[2], rvc: rvc, lineNumber: lineNumber, session: session)
+            emitBranch(opcode: branchOp, rs1: rs1, rs2: rs2, targetExpr: ops[2], rvc: rvc, loc: loc, session: session)
 
         case .u:
             guard ops.count == 2, let rd = parseGPR(ops[0]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             if let mod = parseRelocModifier(ops[1], session: session) {
                 let bytes = RV64Encoder.encode(.gpr(opcode, rd: rd, imm: 0), rvcEnabled: false)
                 let fixup = AsmInstFixup(offsetInInst: 0, kind: mod.kind, symbol: mod.symbol, addend: mod.addend, width: 4)
-                session.currentSection.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
                 return
             }
             guard let imm = evalConst(ops[1], session: session) else {
-                diagnostics.report(.asmInvalidExpression, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [ops[1]])
+                diagnostics.report(.asmInvalidExpression, at: loc, args: [ops[1]])
                 return
             }
-            emitInst(.gpr(opcode, rd: rd, imm: imm), rvc: rvc, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, imm: imm), rvc: rvc, session: session, loc: loc)
 
         case .j:
             // `jal target` (1 operand, rd = ra) or `jal rd, target` (2 operands)
@@ -755,7 +755,7 @@ public enum RVAsm {
                 rd = parsedRd
                 targetStr = ops[1]
             } else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let (sym, addend) = parseSymbolTarget(targetStr, session: session)
@@ -765,7 +765,7 @@ public enum RVAsm {
                 .relaxable(
                     branch: .rvBranch(baseInst: baseInst, rvcAllowed: useCJ, targetSymbol: sym, addend: addend),
                     form: useCJ ? 0 : 1,
-                    lineNumber: lineNumber
+                    loc: loc
                 )
             )
 
@@ -774,127 +774,127 @@ public enum RVAsm {
                   let rd = parseGPR(ops[0]),
                   let csr = parseCSR(ops[1], session: session),
                   let rs1 = parseGPR(ops[2]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.gpr(opcode, rd: rd, rs1: rs1, imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, rs1: rs1, imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
 
         case .csrImm:
             guard ops.count == 3,
                   let rd = parseGPR(ops[0]),
                   let csr = parseCSR(ops[1], session: session),
                   let uimm = evalConst(ops[2], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(RV64Instruction(opcode: opcode, rd: rd.rawValue, rs1: UInt8(uimm & 0x1F), imm: Int64(csr.rawValue)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: opcode, rd: rd.rawValue, rs1: UInt8(uimm & 0x1F), imm: Int64(csr.rawValue)), rvc: false, session: session, loc: loc)
 
         case .rLR:
             guard ops.count == 2,
                   let rd = parseGPR(ops[0]),
                   let (imm, base) = parseMemOperand(ops[1], session: session), imm == 0 else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.gpr(opcode, rd: rd, rs1: base, aq: aq, rl: rl), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, rs1: base, aq: aq, rl: rl), rvc: false, session: session, loc: loc)
 
         case .rAMO:
             guard ops.count == 3,
                   let rd = parseGPR(ops[0]),
                   let rs2 = parseGPR(ops[1]),
                   let (imm, base) = parseMemOperand(ops[2], session: session), imm == 0 else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.gpr(opcode, rd: rd, rs1: base, rs2: rs2, aq: aq, rl: rl), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(opcode, rd: rd, rs1: base, rs2: rs2, aq: aq, rl: rl), rvc: false, session: session, loc: loc)
 
         case .rFP:
             guard ops.count >= 3,
                   let fd = parseFPR(ops[0]),
                   let fs1 = parseFPR(ops[1]),
                   let fs2 = parseFPR(ops[2]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let rm = (ops.count >= 4 ? RVRoundingMode(name: ops[3]) : nil) ?? .dyn
-            emitInst(.fp(opcode, rd: fd.rawValue, rs1: fs1.rawValue, rs2: fs2.rawValue, rm: rm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: fd.rawValue, rs1: fs1.rawValue, rs2: fs2.rawValue, rm: rm), rvc: false, session: session, loc: loc)
 
         case .rFPFixed:
             guard ops.count == 3,
                   let fd = parseFPR(ops[0]),
                   let fs1 = parseFPR(ops[1]),
                   let fs2 = parseFPR(ops[2]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.fp(opcode, rd: fd.rawValue, rs1: fs1.rawValue, rs2: fs2.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: fd.rawValue, rs1: fs1.rawValue, rs2: fs2.rawValue), rvc: false, session: session, loc: loc)
 
         case .rFPUnary:
             guard ops.count >= 2,
                   let fd = parseFPR(ops[0]),
                   let fs1 = parseFPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let rm = (ops.count >= 3 ? RVRoundingMode(name: ops[2]) : nil) ?? .dyn
-            emitInst(.fp(opcode, rd: fd.rawValue, rs1: fs1.rawValue, rm: rm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: fd.rawValue, rs1: fs1.rawValue, rm: rm), rvc: false, session: session, loc: loc)
 
         case .rFPCmp:
             guard ops.count == 3,
                   let rd = parseGPR(ops[0]),
                   let fs1 = parseFPR(ops[1]),
                   let fs2 = parseFPR(ops[2]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.fp(opcode, rd: rd.rawValue, rs1: fs1.rawValue, rs2: fs2.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: rd.rawValue, rs1: fs1.rawValue, rs2: fs2.rawValue), rvc: false, session: session, loc: loc)
 
         case .rFPCvtF2I:
             guard ops.count >= 2,
                   let rd = parseGPR(ops[0]),
                   let fs1 = parseFPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let rm = (ops.count >= 3 ? RVRoundingMode(name: ops[2]) : nil) ?? .rtz
-            emitInst(.fp(opcode, rd: rd.rawValue, rs1: fs1.rawValue, rm: rm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: rd.rawValue, rs1: fs1.rawValue, rm: rm), rvc: false, session: session, loc: loc)
 
         case .rFPCvtI2F:
             guard ops.count >= 2,
                   let fd = parseFPR(ops[0]),
                   let rs1 = parseGPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let rm = (ops.count >= 3 ? RVRoundingMode(name: ops[2]) : nil) ?? .dyn
-            emitInst(.fp(opcode, rd: fd.rawValue, rs1: rs1.rawValue, rm: rm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: fd.rawValue, rs1: rs1.rawValue, rm: rm), rvc: false, session: session, loc: loc)
 
         case .rFPMvF2I:
             guard ops.count == 2,
                   let rd = parseGPR(ops[0]),
                   let fs1 = parseFPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.fp(opcode, rd: rd.rawValue, rs1: fs1.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: rd.rawValue, rs1: fs1.rawValue), rvc: false, session: session, loc: loc)
 
         case .rFPMvI2F:
             guard ops.count == 2,
                   let fd = parseFPR(ops[0]),
                   let rs1 = parseGPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.fp(opcode, rd: fd.rawValue, rs1: rs1.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: fd.rawValue, rs1: rs1.rawValue), rvc: false, session: session, loc: loc)
 
         case .rFLI:
             guard ops.count == 2,
                   let fd = parseFPR(ops[0]),
                   let idx = RVZfaFLITable.index(for: ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.fp(opcode, rd: fd.rawValue, rs1: idx), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.fp(opcode, rd: fd.rawValue, rs1: idx), rvc: false, session: session, loc: loc)
 
         // --- RVV 1.0 ---
         case .vsetvl:
@@ -902,131 +902,131 @@ public enum RVAsm {
                   let rd = parseGPR(ops[0]),
                   let rs1 = parseGPR(ops[1]),
                   let rs2 = parseGPR(ops[2]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.gpr(.vsetvl, rd: rd, rs1: rs1, rs2: rs2), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.gpr(.vsetvl, rd: rd, rs1: rs1, rs2: rs2), rvc: false, session: session, loc: loc)
 
         case .vsetvli:
             guard ops.count >= 3,
                   let rd = parseGPR(ops[0]),
                   let rs1 = parseGPR(ops[1]),
                   let vtype = parseVType(Array(ops.dropFirst(2)), session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(RV64Instruction(opcode: .vsetvli, rd: rd.rawValue, rs1: rs1.rawValue, imm: Int64(vtype)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: .vsetvli, rd: rd.rawValue, rs1: rs1.rawValue, imm: Int64(vtype)), rvc: false, session: session, loc: loc)
 
         case .vsetivli:
             guard ops.count >= 3,
                   let rd = parseGPR(ops[0]),
                   let uimm = evalConst(ops[1], session: session),
                   let vtype = parseVType(Array(ops.dropFirst(2)), session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(RV64Instruction(opcode: .vsetivli, rd: rd.rawValue, rs1: UInt8(uimm & 0x1F), imm: Int64(vtype)), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: .vsetivli, rd: rd.rawValue, rs1: UInt8(uimm & 0x1F), imm: Int64(vtype)), rvc: false, session: session, loc: loc)
 
         case .vLoadWhole, .vLoadUnit:
             guard ops.count >= 2,
                   let vd = RVVReg(name: ops[0].lowercased()),
                   let (_, base) = parseMemOperand(ops[1], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let vm = !(ops.count >= 3 && ops[2].lowercased() == "v0.t")
-            emitInst(RV64Instruction(opcode: opcode, rd: vd.rawValue, rs1: base.rawValue, vm: vm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: opcode, rd: vd.rawValue, rs1: base.rawValue, vm: vm), rvc: false, session: session, loc: loc)
 
         case .vStoreWhole, .vStoreUnit:
             guard ops.count >= 2,
                   let vs3 = RVVReg(name: ops[0].lowercased()),
                   let (_, base) = parseMemOperand(ops[1], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let vm = !(ops.count >= 3 && ops[2].lowercased() == "v0.t")
-            emitInst(RV64Instruction(opcode: opcode, rd: vs3.rawValue, rs1: base.rawValue, rs2: vs3.rawValue, vm: vm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(RV64Instruction(opcode: opcode, rd: vs3.rawValue, rs1: base.rawValue, rs2: vs3.rawValue, vm: vm), rvc: false, session: session, loc: loc)
 
         case .vOpiVV:
             guard ops.count >= 3,
                   let vd = RVVReg(name: ops[0].lowercased()),
                   let vs2 = RVVReg(name: ops[1].lowercased()),
                   let vs1 = RVVReg(name: ops[2].lowercased()) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let vm = !(ops.count >= 4 && ops[3].lowercased() == "v0.t")
-            emitInst(.vec(opcode, vd: vd, vs1: vs1.rawValue, vs2: vs2, vm: vm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.vec(opcode, vd: vd, vs1: vs1.rawValue, vs2: vs2, vm: vm), rvc: false, session: session, loc: loc)
 
         case .vOpiVX:
             guard ops.count >= 3,
                   let vd = RVVReg(name: ops[0].lowercased()),
                   let vs2 = RVVReg(name: ops[1].lowercased()),
                   let rs1 = parseGPR(ops[2]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let vm = !(ops.count >= 4 && ops[3].lowercased() == "v0.t")
-            emitInst(.vec(opcode, vd: vd, vs1: rs1.rawValue, vs2: vs2, vm: vm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.vec(opcode, vd: vd, vs1: rs1.rawValue, vs2: vs2, vm: vm), rvc: false, session: session, loc: loc)
 
         case .vOpiVI:
             guard ops.count >= 3,
                   let vd = RVVReg(name: ops[0].lowercased()),
                   let vs2 = RVVReg(name: ops[1].lowercased()),
                   let simm = evalConst(ops[2], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
             let vm = !(ops.count >= 4 && ops[3].lowercased() == "v0.t")
-            emitInst(.vec(opcode, vd: vd, vs2: vs2, imm: simm, vm: vm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.vec(opcode, vd: vd, vs2: vs2, imm: simm, vm: vm), rvc: false, session: session, loc: loc)
 
         case .vMvVV:
             guard ops.count == 2,
                   let vd = RVVReg(name: ops[0].lowercased()),
                   let vs1 = RVVReg(name: ops[1].lowercased()) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.vec(opcode, vd: vd, vs1: vs1.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.vec(opcode, vd: vd, vs1: vs1.rawValue), rvc: false, session: session, loc: loc)
 
         case .vMvVX:
             guard ops.count == 2,
                   let vd = RVVReg(name: ops[0].lowercased()),
                   let rs1 = parseGPR(ops[1]) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.vec(opcode, vd: vd, vs1: rs1.rawValue), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.vec(opcode, vd: vd, vs1: rs1.rawValue), rvc: false, session: session, loc: loc)
 
         case .vMvVI:
             guard ops.count == 2,
                   let vd = RVVReg(name: ops[0].lowercased()),
                   let simm = evalConst(ops[1], session: session) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
                 return
             }
-            emitInst(.vec(opcode, vd: vd, imm: simm), rvc: false, session: session, lineNumber: lineNumber)
+            emitInst(.vec(opcode, vd: vd, imm: simm), rvc: false, session: session, loc: loc)
 
         default:
-            diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [desc.mnemonic])
+            diagnostics.report(.asmInvalidInstruction, at: loc, args: [desc.mnemonic])
         }
     }
 
     // MARK: - Emission & Parsing Helpers
 
-    private static func emitInst(_ inst: RV64Instruction, rvc: Bool, session: AsmSession, lineNumber: Int) {
+    private static func emitInst(_ inst: RV64Instruction, rvc: Bool, session: AsmSession, loc: AsmLoc) {
         let bytes = RV64Encoder.encode(inst, rvcEnabled: rvc)
-        session.currentSection.emitBytes(bytes, lineNumber: lineNumber)
+        session.currentSection.emitBytes(bytes, loc: loc)
     }
 
-    private static func emitWord32(_ word: UInt32, session: AsmSession, lineNumber: Int) {
+    private static func emitWord32(_ word: UInt32, session: AsmSession, loc: AsmLoc) {
         let bytes: [UInt8] = [
             UInt8(truncatingIfNeeded: word),
             UInt8(truncatingIfNeeded: word >> 8),
             UInt8(truncatingIfNeeded: word >> 16),
             UInt8(truncatingIfNeeded: word >> 24),
         ]
-        session.currentSection.emitBytes(bytes, lineNumber: lineNumber)
+        session.currentSection.emitBytes(bytes, loc: loc)
     }
 
     private static func emitBranch(
@@ -1035,7 +1035,7 @@ public enum RVAsm {
         rs2: RVGPR,
         targetExpr: String,
         rvc: Bool,
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession
     ) {
         let (sym, addend) = parseSymbolTarget(targetExpr, session: session)
@@ -1045,7 +1045,7 @@ public enum RVAsm {
             .relaxable(
                 branch: .rvBranch(baseInst: baseInst, rvcAllowed: isCompressedOp && rvc, targetSymbol: sym, addend: addend),
                 form: (isCompressedOp && rvc) ? 0 : 1,
-                lineNumber: lineNumber
+                loc: loc
             )
         )
     }

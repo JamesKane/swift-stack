@@ -14,6 +14,7 @@ public enum ELFReadError: Error, Equatable, Sendable, CustomStringConvertible {
     case outOfBoundsSectionHeaders(offset: UInt64, count: Int, entrySize: Int, fileSize: Int)
     case outOfBoundsSectionData(sectionIndex: Int, offset: UInt64, size: UInt64, fileSize: Int)
     case invalidStringTableIndex(UInt16)
+    case corruptStringTable(String)
     case corruptSymbolTable(String)
     case corruptRelocationTable(String)
     case ioError(String)
@@ -38,6 +39,8 @@ public enum ELFReadError: Error, Equatable, Sendable, CustomStringConvertible {
             return "Section \(secIdx) data out of bounds (offset \(offset), size \(size), fileSize \(fileSize))"
         case .invalidStringTableIndex(let idx):
             return "Invalid string table section index \(idx)"
+        case .corruptStringTable(let msg):
+            return "Corrupt ELF string table: \(msg)"
         case .corruptSymbolTable(let msg):
             return "Corrupt ELF symbol table: \(msg)"
         case .corruptRelocationTable(let msg):
@@ -620,7 +623,10 @@ public struct ELFObjectReader: Sendable {
         return try read(bytes: [UInt8](data))
     }
 
-    /// Parses a `RelocatableObject` from an `UnsafeRawBufferPointer`, validating all bounds.
+    /// Parses a `RelocatableObject` from an `UnsafeRawBufferPointer`.
+    ///
+    /// The input is untrusted: every offset, size, count, index and string reference is validated before use
+    /// (with overflow-checked arithmetic), and malformed input throws an `ELFReadError` rather than trapping.
     public static func read(bytes: UnsafeRawBufferPointer) throws -> RelocatableObject {
         let fileSize = bytes.count
         guard fileSize >= ELF64Constants.ehdrSize else {
@@ -673,7 +679,8 @@ public struct ELFObjectReader: Sendable {
             return obj
         }
 
-        guard eShentsize >= ELF64Constants.shdrSize else {
+        guard eShentsize >= ELF64Constants.shdrSize,
+              let shTable = checkedRange(offset: eShoff, size: UInt64(eShnum) * UInt64(eShentsize), fileSize: fileSize) else {
             throw ELFReadError.outOfBoundsSectionHeaders(
                 offset: eShoff,
                 count: eShnum,
@@ -682,22 +689,13 @@ public struct ELFObjectReader: Sendable {
             )
         }
 
-        let (shTableBytes, shOverflow1) = UInt64(eShnum).multipliedReportingOverflow(by: UInt64(eShentsize))
-        let (shTableEnd, shOverflow2) = eShoff.addingReportingOverflow(shTableBytes)
-        guard !shOverflow1, !shOverflow2, shTableEnd <= UInt64(fileSize) else {
-            throw ELFReadError.outOfBoundsSectionHeaders(
-                offset: eShoff,
-                count: eShnum,
-                entrySize: eShentsize,
-                fileSize: fileSize
-            )
-        }
-
-        // 5. Parse section headers and validate section data bounds
+        // 5. Parse section headers and validate the file range of every section whose contents are read
         var shdrs: [RawELFSectionHeader] = []
+        var dataRanges: [Range<Int>] = []
         shdrs.reserveCapacity(eShnum)
+        dataRanges.reserveCapacity(eShnum)
         for i in 0..<eShnum {
-            let base = Int(eShoff) + i * eShentsize
+            let base = shTable.lowerBound + i * eShentsize
             let shdr = RawELFSectionHeader(
                 shName: readUInt32(bytes, at: base),
                 shType: readUInt32(bytes, at: base + 4),
@@ -710,9 +708,9 @@ public struct ELFObjectReader: Sendable {
                 shAddralign: readUInt64(bytes, at: base + 48),
                 shEntsize: readUInt64(bytes, at: base + 56)
             )
-            if shdr.shType != ELF64Constants.shtNull && shdr.shType != ELF64Constants.shtNobits && shdr.shSize > 0 {
-                let (endOff, over) = shdr.shOffset.addingReportingOverflow(shdr.shSize)
-                guard !over, endOff <= UInt64(fileSize) else {
+            var range = 0..<0
+            if i > 0 && shdr.shType != ELF64Constants.shtNull && shdr.shType != ELF64Constants.shtNobits {
+                guard let r = checkedRange(offset: shdr.shOffset, size: shdr.shSize, fileSize: fileSize) else {
                     throw ELFReadError.outOfBoundsSectionData(
                         sectionIndex: i,
                         offset: shdr.shOffset,
@@ -720,17 +718,26 @@ public struct ELFObjectReader: Sendable {
                         fileSize: fileSize
                     )
                 }
+                range = r
+            } else if shdr.shType == ELF64Constants.shtNobits && shdr.shSize > UInt64(UInt32.max) {
+                throw ELFReadError.outOfBoundsSectionData(sectionIndex: i, offset: shdr.shOffset, size: shdr.shSize, fileSize: fileSize)
             }
             shdrs.append(shdr)
+            dataRanges.append(range)
         }
 
-        // 6. Validate e_shstrndx
+        // 6. Validate e_shstrndx (SHN_UNDEF means "no section names")
         guard Int(eShstrndx) < eShnum else {
             throw ELFReadError.invalidStringTableIndex(eShstrndx)
         }
-        let shstrHdr = shdrs[Int(eShstrndx)]
-        guard shstrHdr.shType == ELF64Constants.shtStrtab || eShstrndx == 0 else {
-            throw ELFReadError.invalidStringTableIndex(eShstrndx)
+        let shstrRange: Range<Int>?
+        if eShstrndx == 0 {
+            shstrRange = nil
+        } else {
+            guard shdrs[Int(eShstrndx)].shType == ELF64Constants.shtStrtab else {
+                throw ELFReadError.invalidStringTableIndex(eShstrndx)
+            }
+            shstrRange = dataRanges[Int(eShstrndx)]
         }
 
         // 7. Create user sections in `obj`
@@ -750,10 +757,12 @@ public struct ELFObjectReader: Sendable {
                 break
             }
 
-            let name = readNullTerminatedString(bytes, tableHeader: shstrHdr, offset: shdr.shName)
+            let name = try readString(bytes, table: shstrRange, offset: shdr.shName, what: "section \(elfIdx) name")
             let kind = classifySectionKind(name: name, shType: shdr.shType, shFlags: shdr.shFlags)
             let flags = SectionFlags(rawValue: UInt32(truncatingIfNeeded: shdr.shFlags))
             let alignLog2: UInt8 = shdr.shAddralign <= 1 ? 0 : UInt8(shdr.shAddralign.trailingZeroBitCount)
+            // Contents come only from the validated file range (empty for SHT_NOBITS, whatever the name says)
+            let dataSlice = Array(UnsafeRawBufferPointer(rebasing: bytes[dataRanges[elfIdx]]))
 
             let secIdx: SectionIndex
             if kind.isNobits {
@@ -766,9 +775,6 @@ public struct ELFObjectReader: Sendable {
                     nobitsSize: UInt32(truncatingIfNeeded: shdr.shSize)
                 )
             } else {
-                let start = Int(shdr.shOffset)
-                let end = start + Int(shdr.shSize)
-                let dataSlice = start < end ? Array(bytes[start..<end]) : []
                 secIdx = obj.addSection(
                     name: name,
                     kind: kind,
@@ -778,75 +784,84 @@ public struct ELFObjectReader: Sendable {
                 )
             }
             elfSecToObjSec[elfIdx] = secIdx
-            if kind == .ssSymTypes || name == ".ss_symtypes" {
+            if (kind == .ssSymTypes || name == ".ss_symtypes") && shdr.shType != ELF64Constants.shtNobits {
                 symTypesElfSecIndices.append(elfIdx)
             }
         }
 
-        // 8. Parse .symtab (if present)
-        var elfSymToObjSym: [UInt32: SymbolIndex] = [0: .nilId]
-        for elfIdx in 1..<eShnum where shdrs[elfIdx].shType == ELF64Constants.shtSymtab {
+        // 8. Parse .symtab (at most one, as in every ELF producer)
+        let symtabIndices = (1..<eShnum).filter { shdrs[$0].shType == ELF64Constants.shtSymtab }
+        guard symtabIndices.count <= 1 else {
+            throw ELFReadError.corruptSymbolTable("\(symtabIndices.count) SHT_SYMTAB sections")
+        }
+        var elfSymToObjSym: [SymbolIndex] = [.nilId]
+        let symtabElfIdx = symtabIndices.first
+        if let elfIdx = symtabElfIdx {
             let symHdr = shdrs[elfIdx]
-            guard Int(symHdr.shLink) < eShnum else {
+            guard Int(symHdr.shLink) < eShnum, symHdr.shLink != 0 else {
                 throw ELFReadError.corruptSymbolTable("sh_link \(symHdr.shLink) out of range")
             }
-            let strHdr = shdrs[Int(symHdr.shLink)]
-            guard strHdr.shType == ELF64Constants.shtStrtab else {
+            guard shdrs[Int(symHdr.shLink)].shType == ELF64Constants.shtStrtab else {
                 throw ELFReadError.corruptSymbolTable("sh_link \(symHdr.shLink) is not SHT_STRTAB")
             }
+            let strRange = dataRanges[Int(symHdr.shLink)]
             let entSize = symHdr.shEntsize == 0 ? UInt64(ELF64Constants.symEntrySize) : symHdr.shEntsize
             guard entSize >= UInt64(ELF64Constants.symEntrySize), symHdr.shSize % entSize == 0 else {
                 throw ELFReadError.corruptSymbolTable("invalid sh_size \(symHdr.shSize) or sh_entsize \(entSize)")
             }
-
             let symCount = Int(symHdr.shSize / entSize)
-            if symCount > 1 {
-                for symI in 1..<symCount {
-                    let base = Int(symHdr.shOffset) + symI * Int(entSize)
-                    let stName = readUInt32(bytes, at: base)
-                    let stInfo = bytes[base + 4]
-                    let stOther = bytes[base + 5]
-                    let stShndx = readUInt16(bytes, at: base + 6)
-                    let stValue = readUInt64(bytes, at: base + 8)
-                    let stSize = readUInt64(bytes, at: base + 16)
+            guard UInt64(symHdr.shInfo) <= UInt64(symCount) else {
+                throw ELFReadError.corruptSymbolTable("sh_info \(symHdr.shInfo) exceeds \(symCount) symbols")
+            }
+            let symBase = dataRanges[elfIdx].lowerBound
+            elfSymToObjSym.reserveCapacity(symCount)
+            for symI in 1..<max(1, symCount) {
+                let base = symBase + symI * Int(entSize)
+                let stName = readUInt32(bytes, at: base)
+                let stInfo = bytes[base + 4]
+                let stOther = bytes[base + 5]
+                let stShndx = readUInt16(bytes, at: base + 6)
+                let stValue = readUInt64(bytes, at: base + 8)
+                let stSize = readUInt64(bytes, at: base + 16)
 
-                    let symName = readNullTerminatedString(bytes, tableHeader: strHdr, offset: stName)
-                    let binding = decodeSymbolBinding(stInfo >> 4)
-                    let symKind = decodeSymbolKind(stInfo & 0x0F)
-                    let visibility = decodeSymbolVisibility(stOther & 0x03)
+                let symName = try readString(bytes, table: strRange, offset: stName, what: "symbol \(symI) name")
+                let binding = decodeSymbolBinding(stInfo >> 4)
+                let symKind = decodeSymbolKind(stInfo & 0x0F)
+                let visibility = decodeSymbolVisibility(stOther & 0x03)
 
-                    let section: SectionIndex
-                    if stShndx == ELF64Constants.shnUndef {
-                        section = .undefined
-                    } else if stShndx == ELF64Constants.shnAbs {
-                        section = .absolute
-                    } else if stShndx == ELF64Constants.shnCommon {
-                        section = .common
-                    } else {
-                        section = elfSecToObjSec[Int(stShndx)] ?? .undefined
-                    }
-
-                    let objSym = obj.addSymbol(
-                        name: symName,
-                        section: section,
-                        value: stValue,
-                        size: stSize,
-                        binding: binding,
-                        visibility: visibility,
-                        kind: symKind
-                    )
-                    elfSymToObjSym[UInt32(symI)] = objSym
+                let section: SectionIndex
+                if stShndx == ELF64Constants.shnUndef {
+                    section = .undefined
+                } else if stShndx == ELF64Constants.shnAbs {
+                    section = .absolute
+                } else if stShndx == ELF64Constants.shnCommon {
+                    section = .common
+                } else if Int(stShndx) < eShnum {
+                    section = elfSecToObjSec[Int(stShndx)] ?? .undefined
+                } else {
+                    throw ELFReadError.corruptSymbolTable("symbol \(symI) has section index \(stShndx) of \(eShnum)")
                 }
+
+                let objSym = obj.addSymbol(
+                    name: symName,
+                    section: section,
+                    value: stValue,
+                    size: stSize,
+                    binding: binding,
+                    visibility: visibility,
+                    kind: symKind
+                )
+                elfSymToObjSym.append(objSym)
             }
         }
 
         // 9. Populate symbolTypes from any `.ss_symtypes` section
         for symTypesElfIdx in symTypesElfSecIndices {
-            let shdr = shdrs[symTypesElfIdx]
-            let count = Int(shdr.shSize) / 24
+            let range = dataRanges[symTypesElfIdx]
+            let count = range.count / 24
             for i in 0..<count {
-                let base = Int(shdr.shOffset) + i * 24
-                let elfSymIdx = readUInt32(bytes, at: base)
+                let base = range.lowerBound + i * 24
+                let elfSymIdx = Int(readUInt32(bytes, at: base))
                 let kind = bytes[base + 4]
                 let lang = bytes[base + 5]
                 let flags = readUInt16(bytes, at: base + 6)
@@ -854,7 +869,7 @@ public struct ELFObjectReader: Sendable {
                 let providerMod = readUInt32(bytes, at: base + 16)
                 let reserved = readUInt32(bytes, at: base + 20)
 
-                if let mappedSym = elfSymToObjSym[elfSymIdx], mappedSym.isValid {
+                if elfSymIdx < elfSymToObjSym.count, case let mappedSym = elfSymToObjSym[elfSymIdx], mappedSym.isValid {
                     let rec = SymbolTypeRecord(
                         symbolIndex: mappedSym.rawIndex,
                         kind: kind,
@@ -876,26 +891,37 @@ public struct ELFObjectReader: Sendable {
             guard entSize >= UInt64(ELF64Constants.relaEntrySize), relaHdr.shSize % entSize == 0 else {
                 throw ELFReadError.corruptRelocationTable("invalid sh_size \(relaHdr.shSize) or sh_entsize \(entSize)")
             }
-            guard let targetSec = elfSecToObjSec[Int(relaHdr.shInfo)] else {
-                continue
-            }
-
             let relocCount = Int(relaHdr.shSize / entSize)
+            guard relocCount > 0 else { continue }
+            guard Int(relaHdr.shInfo) < eShnum, let targetSec = elfSecToObjSec[Int(relaHdr.shInfo)] else {
+                throw ELFReadError.corruptRelocationTable("section \(elfIdx): sh_info \(relaHdr.shInfo) is not a relocatable section")
+            }
+            guard let symtab = symtabElfIdx, Int(relaHdr.shLink) == symtab else {
+                throw ELFReadError.corruptRelocationTable("section \(elfIdx): sh_link \(relaHdr.shLink) is not the symbol table")
+            }
+            let targetSize = shdrs[Int(relaHdr.shInfo)].shSize
+
+            let relaBase = dataRanges[elfIdx].lowerBound
             for r in 0..<relocCount {
-                let base = Int(relaHdr.shOffset) + r * Int(entSize)
+                let base = relaBase + r * Int(entSize)
                 let rOffset = readUInt64(bytes, at: base)
                 let rInfo = readUInt64(bytes, at: base + 8)
                 let rAddend = readInt64(bytes, at: base + 16)
 
-                let elfSymIdx = UInt32(rInfo >> 32)
+                let elfSymIdx = Int(rInfo >> 32)
                 let elfType = UInt32(rInfo & 0xFFFF_FFFF)
-                let mappedSym = elfSymToObjSym[elfSymIdx] ?? .nilId
+                guard elfSymIdx < elfSymToObjSym.count else {
+                    throw ELFReadError.corruptRelocationTable("section \(elfIdx) entry \(r): symbol index \(elfSymIdx) of \(elfSymToObjSym.count)")
+                }
+                guard rOffset < targetSize else {
+                    throw ELFReadError.corruptRelocationTable("section \(elfIdx) entry \(r): offset \(rOffset) beyond section size \(targetSize)")
+                }
                 let kind = RelocKind.fromELFType(elfType, arch: arch)
 
                 obj.addRelocation(
                     section: targetSec,
                     offset: rOffset,
-                    symbol: mappedSym,
+                    symbol: elfSymToObjSym[elfSymIdx],
                     kind: kind,
                     addend: rAddend
                 )
@@ -903,6 +929,13 @@ public struct ELFObjectReader: Sendable {
         }
 
         return obj
+    }
+
+    /// `offset..<offset+size` as a range of the file, or nil if it overflows or extends past the end.
+    private static func checkedRange(offset: UInt64, size: UInt64, fileSize: Int) -> Range<Int>? {
+        let (end, overflow) = offset.addingReportingOverflow(size)
+        guard !overflow, end <= UInt64(fileSize) else { return nil }
+        return Int(offset)..<Int(end)
     }
 
     // MARK: - Private Decoding Helpers
@@ -988,23 +1021,21 @@ public struct ELFObjectReader: Sendable {
         }
     }
 
-    private static func readNullTerminatedString(
-        _ bytes: UnsafeRawBufferPointer,
-        tableHeader: RawELFSectionHeader,
-        offset: UInt32
-    ) -> String {
-        guard UInt64(offset) < tableHeader.shSize else { return "" }
-        let start = Int(tableHeader.shOffset + UInt64(offset))
-        let maxEnd = Int(tableHeader.shOffset + tableHeader.shSize)
-        guard start >= 0 && start < maxEnd && maxEnd <= bytes.count else { return "" }
-
+    /// The NUL-terminated string at `offset` in the string table occupying `table` ("" for offset 0).
+    private static func readString(_ bytes: UnsafeRawBufferPointer, table: Range<Int>?, offset: UInt32, what: String) throws -> String {
+        guard offset != 0 else { return "" }
+        guard let table, UInt64(offset) < UInt64(table.count) else {
+            throw ELFReadError.corruptStringTable("\(what): offset \(offset) is outside the string table")
+        }
+        let start = table.lowerBound + Int(offset)
         var cur = start
-        while cur < maxEnd && bytes[cur] != 0 {
+        while cur < table.upperBound && bytes[cur] != 0 {
             cur += 1
         }
-        guard cur > start else { return "" }
-        let slice = UnsafeRawBufferPointer(rebasing: bytes[start..<cur])
-        return String(decoding: slice, as: UTF8.self)
+        guard cur < table.upperBound else {
+            throw ELFReadError.corruptStringTable("\(what): string at offset \(offset) is not NUL-terminated")
+        }
+        return String(decoding: UnsafeRawBufferPointer(rebasing: bytes[start..<cur]), as: UTF8.self)
     }
 
     @inline(__always)

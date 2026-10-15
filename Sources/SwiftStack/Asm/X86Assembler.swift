@@ -42,7 +42,7 @@ public enum X86Asm {
     internal static func parseInstruction(
         mnemonic rawMnemonic: String,
         args rawArgs: String,
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) {
@@ -86,13 +86,13 @@ public enum X86Asm {
                 case .symbolOffset(let sym, let addend, _):
                     session.currentSection.emitRelaxable(
                         .x86Branch(isConditional: false, condCode: 0, targetSymbol: sym, addend: addend),
-                        lineNumber: lineNumber
+                        loc: loc
                     )
                     return
                 case .constant(let relVal):
                     let inst = X86Instruction(mnemonic: "jmp", operands: [.relTarget(relVal)], codeMode: session.x86CodeMode)
                     if let enc = try? encoder.encode(inst) {
-                        session.currentSection.emitBytes(enc.bytes, lineNumber: lineNumber)
+                        session.currentSection.emitBytes(enc.bytes, loc: loc)
                         return
                     }
                 case .symbolDiff:
@@ -110,13 +110,13 @@ public enum X86Asm {
                 case .symbolOffset(let sym, let addend, _):
                     session.currentSection.emitRelaxable(
                         .x86Branch(isConditional: true, condCode: cc, targetSymbol: sym, addend: addend),
-                        lineNumber: lineNumber
+                        loc: loc
                     )
                     return
                 case .constant(let relVal):
                     let inst = X86Instruction(mnemonic: mnem, operands: [.relTarget(relVal)], codeMode: session.x86CodeMode)
                     if let enc = try? encoder.encode(inst) {
-                        session.currentSection.emitBytes(enc.bytes, lineNumber: lineNumber)
+                        session.currentSection.emitBytes(enc.bytes, loc: loc)
                         return
                     }
                 case .symbolDiff:
@@ -140,12 +140,12 @@ public enum X86Asm {
                         addend: addend - 4,
                         resolveIfSameSection: true
                     )
-                    session.currentSection.emitBytes([0xE8, 0, 0, 0, 0], fixups: [fixup], lineNumber: lineNumber)
+                    session.currentSection.emitBytes([0xE8, 0, 0, 0, 0], fixups: [fixup], loc: loc)
                     return
                 case .constant(let relVal):
                     let inst = X86Instruction(mnemonic: "call", operands: [.relTarget(relVal)], codeMode: session.x86CodeMode)
                     if let enc = try? encoder.encode(inst) {
-                        session.currentSection.emitBytes(enc.bytes, lineNumber: lineNumber)
+                        session.currentSection.emitBytes(enc.bytes, loc: loc)
                         return
                     }
                 case .symbolDiff:
@@ -170,8 +170,8 @@ public enum X86Asm {
             ) else {
                 diagnostics.report(
                     .asmInvalidInstruction,
-                    at: SourceLocation(rawValue: UInt32(max(1, lineNumber))),
-                    args: ["\(rawMnemonic) \(rawArgs)"]
+                    at: loc,
+                    args: ["\(rawMnemonic) \(rawArgs)".trimmingCharacters(in: .whitespaces)]
                 )
                 return
             }
@@ -237,12 +237,12 @@ public enum X86Asm {
                     )
                 }
             }
-            session.currentSection.emitBytes(encoded.bytes, fixups: fixups, lineNumber: lineNumber)
+            session.currentSection.emitBytes(encoded.bytes, fixups: fixups, loc: loc)
         } catch {
             diagnostics.report(
                 .asmInvalidInstruction,
-                at: SourceLocation(rawValue: UInt32(max(1, lineNumber))),
-                args: ["\(rawMnemonic) \(rawArgs)"]
+                at: loc,
+                args: ["\(rawMnemonic) \(rawArgs)".trimmingCharacters(in: .whitespaces)]
             )
         }
     }

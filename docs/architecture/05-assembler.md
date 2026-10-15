@@ -120,12 +120,12 @@ The assembler implements the GNU `as` subset used by the Todhchai corpus. The li
 | Data | `.byte`, `.short`/`.2byte`, `.long`/`.4byte`, `.quad`/`.8byte`, `.ascii`, `.asciz`/`.string`, `.zero`, `.space`, `.fill` |
 | Symbols | `.globl`/`.global`, `.local`, `.weak`, `.hidden`, `.type sym, @function/@object`, `.size`, `.set`/`.equ`, `=` |
 | Alignment | `.align` (target-specific meaning: bytes on x86, power of two on ARM and RISC-V, as in GNU `as`), `.balign`, `.p2align` |
-| Macros | `.macro name args` / `.endm`, default and `:req` arguments, `\arg` substitution, `\@` counter, `.exitm` |
+| Macros | `.macro name args` / `.endm`, default, `:req` and `:vararg` parameters, positional and `name=value` arguments, `\arg` substitution, `\()` separator, `\@` counter, `.exitm`, `.purgem` |
 | Repetition | `.rept n` / `.endr`, `.irp sym, values` / `.endr`, `.irpc` |
-| Conditionals | `.if expr`, `.ifdef`/`.ifndef`, `.ifc`/`.ifnc`, `.else`, `.elseif`, `.endif` |
+| Conditionals | `.if expr`, `.ifeq`/`.ifne`/`.ifge`/`.ifgt`/`.ifle`/`.iflt`, `.ifdef`/`.ifndef`, `.ifc`/`.ifnc`, `.ifeqs`/`.ifnes`, `.ifb`/`.ifnb`, `.else`, `.elseif`, `.endif` |
 | Inclusion | `.include "file"`, `.incbin "file"[, skip[, count]]` (shares the `BinaryAssetPool` with `#embed`) |
 | Labels | Named labels; numeric local labels `1:` with `1b` (nearest backward) and `1f` (nearest forward) |
-| CFI | `.cfi_startproc`/`.cfi_endproc`, `.cfi_def_cfa`, `.cfi_def_cfa_offset`, `.cfi_def_cfa_register`, `.cfi_offset`, `.cfi_rel_offset`, `.cfi_restore`, `.cfi_undefined`, `.cfi_remember_state`/`.cfi_restore_state`, `.cfi_adjust_cfa_offset`, `.cfi_signal_frame` |
+| CFI | `.cfi_startproc`/`.cfi_endproc`, `.cfi_def_cfa`, `.cfi_def_cfa_offset`, `.cfi_def_cfa_register`, `.cfi_offset`, `.cfi_rel_offset`, `.cfi_restore`, `.cfi_undefined`, `.cfi_remember_state`/`.cfi_restore_state`, `.cfi_adjust_cfa_offset`, `.cfi_signal_frame`, `.cfi_val_offset`, `.cfi_same_value`, `.cfi_register`, `.cfi_return_column`, `.cfi_escape`, `.cfi_window_save`/`.cfi_negate_ra_state`, `.cfi_sections`; `.cfi_personality`/`.cfi_lsda` only with encoding `0xff` (omit) |
 | Misc | `.file`, `.loc` (line info), `.ident` (ignored), `.option` (RISC-V; §4.8) |
 
 **`.S` preprocessing.** `.S` files go through the C23 preprocessor ([01](01-frontend.md)) in *assembler-with-cpp* mode:
@@ -134,9 +134,11 @@ The assembler implements the GNU `as` subset used by the Todhchai corpus. The li
 - Unbalanced `'` and `"` characters do not cause errors.
 - Token pasting and stringizing behave as in C.
 
-Each output line keeps its expansion location, so diagnostics point at both the macro use and the source line.
+The preprocessor output carries GNU line markers (`# <line> "<file>"`) and keeps each line's original column, and the assembler honours them (and `#line`). Every statement therefore keeps a `file:line:col` location, through `#include`d headers, `.include`, `.rept`/`.irp` and macro expansion; an error inside a macro body also gets a note at each enclosing macro use. Macro expansion is bounded at 100 levels, as in GNU `as`.
 
-**Expressions.** Integer expressions use GNU operator precedence, symbol arithmetic, and `.` (current location). Each value is one of: an absolute constant; a section-relative value (`sym + c`); a difference of symbols in the same section, resolved after layout; or an external symbol plus addend, which becomes a relocation.
+**Macro arguments** are split as GNU `as` splits them: a comma separates arguments, and so does a blank between two complete terms (`m 4 -5` passes `4` and `-5`), but a blank next to a binary operator does not (`m 1 + 2` passes `1 + 2`). A `:vararg` parameter receives the rest of the line verbatim. LLVM MC differs on blank separation; Swift-Stack follows GNU `as`.
+
+**Expressions.** Integer expressions use GNU `as` operator precedence, which is not C's. From tightest to loosest: unary `- ~ ! +`; `* / % << >>`; `| & ^ !` (binary `!` is or-not); `+ -`; comparisons `== != <> < > <= >=` (true is -1); `&&`; `||`. Operators of one level associate left to right, `>>` is a logical shift, and arithmetic wraps at 64 bits. Expressions also support symbol arithmetic and `.` (current location). `.equ`/`.set`/`=` may name a label difference, including forward references; it resolves to an absolute constant after layout, usable in immediates, data, `.size` and other `.equ`s. Each value is one of: an absolute constant; a section-relative value (`sym + c`); a difference of symbols in the same section, resolved after layout; or an external symbol plus addend, which becomes a relocation.
 
 ### 4.5 Layout and relaxation
 
@@ -217,7 +219,7 @@ Branches to symbols that are undefined, external, or in another section are enco
 
 CFI directives in hand-written assembly serve two purposes, reconciling the unwind policy in [04 §4.11](04-backend.md) and [07](07-debugging-and-sdi.md):
 
-1. **`.eh_frame` generation.** Each `.cfi_startproc`…`.cfi_endproc` region produces one FDE (and a CIE, shared where identical). This is the canonical unwind info on Linux and FreeBSD, and the fallback on Todhchai and macOS.
+1. **`.eh_frame` generation.** Each `.cfi_startproc`…`.cfi_endproc` region produces one FDE (and a CIE, shared where identical). Each CFA instruction follows a `DW_CFA_advance_loc`, `advance_loc1`, `advance_loc2` or `advance_loc4` from the previous one's address, chosen after layout so relaxed branches are accounted for; the bytes and `pc_begin` relocations match GNU `as`. This is the canonical unwind info on Linux and FreeBSD, and the fallback on Todhchai and macOS.
 2. **CUD synthesis.** The assembler interprets each region's CFI program symbolically. If the final state at every instruction past the prologue matches a CUD-describable layout (frame pointer established, fixed frame size, callee-saved registers at fixed offsets), it emits a CUD record and, on Todhchai, drops the FDE. Otherwise the function is marked *CUD-inexpressible* and keeps its FDE. A note-level diagnostic lists such functions.
 
 Functions with no CFI region (common in entry stubs and context switches) get no unwind info. Unwinders stop at them.
@@ -243,6 +245,7 @@ Functions with no CFI region (common in entry stubs and context switches) get no
   1. `.text` alignment is 4 (GNU: 1).
   2. Multi-byte NOP padding uses a single 6-byte `nopw` where GNU emits `nop` + 5-byte `nopl`.
   3. A memory displacement given by a label difference that is unknown when the instruction is parsed (`lea T_OFF(sym)(%rsi)` with `T_OFF(x) = x - base`) is encoded as `disp32`. GNU `as` later relaxes it to `disp8`, which changes the containing section's size.
+- **Where GNU `as` and LLVM MC disagree, Swift-Stack follows GNU `as`:** `.eh_frame` FDEs are in source order (LLVM MC groups them by CIE), and blank-separated macro arguments are split as in §4.4. The in-repo corpus avoids these cases so that the clang comparison stays exact, and regression tests pin the GNU behavior.
 - **Encoder oracle:** every `Encode` table sample is also checked against `llvm-mc`. `llvm-mc` assembles the disassembler's text, and the bytes must match or decode to the same instruction. This catches encoder/disassembler pairs that agree on a wrong encoding, which a self round trip cannot.
 - **Corpus:** Todhchai `system/sys/floor/start.S`, context-switch and trap sources for all three architectures, plus synthetic tests for every directive in §4.4. Regressions live in `Tests/Differential/asm/<arch>/`.
 

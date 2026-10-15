@@ -35,7 +35,7 @@ All three target architectures use a single static instruction descriptor table 
   - Closed `ObjectArch` (`x86_64`, `aarch64`, `riscv64`) and `ObjectFormat` (`elf64`) enums.
 - **`ELFObjectIO.swift`**:
   - `ELFObjectWriter`: Deterministic (`D6`) ELF64 `ET_REL` serializer with canonical section ordering, local-before-global `SHT_SYMTAB` partitioning (`sh_info` = first global index), per-code-section `.rela<sec>` tables, and architecture `e_flags` (`EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE` on RV64).
-  - `ELFObjectReader`: Full ELF64 `ET_REL` parser reconstructing `RelocatableObject` sections, symbols, and `.rela` relocations for round-trip verification and upcoming M3 linker input.
+  - `ELFObjectReader`: Full ELF64 `ET_REL` parser reconstructing `RelocatableObject` sections, symbols, and `.rela` relocations for round-trip verification and upcoming M3 linker input. Input is untrusted: every offset, size, index, `sh_link`/`sh_info` and string reference is validated with overflow-checked arithmetic, and malformed input throws an `ELFReadError` instead of trapping.
 
 ### 1.3 Multi-Architecture Assemblers & `.S` Preprocessing (`Sources/SwiftStack/Asm/`)
 
@@ -44,7 +44,7 @@ All three target architectures use a single static instruction descriptor table 
   - Preserves `#` immediate prefixes on AArch64 (`#0x10`) inside macro bodies rather than treating them as C stringification operators when not followed by a macro parameter name.
 - **`Assembler.swift`**:
   - Shared directive engine (`.section`, `.text`, `.data`, `.rodata`, `.bss`, `.pushsection`, `.popsection`, `.globl`/`.global`, `.weak`, `.local`, `.hidden`, `.type`, `.size`, `.equ`/`.set`, `.byte`, `.short`/`.hword`/`.2byte`, `.word`/`.long`/`.4byte`, `.quad`/`.dword`/`.8byte`, `.asciz`/`.string`, `.ascii`, `.space`/`.skip`/`.zero`, `.align`/`.balign`/`.p2align`, `.cfi_*`, `.option`, `.arch`, `.code16`/`.code32`/`.code64`).
-  - Macro & repetition preprocessor (`.macro`/`.endm` with `\@` unique invocation counters and default arguments, `.rept`/`.endr`, `.irp`/`.endr`, `.if`/`.ifdef`/`.ifndef`/`.ifeq`/`.ifne`/`.else`/`.elseif`/`.endif`) and directional numeric local labels (`1:` with `1b` / `1f` resolution).
+  - Macro & repetition preprocessor (`.macro`/`.endm` with `\@` unique invocation counters, default/`:req`/`:vararg` parameters and `\()`, `.rept`/`.endr`, `.irp`/`.endr`, `.if`/`.ifdef`/`.ifndef`/`.ifeq`/`.ifne`/`.else`/`.elseif`/`.endif`) and directional numeric local labels (`1:` with `1b` / `1f` resolution).
   - Multi-pass branch relaxation engine with architecture-specific `NOP` alignment padding (multi-byte `NOP`s on x86-64, `0xD503201F` on AArch64, `0x00000013` / `0x0001` on RV64).
 - **Architecture Frontends**:
   - `X86Assembler.swift` (`X86Asm`): AT&T syntax, `%seg:disp(base, index, scale)` parsing, `@PLT` / `@GOTPCREL` / `@TPOFF` modifiers, `.code16`/`.code32`/`.code64` state switching, and x86-64 `JMP`/`Jcc` `rel8` <-> `rel32` relaxation.
@@ -64,7 +64,7 @@ Per [09-roadmap.md](../09-roadmap.md) (§M2) and [05-assembler.md](../05-assembl
    - **GNU `as` differences:** the x86-64 differences are the three documented in 05 §4.11 (alignment, NOP padding, `disp32` for a late-resolved label difference). Each is exempted only for the affected section, and the clang comparison still covers it exactly.
    - A missing corpus or oracle skips the test rather than passing it.
 2. **Encoder/disassembler round trip.** `verifyRoundTrip()` round-trips one sample per descriptor; it is not yet exhaustive over operand forms. `M2EncoderOracleTests.swift` checks every sample against `llvm-mc`, which catches encoder/disassembler pairs that agree on a wrong encoding (it found the 16-bit `tzcnt`/`lzcnt`/`popcnt` prefix bug).
-3. **Behavior without an oracle.** `M2AssemblerRegressionTests.swift` covers out-of-range AArch64/RV64 branch relaxation (clang reports these as errors instead of relaxing), rejected encodings being diagnosed rather than dropped, and `ldr Xt, #imm`.
+3. **Behavior without an oracle.** `M2AssemblerRegressionTests.swift` covers out-of-range AArch64/RV64 branch relaxation (clang reports these as errors instead of relaxing), rejected encodings being diagnosed rather than dropped, `ldr Xt, #imm`, rendered diagnostic locations (`file:line:col` through `.include`, macros, `.rept` and `.S` preprocessing), and an ELF reader fuzz test (every truncation plus 12,000 seeded mutations of valid objects must throw, never crash). It also pins GNU `as` output for CFI, `.equ` label differences, expression precedence and macro arguments, so these hold where no oracle is installed.
 
 ### Defects fixed after the initial M2 report
 - **`.long sym - .`:** produced an absolute relocation. It now uses `R_X86_64_PC32`/`PC64`, `R_AARCH64_PREL32`/`PREL64`, or an `R_RISCV_ADD`/`SUB` pair.
@@ -74,3 +74,11 @@ Per [09-roadmap.md](../09-roadmap.md) (§M2) and [05-assembler.md](../05-assembl
 - **AArch64 encoder rejections:** an instruction the encoder rejected was silently dropped. The encoder now range-checks PC-relative fields.
 - **`.S` target macros:** AArch64/RV64 `.S` files also saw `__x86_64__`.
 - **RISC-V external `j`:** a compressed jump to an external symbol was laid out at 2 bytes but emitted at 4.
+- **`.eh_frame`:** CFA instructions had no `DW_CFA_advance_loc*`, so every rule applied from the function start. Records now match GNU `as` byte for byte (advance_loc/1/2/4, shared CIEs, multiple FDEs, padding), and more `.cfi_*` directives are supported (05 §4.4).
+- **`.equ`/`.set` of a label difference:** did not resolve to a constant when it named labels, especially forward ones. It now resolves after layout, in immediates, data and `.size`.
+- **Expression precedence:** followed C. It now follows GNU `as` (05 §4.4), including -1 for true comparisons and binary `!`.
+- **Macros:** `:vararg` parameters, `\()` concatenation and GNU argument splitting were missing or wrong; unbounded recursion overflowed the stack.
+- **Diagnostic locations:** assembler errors reported a bare line number, with no file, and the wrong line after `.include`, macro expansion and `.S` preprocessing. They now carry `file:line:col`, with notes at macro uses.
+- **ELF reader:** truncated or corrupted objects (bad offsets, sizes, `sh_link`/`sh_info`, string offsets, symbol/relocation indices) could trap.
+- **RVC:** `addi sp, sp, -16` used `c.addi16sp`; GNU `as` and LLVM MC use `c.addi` when the immediate fits.
+- **Diagnostic rendering** trapped on an empty `DiagnosticBag`.

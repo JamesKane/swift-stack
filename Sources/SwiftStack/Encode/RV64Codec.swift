@@ -1693,6 +1693,11 @@ public enum RV64Encoder {
             if rs1 == .zero && rd != .zero && imm >= -32 && imm <= 31 {
                 return RV64Instruction(opcode: .c_li, rd: rd.rawValue, imm: imm)
             }
+            // c.addi: addi rd, rd, nzimm (rd != x0, imm in -32..31, imm != 0). Checked before c.addi16sp, so
+            // `addi sp, sp, -16` is `c.addi` as in GNU `as` and LLVM MC.
+            if rd == rs1 && rd != .zero && imm != 0 && imm >= -32 && imm <= 31 {
+                return RV64Instruction(opcode: .c_addi, rd: rd.rawValue, rs1: rd.rawValue, imm: imm)
+            }
             // c.addi16sp: addi sp, sp, nzimm (imm in -512..496, multiple of 16, imm != 0)
             if rd == .sp && rs1 == .sp && imm != 0 && imm >= -512 && imm <= 496 && (imm & 0xF) == 0 {
                 return RV64Instruction(opcode: .c_addi16sp, rd: RVGPR.sp.rawValue, rs1: RVGPR.sp.rawValue, imm: imm)
@@ -1700,10 +1705,6 @@ public enum RV64Encoder {
             // c.addi4spn: addi rd', sp, nzuimm (rd in x8..x15, imm in 4..1020, multiple of 4)
             if rs1 == .sp && rd.isCompressedReg && imm >= 4 && imm <= 1020 && (imm & 0x3) == 0 {
                 return RV64Instruction(opcode: .c_addi4spn, rd: rd.rawValue, rs1: RVGPR.sp.rawValue, imm: imm)
-            }
-            // c.addi: addi rd, rd, nzimm (rd != x0, imm in -32..31, imm != 0)
-            if rd == rs1 && rd != .zero && imm != 0 && imm >= -32 && imm <= 31 {
-                return RV64Instruction(opcode: .c_addi, rd: rd.rawValue, rs1: rd.rawValue, imm: imm)
             }
             return nil
 

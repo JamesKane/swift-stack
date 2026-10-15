@@ -15,7 +15,7 @@ internal enum A64Asm {
     static func parseInstruction(
         mnemonic rawMnemonic: String,
         args: String,
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) {
@@ -26,56 +26,56 @@ internal enum A64Asm {
         // 1. Zero-operand fixed system instructions & barriers
         switch mnem {
         case "nop":
-            emitInst(A64Instruction(opcode: .nop), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .nop), into: sec, loc: loc)
             return
         case "ret":
             if ops.isEmpty {
-                emitInst(A64Instruction(opcode: .ret, rn: .lr), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .ret, rn: .lr), into: sec, loc: loc)
             } else if let (rn, _, _) = A64GPR.parse(ops[0]) {
-                emitInst(A64Instruction(opcode: .ret, rn: rn), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .ret, rn: rn), into: sec, loc: loc)
             }
             return
         case "eret":
-            emitInst(A64Instruction(opcode: .eret), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .eret), into: sec, loc: loc)
             return
         case "yield":
-            emitInst(A64Instruction(opcode: .yield), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .yield), into: sec, loc: loc)
             return
         case "wfe":
-            emitInst(A64Instruction(opcode: .wfe), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .wfe), into: sec, loc: loc)
             return
         case "wfi":
-            emitInst(A64Instruction(opcode: .wfi), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .wfi), into: sec, loc: loc)
             return
         case "sev":
-            emitInst(A64Instruction(opcode: .sev), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .sev), into: sec, loc: loc)
             return
         case "sevl":
-            emitInst(A64Instruction(opcode: .sevl), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .sevl), into: sec, loc: loc)
             return
         case "clrex":
-            emitInst(A64Instruction(opcode: .clrex), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .clrex), into: sec, loc: loc)
             return
         case "isb":
             let opt = ops.first.flatMap { A64BarrierOption.parse(Substring($0)) } ?? .sy
-            emitInst(A64Instruction(opcode: .isb, barrierOption: opt), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .isb, barrierOption: opt), into: sec, loc: loc)
             return
         case "dsb", "dmb":
             let op: A64OpcodeId = (mnem == "dsb") ? .dsb : .dmb
             let opt = ops.first.flatMap { A64BarrierOption.parse(Substring($0)) } ?? .sy
-            emitInst(A64Instruction(opcode: op, barrierOption: opt), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, barrierOption: opt), into: sec, loc: loc)
             return
         case "pacia1716":
-            emitInst(A64Instruction(opcode: .hint, imm: 8), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .hint, imm: 8), into: sec, loc: loc)
             return
         case "paciasp":
-            emitInst(A64Instruction(opcode: .hint, imm: 25), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .hint, imm: 25), into: sec, loc: loc)
             return
         case "autiasp":
-            emitInst(A64Instruction(opcode: .hint, imm: 29), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .hint, imm: 29), into: sec, loc: loc)
             return
         case "xpaclri":
-            emitInst(A64Instruction(opcode: .hint, imm: 7), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .hint, imm: 7), into: sec, loc: loc)
             return
         case "bti":
             let target = ops.first?.lowercased() ?? ""
@@ -86,11 +86,11 @@ internal enum A64Asm {
             case "jc": imm7 = 38
             default:   imm7 = 32
             }
-            emitInst(A64Instruction(opcode: .hint, imm: imm7), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .hint, imm: imm7), into: sec, loc: loc)
             return
         case "hint":
             let immVal = parseImmediateValue(ops.first ?? "0", session: session) ?? 0
-            emitInst(A64Instruction(opcode: .hint, imm: immVal), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .hint, imm: immVal), into: sec, loc: loc)
             return
         case "svc", "hvc", "smc", "brk", "hlt", "udf":
             let immVal = parseImmediateValue(ops.first ?? "0", session: session) ?? 0
@@ -103,7 +103,7 @@ internal enum A64Asm {
             case "hlt": op = .hlt
             default:    op = .udf
             }
-            emitInst(A64Instruction(opcode: op, imm: immVal), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, imm: immVal), into: sec, loc: loc)
             return
         default:
             break
@@ -113,11 +113,11 @@ internal enum A64Asm {
         if mnem == "tlbi" || mnem == "ic" || mnem == "dc" {
             guard let opName = ops.first,
                   let maintOp = A64SysMaintOp.allCases.first(where: { $0.operandName == opName.lowercased() }) else {
-                diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [rawMnemonic])
+                diagnostics.report(.asmInvalidInstruction, at: loc, args: [rawMnemonic])
                 return
             }
             let rt: A64GPR = (ops.count >= 2) ? (A64GPR.parse(ops[1])?.reg ?? .xzr) : .xzr
-            emitInst(A64Instruction(opcode: .sysMaint, rd: rt, sysMaintOp: maintOp), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .sysMaint, rd: rt, sysMaintOp: maintOp), into: sec, loc: loc)
             return
         }
 
@@ -125,19 +125,19 @@ internal enum A64Asm {
         if mnem == "mrs" && ops.count == 2 {
             if let (rd, _, _) = A64GPR.parse(ops[0]),
                let sysReg = A64SysReg.parse(ops[1]) {
-                emitInst(A64Instruction(opcode: .mrs, rd: rd, sysReg: sysReg), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .mrs, rd: rd, sysReg: sysReg), into: sec, loc: loc)
                 return
             }
         }
         if mnem == "msr" && ops.count == 2 {
             if let pfield = A64PStateField.parse(Substring(ops[0])) {
                 let immVal = parseImmediateValue(ops[1], session: session) ?? 0
-                emitInst(A64Instruction(opcode: .msrPState, imm: immVal, pstateField: pfield), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .msrPState, imm: immVal, pstateField: pfield), into: sec, loc: loc)
                 return
             }
             if let sysReg = A64SysReg.parse(ops[0]),
                let (rt, _, _) = A64GPR.parse(ops[1]) {
-                emitInst(A64Instruction(opcode: .msrReg, rd: rt, sysReg: sysReg), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .msrReg, rd: rt, sysReg: sysReg), into: sec, loc: loc)
                 return
             }
         }
@@ -145,31 +145,31 @@ internal enum A64Asm {
         // 4. Branches (`b`, `bl`, `b.cond`, `b<cond>`, `br`, `blr`, `cbz`, `cbnz`, `tbz`, `tbnz`)
         if mnem == "b" || mnem == "bl" {
             guard let targetStr = ops.first else { return }
-            emitBranchTarget(baseInst: A64Instruction(opcode: mnem == "bl" ? .bl : .b), targetExpr: targetStr, session: session, lineNumber: lineNumber)
+            emitBranchTarget(baseInst: A64Instruction(opcode: mnem == "bl" ? .bl : .b), targetExpr: targetStr, session: session, loc: loc)
             return
         }
         if mnem.hasPrefix("b.") {
             let condStr = String(mnem.dropFirst(2))
             if let cond = A64Cond.parse(condStr), let targetStr = ops.first {
-                emitBranchTarget(baseInst: A64Instruction(opcode: .bCond, cond: cond), targetExpr: targetStr, session: session, lineNumber: lineNumber)
+                emitBranchTarget(baseInst: A64Instruction(opcode: .bCond, cond: cond), targetExpr: targetStr, session: session, loc: loc)
                 return
             }
         }
         if mnem.count == 3 && mnem.hasPrefix("b") && mnem != "bic" && mnem != "bfi" && mnem != "bfm" && mnem != "brk" && mnem != "bti" && mnem != "blr" {
             let condStr = String(mnem.dropFirst(1))
             if let cond = A64Cond.parse(condStr), let targetStr = ops.first {
-                emitBranchTarget(baseInst: A64Instruction(opcode: .bCond, cond: cond), targetExpr: targetStr, session: session, lineNumber: lineNumber)
+                emitBranchTarget(baseInst: A64Instruction(opcode: .bCond, cond: cond), targetExpr: targetStr, session: session, loc: loc)
                 return
             }
         }
         if (mnem == "br" || mnem == "blr"), let firstOp = ops.first, let (rn, _, _) = A64GPR.parse(firstOp) {
-            emitInst(A64Instruction(opcode: mnem == "br" ? .br : .blr, rn: rn), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: mnem == "br" ? .br : .blr, rn: rn), into: sec, loc: loc)
             return
         }
         if (mnem == "cbz" || mnem == "cbnz") && ops.count == 2 {
             if let (rt, is64, _) = A64GPR.parse(ops[0]) {
                 let base = A64Instruction(opcode: mnem == "cbz" ? .cbz : .cbnz, is64Bit: is64, rd: rt)
-                emitBranchTarget(baseInst: base, targetExpr: ops[1], session: session, lineNumber: lineNumber)
+                emitBranchTarget(baseInst: base, targetExpr: ops[1], session: session, loc: loc)
                 return
             }
         }
@@ -177,7 +177,7 @@ internal enum A64Asm {
             if let (rt, is64, _) = A64GPR.parse(ops[0]) {
                 let bit = UInt8(truncatingIfNeeded: parseImmediateValue(ops[1], session: session) ?? 0)
                 let base = A64Instruction(opcode: mnem == "tbz" ? .tbz : .tbnz, is64Bit: is64 || bit >= 32, rd: rt, amount: bit)
-                emitBranchTarget(baseInst: base, targetExpr: ops[2], session: session, lineNumber: lineNumber)
+                emitBranchTarget(baseInst: base, targetExpr: ops[2], session: session, loc: loc)
                 return
             }
         }
@@ -194,7 +194,7 @@ internal enum A64Asm {
                     var instWithImm = base
                     instWithImm.imm = v
                     if let immBytes = A64Encoder.encodeBytes(instWithImm) {
-                        sec.emitBytes(immBytes, lineNumber: lineNumber)
+                        sec.emitBytes(immBytes, loc: loc)
                     }
                 case .symbolOffset(let sym, let addend, let mod):
                     let rKind: RelocKind
@@ -213,9 +213,9 @@ internal enum A64Asm {
                         width: 4,
                         resolveIfSameSection: !isPage && mod == .none
                     )
-                    sec.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                    sec.emitBytes(bytes, fixups: [fixup], loc: loc)
                 default:
-                    sec.emitBytes(bytes, lineNumber: lineNumber)
+                    sec.emitBytes(bytes, loc: loc)
                 }
                 return
             }
@@ -226,7 +226,7 @@ internal enum A64Asm {
             if let (rd, _, _) = A64GPR.parse(ops[0]),
                let (rn, _, _) = A64GPR.parse(ops[1]) {
                 let imm = parseImmediateValue(ops[2], session: session) ?? 0
-                emitInst(A64Instruction(opcode: mnem == "addvl" ? .sveAddvl : .sveAddpl, rd: rd, rn: rn, imm: imm), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: mnem == "addvl" ? .sveAddvl : .sveAddpl, rd: rd, rn: rn, imm: imm), into: sec, loc: loc)
                 return
             }
         }
@@ -240,13 +240,13 @@ internal enum A64Asm {
                     UInt8(truncatingIfNeeded: word >> 8),
                     UInt8(truncatingIfNeeded: word >> 16),
                     UInt8(truncatingIfNeeded: word >> 24),
-                ], lineNumber: lineNumber)
+                ], loc: loc)
                 return
             }
         }
         if (mnem == "rdffr" || mnem == "wrffr") && ops.count == 1 {
             if let pd = A64PReg.parse(Substring(ops[0])) {
-                emitInst(A64Instruction(opcode: mnem == "rdffr" ? .sveRdffr : .sveWrffr, pd: pd), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: mnem == "rdffr" ? .sveRdffr : .sveWrffr, pd: pd), into: sec, loc: loc)
                 return
             }
         }
@@ -254,7 +254,7 @@ internal enum A64Asm {
         // 7. Loads and Stores (`ldr`, `str`, `ldrb`, `strb`, `ldrh`, `strh`, `ldrsb`, `ldrsh`, `ldrsw`,
         //    `ldur`, `stur`, `ldtr`, `sttr`, `ldp`, `stp`, `ldxr`, `stxr`, `ldaxr`, `stlxr`, `ldar`, `stlr`)
         if isLoadStoreMnemonic(mnem) {
-            parseLoadStore(mnemonic: mnem, ops: ops, lineNumber: lineNumber, session: session, diagnostics: &diagnostics)
+            parseLoadStore(mnemonic: mnem, ops: ops, loc: loc, session: session, diagnostics: &diagnostics)
             return
         }
 
@@ -272,12 +272,12 @@ internal enum A64Asm {
                 let exprVal = evalExpr(ops[1], session: session)
                 switch exprVal {
                 case .constant(let imm):
-                    emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, amount: shiftAmt, imm: imm & 0xFFFF), into: sec, lineNumber: lineNumber)
+                    emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, amount: shiftAmt, imm: imm & 0xFFFF), into: sec, loc: loc)
                 case .symbolOffset(let sym, let addend, let mod):
                     let base = A64Instruction(opcode: op, is64Bit: is64, rd: rd, amount: shiftAmt, imm: 0)
                     if let bytes = A64Encoder.encodeBytes(base) {
                         let rKind: RelocKind = (mod == .a64TprelHi12) ? .aarch64_tlsle_add_tprel_hi12 : .aarch64_tlsle_add_tprel_lo12_nc
-                        sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: sym, addend: addend)], lineNumber: lineNumber)
+                        sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: sym, addend: addend)], loc: loc)
                     }
                 default:
                     break
@@ -288,14 +288,14 @@ internal enum A64Asm {
         if mnem == "mov" && ops.count == 2 {
             if let (rd, is64, rdIsSP) = A64GPR.parse(ops[0]) {
                 if let (rn, _, rnIsSP) = A64GPR.parse(ops[1]) {
-                    emitInst(.movReg(is64Bit: is64, rd: rd, rn: rn, involvesSP: rdIsSP || rnIsSP), into: sec, lineNumber: lineNumber)
+                    emitInst(.movReg(is64Bit: is64, rd: rd, rn: rn, involvesSP: rdIsSP || rnIsSP), into: sec, loc: loc)
                     return
                 }
                 if let exprVal = evalExpr(ops[1], session: session) {
                     switch exprVal {
                     case .constant(let imm):
                         if let movInst = encodeMovImmediate(rd: rd, is64Bit: is64, imm: imm) {
-                            emitInst(movInst, into: sec, lineNumber: lineNumber)
+                            emitInst(movInst, into: sec, loc: loc)
                             return
                         }
                     case .symbolDiff(let plusSym, let minusSym, let addend):
@@ -309,7 +309,7 @@ internal enum A64Asm {
                                 addend: addend,
                                 width: 4
                             )
-                            sec.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                            sec.emitBytes(bytes, fixups: [fixup], loc: loc)
                             return
                         }
                     default:
@@ -322,7 +322,7 @@ internal enum A64Asm {
             if let (rd, is64, _) = A64GPR.parse(ops[0]),
                let (rm, _, _) = A64GPR.parse(ops[1]) {
                 let (shift, amt) = parseOptionalShift(ops, startIndex: 2, session: session)
-                emitInst(.mvn(is64Bit: is64, rd: rd, rm: rm, shift: shift, amount: amt), into: sec, lineNumber: lineNumber)
+                emitInst(.mvn(is64Bit: is64, rd: rd, rm: rm, shift: shift, amount: amt), into: sec, loc: loc)
                 return
             }
         }
@@ -345,7 +345,7 @@ internal enum A64Asm {
                                 amount: amt
                             ),
                             into: sec,
-                            lineNumber: lineNumber
+                            loc: loc
                         )
                     } else {
                         let (shift, amt) = parseOptionalShift(ops, startIndex: 2, session: session)
@@ -354,7 +354,7 @@ internal enum A64Asm {
                                 ? .cmpShifted(is64Bit: is64, rn: rn, rm: rm, shift: shift, amount: amt)
                                 : .cmnShifted(is64Bit: is64, rn: rn, rm: rm, shift: shift, amount: amt),
                             into: sec,
-                            lineNumber: lineNumber
+                            loc: loc
                         )
                     }
                     return
@@ -367,7 +367,7 @@ internal enum A64Asm {
                             ? .cmpImm(is64Bit: is64, rn: rn, imm12: UInt16(truncatingIfNeeded: imm), lsl12: lsl12)
                             : .cmnImm(is64Bit: is64, rn: rn, imm12: UInt16(truncatingIfNeeded: imm), lsl12: lsl12),
                         into: sec,
-                        lineNumber: lineNumber
+                        loc: loc
                     )
                     return
                 }
@@ -377,11 +377,11 @@ internal enum A64Asm {
             if let (rn, is64, _) = A64GPR.parse(ops[0]) {
                 if let (rm, _, _) = A64GPR.parse(ops[1]) {
                     let (shift, amt) = parseOptionalShift(ops, startIndex: 2, session: session)
-                    emitInst(.tstShifted(is64Bit: is64, rn: rn, rm: rm, shift: shift, amount: amt), into: sec, lineNumber: lineNumber)
+                    emitInst(.tstShifted(is64Bit: is64, rn: rn, rm: rm, shift: shift, amount: amt), into: sec, loc: loc)
                     return
                 }
                 if let imm = parseImmediateValue(ops[1], session: session) {
-                    emitInst(.tstImm(is64Bit: is64, rn: rn, bitmask: UInt64(bitPattern: imm)), into: sec, lineNumber: lineNumber)
+                    emitInst(.tstImm(is64Bit: is64, rn: rn, bitmask: UInt64(bitPattern: imm)), into: sec, loc: loc)
                     return
                 }
             }
@@ -395,7 +395,7 @@ internal enum A64Asm {
                         ? .neg(is64Bit: is64, rd: rd, rm: rm, shift: shift, amount: amt)
                         : .negs(is64Bit: is64, rd: rd, rm: rm, shift: shift, amount: amt),
                     into: sec,
-                    lineNumber: lineNumber
+                    loc: loc
                 )
                 return
             }
@@ -403,34 +403,34 @@ internal enum A64Asm {
 
         // 10. Arithmetic & Logical (`add`, `adds`, `sub`, `subs`, `and`, `ands`, `orr`, `orn`, `eor`, `eon`, `bic`, `bics`)
         if mnem == "add" || mnem == "adds" || mnem == "sub" || mnem == "subs" {
-            if parseAddSub(mnemonic: mnem, ops: ops, lineNumber: lineNumber, session: session) {
+            if parseAddSub(mnemonic: mnem, ops: ops, loc: loc, session: session) {
                 return
             }
         }
         if mnem == "and" || mnem == "ands" || mnem == "orr" || mnem == "orn" || mnem == "eor" || mnem == "eon" || mnem == "bic" || mnem == "bics" {
-            if parseLogical(mnemonic: mnem, ops: ops, lineNumber: lineNumber, session: session) {
+            if parseLogical(mnemonic: mnem, ops: ops, loc: loc, session: session) {
                 return
             }
         }
 
         // 11. Shifts, Bitfields, Multiply/Divide, Conditional Select
-        if parseBitfieldOrShiftOrMulOrCond(mnemonic: mnem, ops: ops, lineNumber: lineNumber, session: session) {
+        if parseBitfieldOrShiftOrMulOrCond(mnemonic: mnem, ops: ops, loc: loc, session: session) {
             return
         }
 
         // 12. Scalar FP and Advanced SIMD (NEON)
-        if parseFpOrSimd(mnemonic: mnem, ops: ops, lineNumber: lineNumber, session: session) {
+        if parseFpOrSimd(mnemonic: mnem, ops: ops, loc: loc, session: session) {
             return
         }
 
-        diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [rawMnemonic])
+        diagnostics.report(.asmInvalidInstruction, at: loc, args: [rawMnemonic])
     }
 
     // MARK: - Helpers
 
-    private static func emitInst(_ inst: A64Instruction, into sec: AsmSectionBuilder, lineNumber: Int) {
+    private static func emitInst(_ inst: A64Instruction, into sec: AsmSectionBuilder, loc: AsmLoc) {
         if let bytes = A64Encoder.encodeBytes(inst) {
-            sec.emitBytes(bytes, lineNumber: lineNumber)
+            sec.emitBytes(bytes, loc: loc)
         }
     }
 
@@ -451,7 +451,7 @@ internal enum A64Asm {
         baseInst: A64Instruction,
         targetExpr: String,
         session: AsmSession,
-        lineNumber: Int
+        loc: AsmLoc
     ) {
         let sec = session.currentSection
         if let val = evalExpr(targetExpr, session: session) {
@@ -459,14 +459,14 @@ internal enum A64Asm {
             case .constant(let c):
                 var inst = baseInst
                 inst.imm = c
-                emitInst(inst, into: sec, lineNumber: lineNumber)
+                emitInst(inst, into: sec, loc: loc)
             case .symbolOffset(let sym, let addend, _):
                 if sym == "." {
                     var inst = baseInst
                     inst.imm = addend
-                    emitInst(inst, into: sec, lineNumber: lineNumber)
+                    emitInst(inst, into: sec, loc: loc)
                 } else {
-                    sec.emitRelaxable(.a64Branch(baseInst: baseInst, targetSymbol: sym, addend: addend), lineNumber: lineNumber)
+                    sec.emitRelaxable(.a64Branch(baseInst: baseInst, targetSymbol: sym, addend: addend), loc: loc)
                 }
             default:
                 break
@@ -540,7 +540,7 @@ internal enum A64Asm {
     private static func parseAddSub(
         mnemonic: String,
         ops: [String],
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession
     ) -> Bool {
         guard ops.count >= 3,
@@ -565,7 +565,7 @@ internal enum A64Asm {
                 case "sub":  op = .subExtended
                 default:     op = .subsExtended
                 }
-                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, extendKind: ext, amount: amt), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, extendKind: ext, amount: amt), into: sec, loc: loc)
             } else {
                 let (shift, amt) = parseOptionalShift(ops, startIndex: 3, session: session)
                 let op: A64OpcodeId
@@ -575,7 +575,7 @@ internal enum A64Asm {
                 case "sub":  op = .subShifted
                 default:     op = .subsShifted
                 }
-                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, shiftKind: shift, amount: amt), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, shiftKind: shift, amount: amt), into: sec, loc: loc)
             }
             return true
         }
@@ -601,11 +601,11 @@ internal enum A64Asm {
                 case .subImm:  flippedOp = .addImm
                 default:       flippedOp = .addsImm
                 }
-                emitInst(A64Instruction(opcode: flippedOp, is64Bit: is64, rd: rd, rn: rn, amount: shiftAmt, imm: -imm), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: flippedOp, is64Bit: is64, rd: rd, rn: rn, amount: shiftAmt, imm: -imm), into: sec, loc: loc)
             } else if imm > 0xFFF && (imm & 0xFFF) == 0 && (imm >> 12) <= 0xFFF && shiftAmt == 0 {
-                emitInst(A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: 12, imm: imm >> 12), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: 12, imm: imm >> 12), into: sec, loc: loc)
             } else {
-                emitInst(A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: shiftAmt, imm: imm), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: shiftAmt, imm: imm), into: sec, loc: loc)
             }
             return true
 
@@ -618,7 +618,7 @@ internal enum A64Asm {
             case .a64TprelLo12Nc: rKind = .aarch64_tlsle_add_tprel_lo12_nc
             default:              rKind = .aarch64_add_abs_lo12_nc
             }
-            sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: sym, addend: addend)], lineNumber: lineNumber)
+            sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: sym, addend: addend)], loc: loc)
             return true
 
         default:
@@ -629,7 +629,7 @@ internal enum A64Asm {
     private static func parseLogical(
         mnemonic: String,
         ops: [String],
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession
     ) -> Bool {
         guard ops.count >= 3,
@@ -652,7 +652,7 @@ internal enum A64Asm {
             case "bic":  op = .bicShifted
             default:     op = .bicsShifted
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, shiftKind: shift, amount: amt), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, shiftKind: shift, amount: amt), into: sec, loc: loc)
             return true
         }
 
@@ -674,7 +674,7 @@ internal enum A64Asm {
             default:
                 return false
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, imm: Int64(bitPattern: mask)), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, imm: Int64(bitPattern: mask)), into: sec, loc: loc)
             return true
         }
         return false
@@ -685,7 +685,7 @@ internal enum A64Asm {
     private static func parseBitfieldOrShiftOrMulOrCond(
         mnemonic: String,
         ops: [String],
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession
     ) -> Bool {
         let sec = session.currentSection
@@ -703,7 +703,7 @@ internal enum A64Asm {
                 case "asr": op = .asrv
                 default:    op = .rorv
                 }
-                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, loc: loc)
                 return true
             }
             if let shiftVal = parseImmediateValue(ops[2], session: session) {
@@ -715,7 +715,7 @@ internal enum A64Asm {
                 case "asr": inst = .asrImm(is64Bit: is64, rd: rd, rn: rn, shift: shift)
                 default:    inst = A64Instruction(opcode: .extr, is64Bit: is64, rd: rd, rn: rn, rm: rn, amount: shift)
                 }
-                emitInst(inst, into: sec, lineNumber: lineNumber)
+                emitInst(inst, into: sec, loc: loc)
                 return true
             }
             return false
@@ -736,7 +736,7 @@ internal enum A64Asm {
             case "smulh": op = .smulh
             default:      op = .umulh
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, loc: loc)
             return true
 
         case "mul":
@@ -744,7 +744,7 @@ internal enum A64Asm {
                   let (rd, is64, _) = A64GPR.parse(ops[0]),
                   let (rn, _, _) = A64GPR.parse(ops[1]),
                   let (rm, _, _) = A64GPR.parse(ops[2]) else { return false }
-            emitInst(.mul(is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, lineNumber: lineNumber)
+            emitInst(.mul(is64Bit: is64, rd: rd, rn: rn, rm: rm), into: sec, loc: loc)
             return true
 
         case "madd", "msub":
@@ -753,7 +753,7 @@ internal enum A64Asm {
                   let (rn, _, _) = A64GPR.parse(ops[1]),
                   let (rm, _, _) = A64GPR.parse(ops[2]),
                   let (ra, _, _) = A64GPR.parse(ops[3]) else { return false }
-            emitInst(A64Instruction(opcode: mnemonic == "madd" ? .madd : .msub, is64Bit: is64, rd: rd, rn: rn, rm: rm, ra: ra), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: mnemonic == "madd" ? .madd : .msub, is64Bit: is64, rd: rd, rn: rn, rm: rm, ra: ra), into: sec, loc: loc)
             return true
 
         case "ubfx", "sbfx", "bfi", "bfxil", "ubfm", "sbfm", "bfm":
@@ -774,7 +774,7 @@ internal enum A64Asm {
             case "sbfm":  inst = A64Instruction(opcode: .sbfm, is64Bit: is64, rd: rd, rn: rn, imm: Int64(a), imm2: b)
             default:      inst = A64Instruction(opcode: .bfm, is64Bit: is64, rd: rd, rn: rn, imm: Int64(a), imm2: b)
             }
-            emitInst(inst, into: sec, lineNumber: lineNumber)
+            emitInst(inst, into: sec, loc: loc)
             return true
 
         case "extr":
@@ -783,7 +783,7 @@ internal enum A64Asm {
                   let (rn, _, _) = A64GPR.parse(ops[1]),
                   let (rm, _, _) = A64GPR.parse(ops[2]),
                   let lsb = parseImmediateValue(ops[3], session: session) else { return false }
-            emitInst(A64Instruction(opcode: .extr, is64Bit: is64, rd: rd, rn: rn, rm: rm, amount: UInt8(truncatingIfNeeded: lsb)), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .extr, is64Bit: is64, rd: rd, rn: rn, rm: rm, amount: UInt8(truncatingIfNeeded: lsb)), into: sec, loc: loc)
             return true
 
         case "sxtb", "sxth", "sxtw", "uxtb", "uxth":
@@ -798,7 +798,7 @@ internal enum A64Asm {
             case "uxtb": inst = .uxtb(rd: rd, rn: rn)
             default:     inst = .uxth(rd: rd, rn: rn)
             }
-            emitInst(inst, into: sec, lineNumber: lineNumber)
+            emitInst(inst, into: sec, loc: loc)
             return true
 
         case "clz", "rbit", "rev", "rev16", "rev32":
@@ -813,14 +813,14 @@ internal enum A64Asm {
             case "rev16": op = .rev16
             default:      op = .rev32
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn), into: sec, loc: loc)
             return true
 
         case "cset", "csetm":
             guard ops.count == 2,
                   let (rd, is64, _) = A64GPR.parse(ops[0]),
                   let cond = A64Cond.parse(ops[1]) else { return false }
-            emitInst(mnemonic == "cset" ? .cset(is64Bit: is64, rd: rd, cond: cond) : .csetm(is64Bit: is64, rd: rd, cond: cond), into: sec, lineNumber: lineNumber)
+            emitInst(mnemonic == "cset" ? .cset(is64Bit: is64, rd: rd, cond: cond) : .csetm(is64Bit: is64, rd: rd, cond: cond), into: sec, loc: loc)
             return true
 
         case "csel", "csinc", "csinv", "csneg":
@@ -836,7 +836,7 @@ internal enum A64Asm {
             case "csinv": op = .csinv
             default:      op = .csneg
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, cond: cond), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rm, cond: cond), into: sec, loc: loc)
             return true
 
         case "cinc", "cinv", "cneg":
@@ -845,7 +845,7 @@ internal enum A64Asm {
                   let (rn, _, _) = A64GPR.parse(ops[1]),
                   let cond = A64Cond.parse(ops[2]) else { return false }
             let op: A64OpcodeId = (mnemonic == "cinc") ? .csinc : ((mnemonic == "cinv") ? .csinv : .csneg)
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rn, cond: cond.inverted), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rd, rn: rn, rm: rn, cond: cond.inverted), into: sec, loc: loc)
             return true
 
         case "ccmp":
@@ -854,11 +854,11 @@ internal enum A64Asm {
                   let nzcv = parseImmediateValue(ops[2], session: session),
                   let cond = A64Cond.parse(ops[3]) else { return false }
             if let (rm, _, _) = A64GPR.parse(ops[1]) {
-                emitInst(A64Instruction(opcode: .ccmpReg, is64Bit: is64, rn: rn, rm: rm, cond: cond, imm2: UInt8(truncatingIfNeeded: nzcv)), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .ccmpReg, is64Bit: is64, rn: rn, rm: rm, cond: cond, imm2: UInt8(truncatingIfNeeded: nzcv)), into: sec, loc: loc)
                 return true
             }
             if let imm5 = parseImmediateValue(ops[1], session: session) {
-                emitInst(A64Instruction(opcode: .ccmpImm, is64Bit: is64, rn: rn, cond: cond, imm: imm5, imm2: UInt8(truncatingIfNeeded: nzcv)), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .ccmpImm, is64Bit: is64, rn: rn, cond: cond, imm: imm5, imm2: UInt8(truncatingIfNeeded: nzcv)), into: sec, loc: loc)
                 return true
             }
             return false
@@ -885,7 +885,7 @@ internal enum A64Asm {
     private static func parseLoadStore(
         mnemonic: String,
         ops: [String],
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) {
@@ -896,12 +896,12 @@ internal enum A64Asm {
             let isLoad = (mnemonic == "ldr")
             if let zd = A64ZReg.parse(Substring(ops[0])) {
                 let (baseReg, immVal) = parseSVEMemOperand(ops: Array(ops.dropFirst()), session: session)
-                emitInst(A64Instruction(opcode: isLoad ? .sveLdrZ : .sveStrZ, rn: baseReg, zd: zd, imm: immVal), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: isLoad ? .sveLdrZ : .sveStrZ, rn: baseReg, zd: zd, imm: immVal), into: sec, loc: loc)
                 return
             }
             if let pd = A64PReg.parse(Substring(ops[0])) {
                 let (baseReg, immVal) = parseSVEMemOperand(ops: Array(ops.dropFirst()), session: session)
-                emitInst(A64Instruction(opcode: isLoad ? .sveLdrP : .sveStrP, rn: baseReg, pd: pd, imm: immVal), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: isLoad ? .sveLdrP : .sveStrP, rn: baseReg, pd: pd, imm: immVal), into: sec, loc: loc)
                 return
             }
         }
@@ -918,7 +918,7 @@ internal enum A64Asm {
                 case .post:   op = isLoad ? .ldpPostQ : .stpPostQ
                 case .signed: op = isLoad ? .ldpSignedQ : .stpSignedQ
                 }
-                emitInst(A64Instruction(opcode: op, rn: memMode.base, vd: v1, vn: v2, scalarWidth: .q, imm: memMode.offset), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: op, rn: memMode.base, vd: v1, vn: v2, scalarWidth: .q, imm: memMode.offset), into: sec, loc: loc)
                 return
             }
             if let (r1, is64, _) = A64GPR.parse(ops[0]),
@@ -929,7 +929,7 @@ internal enum A64Asm {
                 case .post:   op = isLoad ? .ldpPost : .stpPost
                 case .signed: op = isLoad ? .ldpSigned : .stpSigned
                 }
-                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: r1, rn: memMode.base, rm: r2, imm: memMode.offset), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: r1, rn: memMode.base, rm: r2, imm: memMode.offset), into: sec, loc: loc)
                 return
             }
         }
@@ -941,7 +941,7 @@ internal enum A64Asm {
                   let (ws, _, _) = A64GPR.parse(ops[0]),
                   let (rt, is64, _) = A64GPR.parse(ops[1]) else { return }
             let mem = parseMemAddressing(ops: [ops[2]], session: session)
-            emitInst(A64Instruction(opcode: mnemonic == "stxr" ? .stxr : .stlxr, is64Bit: is64, rd: rt, rn: mem.base, rm: ws), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: mnemonic == "stxr" ? .stxr : .stlxr, is64Bit: is64, rd: rt, rn: mem.base, rm: ws), into: sec, loc: loc)
             return
 
         case "ldxr", "ldaxr", "ldar", "stlr", "ldarb", "stlrb", "ldarh", "stlrh":
@@ -959,7 +959,7 @@ internal enum A64Asm {
             case "ldarh": op = .ldarh
             default:      op = .stlrh
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rt, rn: mem.base), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rt, rn: mem.base), into: sec, loc: loc)
             return
 
         default:
@@ -985,13 +985,13 @@ internal enum A64Asm {
                             width: 4,
                             resolveIfSameSection: true
                         )
-                        sec.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                        sec.emitBytes(bytes, fixups: [fixup], loc: loc)
                     }
                     return
                 } else if let exprVal = evalExpr(rhs, session: session),
                           case .constant(let disp) = exprVal {
                     // `ldr xN, #disp` -- PC-relative literal with an explicit byte displacement
-                    emitInst(A64Instruction(opcode: .ldrLit, is64Bit: is64, rd: rt, imm: disp), into: sec, lineNumber: lineNumber)
+                    emitInst(A64Instruction(opcode: .ldrLit, is64Bit: is64, rd: rt, imm: disp), into: sec, loc: loc)
                     return
                 } else if let exprVal = evalExpr(rhs, session: session),
                           case .symbolOffset(let sym, let addend, _) = exprVal {
@@ -1005,7 +1005,7 @@ internal enum A64Asm {
                             width: 4,
                             resolveIfSameSection: true
                         )
-                        sec.emitBytes(bytes, fixups: [fixup], lineNumber: lineNumber)
+                        sec.emitBytes(bytes, fixups: [fixup], loc: loc)
                     }
                     return
                 }
@@ -1031,13 +1031,13 @@ internal enum A64Asm {
             case (true, .q):  op = .ldrFpImmQ
             case (false, .q): op = .strFpImmQ
             }
-            emitInst(A64Instruction(opcode: op, rn: mem.base, vd: vd, scalarWidth: sw, imm: mem.offset), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, rn: mem.base, vd: vd, scalarWidth: sw, imm: mem.offset), into: sec, loc: loc)
             return
         }
 
         // 6. Standard GPR loads/stores
         guard ops.count >= 2, let (rt, is64, _) = A64GPR.parse(ops[0]) else {
-            diagnostics.report(.asmInvalidInstruction, at: SourceLocation(rawValue: UInt32(max(1, lineNumber))), args: [mnemonic])
+            diagnostics.report(.asmInvalidInstruction, at: loc, args: [mnemonic])
             return
         }
         let mem = parseMemAddressing(ops: Array(ops.dropFirst()), session: session)
@@ -1067,7 +1067,7 @@ internal enum A64Asm {
                     amount: mem.shiftAmount
                 ),
                 into: sec,
-                lineNumber: lineNumber
+                loc: loc
             )
             return
         }
@@ -1096,7 +1096,7 @@ internal enum A64Asm {
             case ("ldrsw", true):  op = .ldrswPre
             default:               op = .ldrswPost
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, loc: loc)
             return
         }
 
@@ -1123,7 +1123,7 @@ internal enum A64Asm {
             case "ldtrsh": op = is64 ? .ldtrsh64 : .ldtrsh32
             default:       op = .ldtrsw
             }
-            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, loc: loc)
             return
         }
 
@@ -1156,14 +1156,14 @@ internal enum A64Asm {
                     default: rKind = .aarch64_ldst64_abs_lo12_nc
                     }
                 }
-                sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: symReloc.symbol, addend: symReloc.addend)], lineNumber: lineNumber)
+                sec.emitBytes(bytes, fixups: [AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: symReloc.symbol, addend: symReloc.addend)], loc: loc)
             }
             return
         }
 
         let candidate = A64Instruction(opcode: opImm, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset)
         if let bytes = A64Encoder.encodeBytes(candidate) {
-            sec.emitBytes(bytes, lineNumber: lineNumber)
+            sec.emitBytes(bytes, loc: loc)
             return
         }
 
@@ -1180,7 +1180,7 @@ internal enum A64Asm {
         case "ldrsh": unscaledOp = is64 ? .ldursh64 : .ldursh32
         default:      unscaledOp = .ldursw
         }
-        emitInst(A64Instruction(opcode: unscaledOp, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, lineNumber: lineNumber)
+        emitInst(A64Instruction(opcode: unscaledOp, is64Bit: is64, rd: rt, rn: mem.base, imm: mem.offset), into: sec, loc: loc)
     }
 
     private enum A64MemIndexing {
@@ -1271,7 +1271,7 @@ internal enum A64Asm {
     private static func parseFpOrSimd(
         mnemonic: String,
         ops: [String],
-        lineNumber: Int,
+        loc: AsmLoc,
         session: AsmSession
     ) -> Bool {
         let sec = session.currentSection
@@ -1281,17 +1281,17 @@ internal enum A64Asm {
             guard ops.count == 2 else { return false }
             if let (vd, SomeSw, _) = A64VReg.parse(ops[0]), let sw = SomeSw {
                 if let (rn, _, _) = A64GPR.parse(ops[1]) {
-                    emitInst(A64Instruction(opcode: .fmovGprToFp, is64Bit: sw == .d, rn: rn, vd: vd, scalarWidth: sw), into: sec, lineNumber: lineNumber)
+                    emitInst(A64Instruction(opcode: .fmovGprToFp, is64Bit: sw == .d, rn: rn, vd: vd, scalarWidth: sw), into: sec, loc: loc)
                     return true
                 }
                 if let (vn, _, _) = A64VReg.parse(ops[1]) {
-                    emitInst(A64Instruction(opcode: .fmovReg, is64Bit: sw == .d, vd: vd, vn: vn, scalarWidth: sw), into: sec, lineNumber: lineNumber)
+                    emitInst(A64Instruction(opcode: .fmovReg, is64Bit: sw == .d, vd: vd, vn: vn, scalarWidth: sw), into: sec, loc: loc)
                     return true
                 }
             }
             if let (rd, _, _) = A64GPR.parse(ops[0]),
                let (vn, SomeSw, _) = A64VReg.parse(ops[1]), let sw = SomeSw {
-                emitInst(A64Instruction(opcode: .fmovFpToGpr, is64Bit: sw == .d, rd: rd, vn: vn, scalarWidth: sw), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .fmovFpToGpr, is64Bit: sw == .d, rd: rd, vn: vn, scalarWidth: sw), into: sec, loc: loc)
                 return true
             }
             return false
@@ -1300,31 +1300,31 @@ internal enum A64Asm {
             guard ops.count == 2,
                   let (vd, SomeSwD, _) = A64VReg.parse(ops[0]), let swD = SomeSwD,
                   let (vn, _, _) = A64VReg.parse(ops[1]) else { return false }
-            emitInst(A64Instruction(opcode: swD == .d ? .fcvtStoD : .fcvtDtoS, is64Bit: swD == .d, vd: vd, vn: vn, scalarWidth: swD), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: swD == .d ? .fcvtStoD : .fcvtDtoS, is64Bit: swD == .d, vd: vd, vn: vn, scalarWidth: swD), into: sec, loc: loc)
             return true
 
         case "scvtf":
             guard ops.count == 2,
                   let (vd, SomeSw, _) = A64VReg.parse(ops[0]), let sw = SomeSw,
                   let (rn, is64, _) = A64GPR.parse(ops[1]) else { return false }
-            emitInst(A64Instruction(opcode: .scvtf, is64Bit: is64, rn: rn, vd: vd, scalarWidth: sw), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .scvtf, is64Bit: is64, rn: rn, vd: vd, scalarWidth: sw), into: sec, loc: loc)
             return true
 
         case "fcvtzs":
             guard ops.count == 2,
                   let (rd, is64, _) = A64GPR.parse(ops[0]),
                   let (vn, SomeSw, _) = A64VReg.parse(ops[1]), let sw = SomeSw else { return false }
-            emitInst(A64Instruction(opcode: .fcvtzs, is64Bit: is64, rd: rd, vn: vn, scalarWidth: sw), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .fcvtzs, is64Bit: is64, rd: rd, vn: vn, scalarWidth: sw), into: sec, loc: loc)
             return true
 
         case "fcmp":
             guard ops.count == 2,
                   let (vn, SomeSw, _) = A64VReg.parse(ops[0]), let sw = SomeSw else { return false }
             if let (vm, _, _) = A64VReg.parse(ops[1]) {
-                emitInst(A64Instruction(opcode: .fcmpReg, is64Bit: sw == .d, vn: vn, vm: vm, scalarWidth: sw), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: .fcmpReg, is64Bit: sw == .d, vn: vn, vm: vm, scalarWidth: sw), into: sec, loc: loc)
                 return true
             }
-            emitInst(A64Instruction(opcode: .fcmpZero, is64Bit: sw == .d, vn: vn, scalarWidth: sw), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: .fcmpZero, is64Bit: sw == .d, vn: vn, scalarWidth: sw), into: sec, loc: loc)
             return true
 
         case "fadd", "fsub", "fmul", "fdiv":
@@ -1339,7 +1339,7 @@ internal enum A64Asm {
                 case "fmul": op = .fmulScalar
                 default:     op = .fdivScalar
                 }
-                emitInst(A64Instruction(opcode: op, is64Bit: sw == .d, vd: vd, vn: vn, vm: vm, scalarWidth: sw), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: op, is64Bit: sw == .d, vd: vd, vn: vn, vm: vm, scalarWidth: sw), into: sec, loc: loc)
                 return true
             }
             if let (vd, _, SomeArr) = A64VReg.parse(ops[0]), let arr = SomeArr,
@@ -1352,7 +1352,7 @@ internal enum A64Asm {
                 case "fmul": op = .simdFmul
                 default:     op = .simdFdiv
                 }
-                emitInst(A64Instruction(opcode: op, vd: vd, vn: vn, vm: vm, arrangement: arr), into: sec, lineNumber: lineNumber)
+                emitInst(A64Instruction(opcode: op, vd: vd, vn: vn, vm: vm, arrangement: arr), into: sec, loc: loc)
                 return true
             }
             return false
@@ -1380,7 +1380,7 @@ internal enum A64Asm {
             case "zip1": op = .simdZip1
             default:     op = .simdZip2
             }
-            emitInst(A64Instruction(opcode: op, vd: vd, vn: vn, vm: vm, arrangement: arr), into: sec, lineNumber: lineNumber)
+            emitInst(A64Instruction(opcode: op, vd: vd, vn: vn, vm: vm, arrangement: arr), into: sec, loc: loc)
             return true
 
         default:
