@@ -16,6 +16,9 @@ public struct PPToken: Sendable, Equatable {
     public var location: SourceLocation
     public var endLocation: SourceLocation
     public var spelling: String
+    /// A macro name found while that macro was being expanded ("painted blue", C23 6.10.5.4p2): it is never
+    /// replaced, even if later followed by `(`.
+    public var isPainted: Bool = false
 
     public init(kind: CTokenKind, flags: TokenFlags, location: SourceLocation, endLocation: SourceLocation, spelling: String) {
         self.kind = kind
@@ -84,6 +87,8 @@ public final class CPreprocessor {
     private var includeGuards: [String: String] = [:] // filePath -> guardMacroName
     private var counterValue: UInt32 = 0
     private var activeInclusions: [String] = [] // Call stack of included files for #include_next
+    /// `#line` adjustments per file: from a physical line on, the presumed line is the physical one plus `delta`.
+    private var lineAdjustments: [String: [(fromLine: Int, delta: Int)]] = [:]
 
     public init(sourceManager: SourceManager, diagnostics: consuming DiagnosticBag = DiagnosticBag()) {
         self.sourceManager = sourceManager
@@ -196,8 +201,9 @@ public final class CPreprocessor {
         defineMacro("__INTPTR_MAX__", replacement: "9223372036854775807L")
         defineMacro("__UINTPTR_MAX__", replacement: "18446744073709551615UL")
 
-        // Host Compatibility Profile (D7)
-        defineMacro("_GNU_SOURCE", replacement: "1")
+        // Host Compatibility Profile (D7). Like `clang -std=c23` (not `-std=gnu23`), a strictly conforming mode:
+        // `__STRICT_ANSI__` and no `_GNU_SOURCE`, so the C library declares only what ISO C provides by default.
+        defineMacro("__STRICT_ANSI__", replacement: "1")
         defineMacro("__USER_LABEL_PREFIX__", replacement: "")
         defineMacro("__GNUC__", replacement: "14")
         defineMacro("__GNUC_MINOR__", replacement: "2")
@@ -475,33 +481,9 @@ public final class CPreprocessor {
                         )
                     }
                     // Macro expansion tokens might themselves contain macros to expand
-                    var disabledSet: Set<String> = [tok.spelling]
                     var fullyExpanded: [PPToken] = []
-                    expandAllMacros(expanded, disabled: disabledSet, into: &fullyExpanded)
-                    while let last = fullyExpanded.last,
-                          isIdentifierOrKeyword(last.kind),
-                          let m = macros[last.spelling],
-                          m.isFunctionLike,
-                          !disabledSet.contains(last.spelling),
-                          cursor < input.count,
-                          input[cursor].kind == .lParen {
-                        var depth = 0
-                        while cursor < input.count {
-                            let argTok = input[cursor]
-                            fullyExpanded.append(argTok)
-                            cursor += 1
-                            if argTok.kind == .lParen {
-                                depth += 1
-                            } else if argTok.kind == .rParen {
-                                depth -= 1
-                                if depth == 0 { break }
-                            }
-                        }
-                        var reExpanded: [PPToken] = []
-                        expandAllMacros(fullyExpanded, disabled: disabledSet, into: &reExpanded)
-                        disabledSet.insert(last.spelling)
-                        fullyExpanded = reExpanded
-                    }
+                    expandAllMacros(expanded, disabled: [tok.spelling], into: &fullyExpanded)
+                    expandTrailingInvocations(&fullyExpanded, from: input, at: &cursor, disabled: [])
                     if assemblerMode, tok.isLeadingNewline || output.isEmpty, !fullyExpanded.isEmpty {
                         // The line's position is the macro use, not the definition (`preprocessToText` line markers)
                         fullyExpanded[0].location = tok.location
@@ -721,13 +703,37 @@ public final class CPreprocessor {
                 let msg = tokens.dropFirst().map { $0.spelling }.joined(separator: " ")
                 diagnostics.report(.ppUserWarning, at: first.location, args: [msg])
             case "line":
-                break // Ignored for now
+                handleLine(Array(tokens.dropFirst()), location: first.location)
             default:
                 if !assemblerMode {
                     diagnostics.report(.ppInvalidDirective, at: first.location, args: [first.spelling])
                 }
             }
         }
+    }
+
+    /// `#line digit-sequence ["s-char-sequence"]` (C23 6.10.6), macro-expanded: the next line's presumed line
+    /// number becomes the digit sequence's value (the presumed file name is not modeled).
+    private func handleLine(_ tokens: [PPToken], location: SourceLocation) {
+        var expanded: [PPToken] = []
+        expandAllMacros(tokens, disabled: [], into: &expanded)
+        guard let number = expanded.first, number.kind == .intLiteral, number.spelling.allSatisfy(\.isASCII),
+              number.spelling.allSatisfy(\.isNumber), let value = Int(number.spelling), value <= 2_147_483_647,
+              expanded.count == 1 || (expanded.count == 2 && expanded[1].kind == .stringLiteral),
+              let (file, offset) = sourceManager.file(containing: location) else {
+            diagnostics.report(.ppInvalidDirective, at: location, args: ["line"])
+            return
+        }
+        let nextLine = file.lineTable().lineAndColumn(at: offset).line + 1
+        lineAdjustments[file.path, default: []].append((nextLine, value - nextLine))
+    }
+
+    /// The line number `__LINE__` reports for a token: its physical line, adjusted by any `#line` before it.
+    private func presumedLine(of location: SourceLocation) -> Int {
+        guard let (file, offset) = sourceManager.file(containing: location) else { return 1 }
+        let line = file.lineTable().lineAndColumn(at: offset).line
+        let delta = lineAdjustments[file.path]?.last(where: { $0.fromLine <= line })?.delta ?? 0
+        return line + delta
     }
 
     private func handleDefine(_ tokens: [PPToken], location: SourceLocation) {
@@ -1050,41 +1056,52 @@ public final class CPreprocessor {
         var i = 0
         while i < input.count {
             let tok = input[i]
-            if isIdentifierOrKeyword(tok.kind), macros[tok.spelling] != nil, !disabled.contains(tok.spelling) {
+            if isIdentifierOrKeyword(tok.kind), !tok.isPainted, let macro = macros[tok.spelling],
+               !macro.isFunctionLike || (i + 1 < input.count && input[i + 1].kind == .lParen) {
+                if disabled.contains(tok.spelling) {
+                    var painted = tok
+                    painted.isPainted = true
+                    output.append(painted)
+                    i += 1
+                    continue
+                }
                 var nextExpanded: [PPToken] = []
                 i = expandMacro(macroName: tok.spelling, tokens: input, index: i, disabled: disabled, into: &nextExpanded)
-                var subDisabled = disabled.union([tok.spelling])
                 var subOutput: [PPToken] = []
-                expandAllMacros(nextExpanded, disabled: subDisabled, into: &subOutput)
-                while let last = subOutput.last,
-                      isIdentifierOrKeyword(last.kind),
-                      let m = macros[last.spelling],
-                      m.isFunctionLike,
-                      !subDisabled.contains(last.spelling),
-                      i < input.count,
-                      input[i].kind == .lParen {
-                    var depth = 0
-                    while i < input.count {
-                        let argTok = input[i]
-                        subOutput.append(argTok)
-                        i += 1
-                        if argTok.kind == .lParen {
-                            depth += 1
-                        } else if argTok.kind == .rParen {
-                            depth -= 1
-                            if depth == 0 { break }
-                        }
-                    }
-                    var reExpanded: [PPToken] = []
-                    expandAllMacros(subOutput, disabled: subDisabled, into: &reExpanded)
-                    subDisabled.insert(last.spelling)
-                    subOutput = reExpanded
-                }
+                expandAllMacros(nextExpanded, disabled: disabled.union([tok.spelling]), into: &subOutput)
+                expandTrailingInvocations(&subOutput, from: input, at: &i, disabled: disabled)
                 output.append(contentsOf: subOutput)
             } else {
                 output.append(tok)
                 i += 1
             }
+        }
+    }
+
+    /// A rescanned expansion that ends in the name of a function-like macro takes its arguments from the tokens
+    /// after the invocation (C23 6.10.5.4p1). Those tokens lie outside the finished expansion, so the invocation
+    /// is expanded with only the enclosing context's macros disabled: `CAT(A,B)(x)` with `AB(x)` defined as
+    /// `CAT(x,y)` becomes `xy`, as in GCC and Clang. Painted names stay unexpanded.
+    private func expandTrailingInvocations(_ expansion: inout [PPToken], from input: [PPToken], at cursor: inout Int, disabled: Set<String>) {
+        while let last = expansion.last, !last.isPainted, isIdentifierOrKeyword(last.kind),
+              macros[last.spelling]?.isFunctionLike == true, !disabled.contains(last.spelling),
+              cursor < input.count, input[cursor].kind == .lParen {
+            var invocation = [expansion.removeLast()]
+            var depth = 0
+            while cursor < input.count {
+                let argTok = input[cursor]
+                invocation.append(argTok)
+                cursor += 1
+                if argTok.kind == .lParen {
+                    depth += 1
+                } else if argTok.kind == .rParen {
+                    depth -= 1
+                    if depth == 0 { break }
+                }
+            }
+            var replaced: [PPToken] = []
+            _ = expandMacro(macroName: last.spelling, tokens: invocation, index: 0, disabled: disabled, into: &replaced)
+            expandAllMacros(replaced, disabled: disabled.union([last.spelling]), into: &expansion)
         }
     }
 
@@ -1102,8 +1119,7 @@ public final class CPreprocessor {
 
         // Special dynamic macros
         if macroName == "__LINE__" {
-            let lineNum = 1 // approximated or resolved via LineTable
-            output.append(makeSyntheticToken(kind: .intLiteral, flags: tokens[index].flags, spelling: "\(lineNum)"))
+            output.append(makeSyntheticToken(kind: .intLiteral, flags: tokens[index].flags, spelling: "\(presumedLine(of: tokens[index].location))"))
             return index + 1
         } else if macroName == "__FILE__" {
             let path = activeInclusions.last ?? "<input>"

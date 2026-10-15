@@ -192,6 +192,166 @@ struct M1RegressionTests {
         """))
     }
 
+    @Test("Declarators: parenthesized, function-pointer and pointer-to-array forms are modeled exactly")
+    func declaratorModel() throws {
+        #expect(try Self.accepts("""
+        int (*rows)[4]; int (*tab[2])(int); int (*pick(int))(char); void (*sig(int, void (*)(int)))(int);
+        static_assert(sizeof(*rows) == 16 && sizeof(rows) == 8 && sizeof(tab) == 16);
+        static_assert(sizeof(int (*)[3]) == 8 && sizeof(int *[4]) == 32 && sizeof(int [2][3]) == 24);
+        int f(int a), g(int a), a;
+        typedef struct S *(*fty)(void);
+        struct S { int (*zero)(void); } s;
+        struct S *self(void) { return &s; }
+        fty go(void) { return &self; }
+        int use(void) { return tab[0](1) + pick(2)('c') + go()()->zero() + f(1) - g(1) + a; }
+        void vla(int n, int m[n][n]) { (void)m[0][0]; }
+        """))
+        for bad in [
+            "int f(void)[3];",                                  // function returning an array
+            "int g[3](void);",                                  // array of functions
+            "int (*fp)(int); void f(void) { fp(1, 2); }",       // argument count through a function pointer
+            "int *const p = 0; void f(void) { p = 0; }",        // the pointer itself is const
+            "void f(int a[const 3]) { a = 0; }",                // qualifiers in a parameter's array brackets
+            "int f(int a, int a);",
+            "int n = 3; int a[n];",                             // variable length array at file scope
+        ] {
+            #expect(try !Self.accepts(bad + "\n"), "accepted: \(bad)")
+        }
+    }
+
+    @Test("Integer constant expressions are evaluated with C's types and conversions")
+    func typedConstantEvaluation() throws {
+        #expect(try Self.accepts("""
+        static_assert(sizeof(1ull) == 8 && sizeof(0xFFFFFFFF) == 4 && sizeof(2147483648) == 8 && sizeof(1 ? 1 : 1L) == 8);
+        static_assert(!(-1 < 0u) && -1L < 1u && (0u - 1) == 4294967295u && (-1 >> 1) == -1 && -7 / 2 == -3);
+        static_assert((unsigned char)300 == 44 && (signed char)200 == -56 && (bool)256 == 1 && (int)2.7 == 2);
+        int a[3][4]; int (*p)[5];
+        static_assert(sizeof(a) == 48 && sizeof(a[0]) == 16 && sizeof(*p) == 20);
+        static_assert(sizeof((int[]){1, 2, 3}) == 12 && sizeof("abc") == 4 && sizeof("a" "bc") == 4);
+        char s[] = "hello"; int d[] = {[5] = 1, 2};
+        static_assert(sizeof(s) == 6 && sizeof(d) == 28);
+        constexpr int N = 2 * 3; int arr[N];
+        static_assert(sizeof(arr) == 24);
+        enum { BIG = 0x100000000 }; static_assert(sizeof(BIG) == 8);
+        """))
+        for bad in ["static_assert(1 / 0);", "int n = 3; static_assert(n);", "int n; enum { A = n };", "long long x = 1lL;",
+                    "double d = 1e+;", "double d = 0x1.8;"] {
+            #expect(try !Self.accepts(bad + "\n"), "accepted: \(bad)")
+        }
+    }
+
+    @Test("Struct, union and enum tags are scoped; redefinitions and kind mismatches are diagnosed")
+    func tagScoping() throws {
+        #expect(try Self.accepts("""
+        struct S { char c; };
+        int f(void) { struct S { double d; } s = {1.0}; static_assert(sizeof(s) == 8); return (int)s.d; }
+        struct T { int x; } t1;
+        void g(void) { { struct T { int y; } t2; t2.y = t1.x; } }
+        struct L; struct L *lp; struct L { int v; }; static_assert(sizeof(struct L) == 4);
+        """))
+        for bad in [
+            "struct S { int a; }; struct S { int a; };",
+            "enum E { A }; enum E { B };",
+            "enum { A }; enum { A };",                                     // enumerator redefinition
+            "union U; struct U *p;",
+            "struct A { int a; }; void f(void) { struct A; struct A *p = 0; p->a = 1; }",  // `struct A;` hides the outer tag
+            "struct Out { int o; }; void f(void) { struct Out { int i; } x; x.o = 1; }",
+        ] {
+            #expect(try !Self.accepts(bad + "\n"), "accepted: \(bad)")
+        }
+    }
+
+    @Test("Objects need complete types; array sizes and bit-field widths are checked")
+    func objectTypeConstraints() throws {
+        #expect(try Self.accepts("""
+        struct S s; struct S { int a; };
+        extern struct X x; struct X *px = &x;
+        struct F { int n; int tail[]; };
+        struct B { int :0; char c; unsigned long long w : 64; };
+        void *__dso_handle = &__dso_handle;
+        """))
+        for bad in [
+            "void v;", "struct Unknown u;", "void f(void) { struct Z z; }", "struct W w[2];", "struct T { void v; };",
+            "int a[-1];", "struct S { int a : 40; };", "struct S { int a : 0; };", "struct S { float f : 3; };",
+            "struct S { bool b : 2; };",
+        ] {
+            #expect(try !Self.accepts(bad + "\n"), "accepted: \(bad)")
+        }
+    }
+
+    @Test("Bit-fields share storage units as in the System V ABI; packed and mode attributes apply")
+    func structLayout() throws {
+        #expect(try Self.accepts("""
+        struct B1 { unsigned a:3; unsigned b:5; }; struct B2 { char c; int a:30; char d; };
+        struct B3 { short a:9, b:9, c:9; }; struct B4 { char a; int :0; char b; }; struct B5 { char a; long long b:7; };
+        union U1 { int a:3; char b; };
+        static_assert(sizeof(struct B1) == 4 && sizeof(struct B2) == 12 && sizeof(struct B3) == 6 && _Alignof(struct B3) == 2);
+        static_assert(sizeof(struct B4) == 5 && _Alignof(struct B4) == 1 && sizeof(struct B5) == 8 && sizeof(union U1) == 4);
+        struct __attribute__((packed)) P1 { char a; int b; }; struct P2 { char a; int b; } __attribute__((packed));
+        static_assert(sizeof(struct P1) == 5 && sizeof(struct P2) == 5);
+        typedef int ti_int __attribute__((mode(TI))); typedef unsigned du_int __attribute__((mode(DI)));
+        static_assert(sizeof(ti_int) == 16 && sizeof(du_int) == 8 && (du_int)-1 > 0);
+        """))
+    }
+
+    @Test("`_BitInt(N)`, `wb`/`uwb` literals, enum underlying types and `__int128`")
+    func extendedIntegerTypes() throws {
+        #expect(try Self.accepts("""
+        typedef _BitInt(37) b37; unsigned _BitInt(8) u = 255uwb; b37 f(b37 x) { return x + 1wb; }
+        static_assert(sizeof(_BitInt(37)) == 8 && sizeof(_BitInt(65)) == 16 && sizeof(unsigned _BitInt(9)) == 2);
+        static_assert(_Generic(1wb, _BitInt(2): 1, default: 0) && _Generic(255uwb, unsigned _BitInt(8): 1, default: 0));
+        static_assert(sizeof(__int128) == 16 && _Alignof(__int128) == 16);
+        enum E : unsigned char { A }; static_assert(sizeof(enum E) == 1);
+        enum P { PA }; enum P pf(void); unsigned pf(void);
+        enum N { NA = -1, NB = 0xFFFFFFFF }; static_assert(sizeof(enum N) == 8);
+        """))
+        for bad in ["_BitInt(1) b;", "_BitInt(0) b;", "enum P { PA }; enum P pf(void); int pf(void);"] {
+            #expect(try !Self.accepts(bad + "\n"), "accepted: \(bad)")
+        }
+    }
+
+    @Test("Statement attributes and `?:` operand typing")
+    func statementAttributesAndConditionals() throws {
+        #expect(try Self.accepts("""
+        [[nodiscard]] int g(void);
+        void f(int x, int *p) { switch (x) { case 1: x++; [[fallthrough]]; case 2: break; } (void)(x ? p : 0); (void)(x ? (void)0 : 1); }
+        """))
+        for bad in [
+            "void f(void) { [[fallthrough]]; }",
+            "struct S { int a; }; void f(int c) { struct S s; int *p; (void)(c ? s : p); }",
+            "void f(int c, int *p, double d) { (void)(c ? p : d); }",
+            "struct S { int a; } s; int i = (int)s;",
+        ] {
+            #expect(try !Self.accepts(bad + "\n"), "accepted: \(bad)")
+        }
+    }
+
+    @Test("`#line`, `__LINE__`, rescanning past the end of an expansion, and prefixed literals")
+    func preprocessorLinesAndRescanning() throws {
+        #expect(try Self.accepts("""
+        static_assert(__LINE__ == 1);
+        #line 100
+        static_assert(__LINE__ == 100);
+        #define L 500
+        #line L "renamed.c"
+        static_assert(__LINE__ == 500);
+        #define CAT2(a,b) a##b
+        #define CAT(a,b) CAT2(a,b)
+        #define AB(x) CAT(x,y)
+        #define foo foo
+        int foo;
+        int f(void) { int xy = 42; return CAT(A,B)(x); }
+        static_assert(L'a' == 97 && u'a' == 97 && U'a' == 97 && u8'a' == 97 && sizeof(u"ab") == 6 && sizeof(L"ab") == 12);
+        """))
+        #expect(try !Self.accepts("#line abc\nint x;\n"))
+        #expect(try Self.compileAndRun("""
+        #define CAT2(a,b) a##b
+        #define CAT(a,b) CAT2(a,b)
+        #define AB(x) CAT(x,y)
+        int main(void) { int xy = 42, z = 1; return CAT(A,B)(x) + z; }
+        """) == 43)
+    }
+
     @Test("Shared C literal decoding")
     func literalDecoding() {
         #expect(CLiteral.characterValue("'\\n'") == 10)

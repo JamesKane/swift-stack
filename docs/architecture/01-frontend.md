@@ -161,7 +161,9 @@ The preprocessor runs per C unit and produces that unit's final, post-expansion 
   - `__VA_OPT__` and `__VA_ARGS__` are supported.
   - Stringizing and pasting write their spellings into the unit's scratch buffer (§4.3).
   - Expansion streams tokens into the output columns without heap strings.
+  - A macro name met while that macro is disabled is painted and never replaced. When a rescanned expansion ends in the name of a function-like macro, its arguments come from the tokens after the invocation; those lie outside the finished expansion, so only the enclosing context's macros stay disabled (`CAT(A,B)(x)`, where `AB(x)` expands to `CAT(x,y)`, gives `xy`, as in GCC and Clang).
 - **Conditionals and queries.** `#if`/`#elif` expressions are evaluated in `intmax_t`/`uintmax_t`, following C23 rules. The following are supported: `#ifdef`, `#ifndef`, the C23 additions `#elifdef` and `#elifndef`, `defined`, `__has_include`, `__has_embed`, `__has_c_attribute`, and `#warning`.
+- **Line control.** `#line` (its operands macro-expanded) sets the presumed line number that `__LINE__` reports for the following lines; `__LINE__` is otherwise the physical line of its token.
 - **Include guards.** The preprocessor detects the include-guard pattern and `#pragma once`, and skips re-entering such files.
 - **`#embed`** (C23 binary resource inclusion). Full semantics MUST be preserved:
   - The parameters `limit(N)`, `prefix(...)`, `suffix(...)`, and `if_empty(...)` are supported, as are vendor parameters that `__has_embed` reports as unsupported.
@@ -182,7 +184,7 @@ To parse glibc, FreeBSD libc, and macOS SDK headers, the preprocessor and parser
   - `__builtin_va_list` and other `__builtin_*` names, plus basic and extended `asm` statements
   - vector-type attributes `vector_size(N)` and `ext_vector_type(N)`, with `__builtin_shufflevector`/`__builtin_convertvector` ([02](02-semantic-analysis.md) §4.2.5, [17](17-simd-and-vectorization.md) §5.7)
 - **Feature queries:** `__has_feature`, `__has_extension`, `__has_attribute`, and `__has_builtin` answer from one table, which is the single source of truth for the profile.
-- **Predefined macros** are generated per target triple: architecture, OS, sizes, `__STDC_VERSION__ == 202311L`, and the `__STDC_NO_*__` macros for the deferred features listed in [02](02-semantic-analysis.md). Which compiler-identity macros to define (`__GNUC__`, `__clang__`) is an open question (§7).
+- **Predefined macros** are generated per target triple: architecture, OS, sizes, `__STDC_VERSION__ == 202311L`, `__STRICT_ANSI__` (as with `clang -std=c23`; `_GNU_SOURCE` is not predefined, so the C library declares only what its strictly conforming mode exposes), and the `__STDC_NO_*__` macros for the deferred features listed in [02](02-semantic-analysis.md). Which compiler-identity macros to define (`__GNUC__`, `__clang__`) is an open question (§7).
 - **Blocks.** `__BLOCKS__` is never defined. macOS headers guard their block-based APIs behind it, so those declarations are simply not seen.
 
 ### 4.6 Parse tree
@@ -229,6 +231,14 @@ Properties:
 1. **Append-only construction.** The parser records `start = count`, parses the children, and then appends the parent with `subtreeSize = count - start + 1`. No back-patching is needed.
 2. **Sibling stepping.** For a node at index `i`, its last child is at `i - 1`, and the sibling before any child `c` is at `c - subtreeSize(c)`. Enumerating `k` children costs O(k), visiting them right to left. Skipping a whole subtree (for example an unneeded function body) is a single subtraction.
 3. **Linear consumers.** Building SemIR walks indices `0..<count` in order ([10](10-semantic-ir-and-name-resolution.md) §4.2). To give that walk top-down information, the parser also emits *start marker* nodes before certain children, such as `VarDeclStart`, `CallArgsStart`, and `FunctionBodyStart`. These are ordinary leaf nodes that tell the checker "an initializer for the declared pattern begins here", so it can push an expected type before the initializer's children arrive.
+
+#### C declarations
+
+A C declaration is a `varDecl`, `typedefDecl` or (at file scope, with a body) `functionDecl` node whose children are a `declSpecs` node and then each declarator, followed by its initializer if it has one. Struct and union members are `fieldDecl` nodes of the same shape, with bit-field widths in place of initializers.
+
+- **Declaration specifiers.** `declSpecs` holds a `specifier` leaf per keyword, typedef name or builtin type name, and nodes for the struct, union, enum, `typeof`, `_Atomic(T)` and `_BitInt(N)` specifiers. A typedef name counts as a type specifier only when no other has been seen, so in `T T;` the second `T` is the declarator.
+- **Declarators.** A `declarator` node's token is the declared identifier (none for an abstract declarator). Its children follow the source: a `pointerType` leaf per `*`, each followed by `specifier` leaves for its qualifiers; the nested `declarator` of a parenthesized declarator; then an `arrayType` (child: the size expression) or `functionType` (child: the `paramList`) node per suffix. Sem derives the type: at each level the pointers apply first, then the suffixes from right to left, then the nested declarator, so `int (*tab[2])(int)` is an array of two pointers to functions.
+- **Type names** (casts, `sizeof`, compound literals, `_Generic`, `typeof`) are `typeName` nodes: `declSpecs` and an optional abstract `declarator`.
 
 #### Parsing strategy
 

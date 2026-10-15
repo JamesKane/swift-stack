@@ -33,6 +33,13 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
     case typeofUnqualType = 27
     case atomicType = 28
 
+    // Declaration specifiers & declarators (64..68, 01-frontend.md §4.6)
+    case declSpecs = 64
+    case specifier = 65
+    case declarator = 66
+    case typeName = 67
+    case bitIntType = 68
+
     // Statements (20..24, 29, 40..48)
     case compoundStmt = 20
     case returnStmt = 21
@@ -112,6 +119,11 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
         case .typeofType: return "typeofType"
         case .typeofUnqualType: return "typeofUnqualType"
         case .atomicType: return "atomicType"
+        case .declSpecs: return "declSpecs"
+        case .specifier: return "specifier"
+        case .declarator: return "declarator"
+        case .typeName: return "typeName"
+        case .bitIntType: return "bitIntType"
         case .compoundStmt: return "compoundStmt"
         case .returnStmt: return "returnStmt"
         case .ifStmt: return "ifStmt"

@@ -20,12 +20,31 @@ public enum CTypeKind: Sendable, Equatable {
 public struct StructField: Sendable, Equatable {
     public let name: String
     public let type: QualType
+    /// Byte offset of the member, or of the storage unit holding a bit-field.
     public let offset: UInt32
+    /// Width of a bit-field (nil for an ordinary member) and its first bit within the storage unit at `offset`.
+    public let bitWidth: Int?
+    public let bitOffset: Int
 
-    public init(name: String, type: QualType, offset: UInt32) {
+    public init(name: String, type: QualType, offset: UInt32, bitWidth: Int? = nil, bitOffset: Int = 0) {
         self.name = name
         self.type = type
         self.offset = offset
+        self.bitWidth = bitWidth
+        self.bitOffset = bitOffset
+    }
+}
+
+/// A member of a struct or union being laid out: an ordinary member, or a bit-field with its width.
+public struct StructMemberDecl: Sendable {
+    public let name: String
+    public let type: QualType
+    public let bitWidth: Int?
+
+    public init(name: String, type: QualType, bitWidth: Int? = nil) {
+        self.name = name
+        self.type = type
+        self.bitWidth = bitWidth
     }
 }
 
@@ -60,8 +79,11 @@ public final class TypePool {
     private var pointerCache: [QualType: TypeId] = [:]
     /// Keyed by name and underlying type: a block-scope typedef may reuse an outer name for another type.
     private var typedefCache: [String: TypeId] = [:]
-    private var structCache: [String: TypeId] = [:]
-    private var enumCache: [String: TypeId] = [:]
+    /// Integer types beyond the reserved slots (`unsigned __int128`, `_BitInt(N)`), keyed by width and signedness.
+    private var integerCache: [Int: TypeId] = [:]
+    /// Struct, union and enum types declared but not (yet) defined. Tags are scoped by the semantic analyzer, so
+    /// every declaration that introduces a tag creates a distinct type here.
+    private var incompleteTags: Set<TypeId> = []
 
     public init() {
         setupReservedSlots()
@@ -219,6 +241,7 @@ public final class TypePool {
         if l == .longdouble || r == .longdouble { return .longdouble }
         if l == .double || r == .double { return .double }
         if l == .float || r == .float { return .float }
+        if isFloating(type: l) || isFloating(type: r) { return isFloating(type: l) ? l : r }  // `_Float16`, `__bf16`
 
         // Both operands undergo integer promotions
         let pL = promote(type: l)
@@ -272,75 +295,138 @@ public final class TypePool {
         return id
     }
 
-    /// Creates or retrieves a struct / union type with System V AMD64 ABI layout.
-    public func structType(name: String, fields: [(name: String, type: QualType)], isUnion: Bool) -> TypeId {
-        if !name.isEmpty, let existing = structCache[name] {
-            if fields.isEmpty {
-                return existing
-            }
-            if case .struct(_, let existingFields, _) = typeInfo(of: existing).kind, !existingFields.isEmpty {
-                return existing
-            }
+    /// An integer type of `width` bits (C23 `_BitInt(N)`, `__int128`): sized as Clang does for x86-64 System V
+    /// (`_BitInt(N)` takes the smallest of 1, 2, 4 or 8 bytes that holds it, then whole 8-byte words).
+    public func integerType(width: Int, isSigned: Bool) -> TypeId {
+        let key = width << 1 | (isSigned ? 1 : 0)
+        if let existing = integerCache[key] { return existing }
+        let size: Int, align: Int
+        switch width {
+        case ...8: (size, align) = (1, 1)
+        case ...16: (size, align) = (2, 2)
+        case ...32: (size, align) = (4, 4)
+        case ...64: (size, align) = (8, 8)
+        default: (size, align) = ((width + 63) / 64 * 8, 8)
         }
-
-        var structFields: [StructField] = []
-        var currentOffset: UInt32 = 0
-        var maxAlign: Int = 1
-        var maxSize: Int = 0
-
-        for f in fields {
-            let fSize = size(of: f.type.typeId)
-            let fAlign = max(1, alignment(of: f.type.typeId))
-            maxAlign = max(maxAlign, fAlign)
-
-            if isUnion {
-                structFields.append(StructField(name: f.name, type: f.type, offset: 0))
-                maxSize = max(maxSize, fSize)
-            } else {
-                // Pad current offset to fAlign
-                let pad = (UInt32(fAlign) - (currentOffset % UInt32(fAlign))) % UInt32(fAlign)
-                currentOffset += pad
-                structFields.append(StructField(name: f.name, type: f.type, offset: currentOffset))
-                currentOffset += UInt32(fSize)
-            }
-        }
-
-        let totalSize: Int
-        if isUnion {
-            let pad = (maxAlign - (maxSize % maxAlign)) % maxAlign
-            totalSize = maxSize + pad
-        } else {
-            let pad = (maxAlign - (Int(currentOffset) % maxAlign)) % maxAlign
-            totalSize = Int(currentOffset) + pad
-        }
-
-        if !name.isEmpty, let existing = structCache[name] {
-            let idx = Int(existing.rawIndex)
-            types[idx] = CTypeInfo(kind: .struct(name: name, fields: structFields, isUnion: isUnion), size: totalSize, alignment: maxAlign, canonical: existing)
-            return existing
-        }
-
         let id = TypeId(UInt32(types.count))
-        types.append(CTypeInfo(kind: .struct(name: name, fields: structFields, isUnion: isUnion), size: totalSize, alignment: maxAlign, canonical: id))
-        if !name.isEmpty {
-            structCache[name] = id
-        }
+        types.append(CTypeInfo(kind: .int(width: width, isSigned: isSigned), size: size, alignment: align, canonical: id))
+        integerCache[key] = id
         return id
     }
 
-    public func enumType(name: String, underlyingType: TypeId = .int, cases: [(name: String, value: Int64)]) -> TypeId {
-        if !name.isEmpty, let existing = enumCache[name] {
-            return existing
-        }
-        let sz = size(of: underlyingType)
-        let al = alignment(of: underlyingType)
-        let enumCases = cases.map { EnumCase(name: $0.name, value: $0.value) }
+    /// `__int128` / `unsigned __int128`: 16 bytes, 16-byte aligned (unlike `_BitInt(128)`).
+    public func int128Type(isSigned: Bool) -> TypeId {
+        if isSigned { return .int128 }
+        let key = -1
+        if let existing = integerCache[key] { return existing }
         let id = TypeId(UInt32(types.count))
-        types.append(CTypeInfo(kind: .enum(name: name, underlying: underlyingType, cases: enumCases), size: sz, alignment: al, canonical: id))
-        if !name.isEmpty {
-            enumCache[name] = id
-        }
+        types.append(CTypeInfo(kind: .int(width: 128, isSigned: false), size: 16, alignment: 16, canonical: id))
+        integerCache[key] = id
         return id
+    }
+
+    /// Declares a new, incomplete struct or union type (C23 6.7.2.3).
+    public func declareStruct(name: String, isUnion: Bool) -> TypeId {
+        let id = TypeId(UInt32(types.count))
+        types.append(CTypeInfo(kind: .struct(name: name, fields: [], isUnion: isUnion), size: 0, alignment: 1, canonical: id))
+        incompleteTags.insert(id)
+        return id
+    }
+
+    /// Creates a complete struct or union type.
+    public func structType(name: String, fields: [StructMemberDecl], isUnion: Bool, isPacked: Bool = false) -> TypeId {
+        let id = declareStruct(name: name, isUnion: isUnion)
+        completeStruct(id, fields: fields, isPacked: isPacked)
+        return id
+    }
+
+    /// Defines the members of a declared struct or union, laid out per the x86-64 System V psABI (the AArch64 and
+    /// RISC-V psABIs share these rules): members at their alignment; a bit-field shares the storage unit of its
+    /// declared type with the bits before it unless it would cross that unit's boundary; a zero-width bit-field ends
+    /// the unit; unnamed bit-fields do not affect the alignment. `packed` aligns every member at 1 and lets
+    /// bit-fields straddle units.
+    public func completeStruct(_ id: TypeId, fields: [StructMemberDecl], isPacked: Bool = false) {
+        guard case .struct(let name, _, let isUnion) = typeInfo(of: id).kind else { return }
+        var structFields: [StructField] = []
+        var bitOffset = 0  // next free bit (struct), or the widest member in bits (union)
+        var maxAlign = 1
+
+        for f in fields {
+            let fSize = size(of: f.type.typeId)
+            let fAlign = isPacked ? 1 : max(1, alignment(of: f.type.typeId))
+            if let width = f.bitWidth {
+                let unitBits = max(8, fSize * 8)
+                if !f.name.isEmpty { maxAlign = max(maxAlign, fAlign) }
+                if isUnion {
+                    structFields.append(StructField(name: f.name, type: f.type, offset: 0, bitWidth: width))
+                    bitOffset = max(bitOffset, width)
+                    continue
+                }
+                if width == 0 {
+                    bitOffset = (bitOffset + unitBits - 1) / unitBits * unitBits
+                    continue
+                }
+                if !isPacked && bitOffset / unitBits != (bitOffset + width - 1) / unitBits {
+                    bitOffset = (bitOffset + fAlign * 8 - 1) / (fAlign * 8) * (fAlign * 8)
+                }
+                let unitStart = isPacked ? bitOffset / 8 : bitOffset / unitBits * fSize
+                structFields.append(StructField(name: f.name, type: f.type, offset: UInt32(unitStart), bitWidth: width,
+                                                bitOffset: bitOffset - unitStart * 8))
+                bitOffset += width
+            } else {
+                maxAlign = max(maxAlign, fAlign)
+                if isUnion {
+                    structFields.append(StructField(name: f.name, type: f.type, offset: 0))
+                    bitOffset = max(bitOffset, fSize * 8)
+                } else {
+                    let byteOffset = ((bitOffset + 7) / 8 + fAlign - 1) / fAlign * fAlign
+                    structFields.append(StructField(name: f.name, type: f.type, offset: UInt32(byteOffset)))
+                    bitOffset = (byteOffset + fSize) * 8
+                }
+            }
+        }
+
+        let bytes = (bitOffset + 7) / 8
+        let totalSize = (bytes + maxAlign - 1) / maxAlign * maxAlign
+        types[Int(id.rawIndex)] = CTypeInfo(kind: .struct(name: name, fields: structFields, isUnion: isUnion), size: totalSize,
+                                           alignment: maxAlign, canonical: id)
+        incompleteTags.remove(id)
+    }
+
+    /// Declares a new enumeration type; it is incomplete until defined, unless its underlying type is fixed.
+    public func declareEnum(name: String, underlyingType: TypeId = .uint, isComplete: Bool = false) -> TypeId {
+        let id = TypeId(UInt32(types.count))
+        types.append(CTypeInfo(kind: .enum(name: name, underlying: underlyingType, cases: []), size: size(of: underlyingType),
+                               alignment: alignment(of: underlyingType), canonical: id))
+        if !isComplete { incompleteTags.insert(id) }
+        return id
+    }
+
+    /// Defines the enumeration constants and underlying type of a declared enumeration.
+    public func completeEnum(_ id: TypeId, underlyingType: TypeId, cases: [(name: String, value: Int64)]) {
+        guard case .enum(let name, _, _) = typeInfo(of: id).kind else { return }
+        let enumCases = cases.map { EnumCase(name: $0.name, value: $0.value) }
+        types[Int(id.rawIndex)] = CTypeInfo(kind: .enum(name: name, underlying: underlyingType, cases: enumCases),
+                                           size: size(of: underlyingType), alignment: alignment(of: underlyingType), canonical: id)
+        incompleteTags.remove(id)
+    }
+
+    public func enumType(name: String, underlyingType: TypeId = .uint, cases: [(name: String, value: Int64)]) -> TypeId {
+        let id = declareEnum(name: name, underlyingType: underlyingType)
+        completeEnum(id, underlyingType: underlyingType, cases: cases)
+        return id
+    }
+
+    /// Whether objects of the type can be defined (C23 6.2.5p1): not `void`, nor a struct, union or enumeration
+    /// that is only declared, nor an array of such elements.
+    public func isComplete(_ id: TypeId) -> Bool {
+        let can = canonical(of: id)
+        switch typeInfo(of: can).kind {
+        case .void: return false
+        case .struct, .enum: return !incompleteTags.contains(can)
+        case .array(let element, _): return isComplete(element.typeId)
+        default: return true
+        }
     }
 
     public func typedefType(name: String, underlying: QualType) -> TypeId {

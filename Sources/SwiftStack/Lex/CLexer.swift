@@ -57,6 +57,28 @@ public struct CLexer: ~Copyable {
         tokenBuffer.ends.setCount(UInt32(count))
     }
 
+    /// Advances `cursor` past the body and closing `quote` of a character constant or string literal whose
+    /// opening quote has been consumed. Returns false if the literal is unterminated on its line.
+    @inline(__always)
+    static func scanQuotedBody(_ cursor: inout UnsafePointer<UInt8>, end: UnsafePointer<UInt8>, quote: UInt8) -> Bool {
+        var escaped = false
+        while cursor < end {
+            let c = cursor.pointee
+            if escaped {
+                escaped = false
+            } else if c == 0x5C /* '\\' */ {
+                escaped = true
+            } else if c == quote {
+                cursor += 1
+                return true
+            } else if c == 0x0A || c == 0x0D {
+                return false
+            }
+            cursor += 1
+        }
+        return false
+    }
+
     /// Inner C lexing loop marked @_noAllocation (Principle 8).
     @_noAllocation
     public static func lexInnerLoop(
@@ -201,6 +223,19 @@ public struct CLexer: ~Copyable {
                 }
                 let len = cursor - tokenStart
                 tokenKind = matchCKeyword(ptr: tokenStart, length: len)
+                // Encoding prefix of a character constant or string literal (C23 6.4.4.5, 6.4.5): `L'x'`,
+                // `u"s"`, `U'x'`, `u8"s"`, `u8'x'`
+                if tokenKind == 1 && cursor < end && (cursor.pointee == 0x22 || cursor.pointee == 0x27) &&
+                   ((len == 1 && (b == 0x4C || b == 0x75 || b == 0x55)) || (len == 2 && b == 0x75 && tokenStart[1] == 0x38)) {
+                    let quote = cursor.pointee
+                    cursor += 1
+                    if scanQuotedBody(&cursor, end: end, quote: quote) {
+                        tokenKind = quote == 0x22 ? 5 : 4 // stringLiteral / charLiteral
+                    } else {
+                        tokenFlag |= flagHasError
+                        tokenKind = 255 // errorToken
+                    }
+                }
 
             case .digit:
                 cursor += 1
@@ -265,64 +300,13 @@ public struct CLexer: ~Copyable {
                 }
                 tokenKind = isFloat ? 3 : 2
 
-            case .quote:
+            case .quote, .singleQuote:
                 cursor += 1
-                var escaped = false
-                var closed = false
-                while cursor < end {
-                    let c = cursor.pointee
-                    if escaped {
-                        escaped = false
-                        cursor += 1
-                    } else if c == 0x5C /* '\\' */ {
-                        escaped = true
-                        cursor += 1
-                    } else if c == 0x22 /* '"' */ {
-                        cursor += 1
-                        closed = true
-                        break
-                    } else if c == 0x0A || c == 0x0D {
-                        tokenFlag |= flagHasError
-                        break
-                    } else {
-                        cursor += 1
-                    }
-                }
-                if !closed {
+                if scanQuotedBody(&cursor, end: end, quote: b) {
+                    tokenKind = b == 0x22 ? 5 : 4 // stringLiteral / charLiteral
+                } else {
                     tokenFlag |= flagHasError
                     tokenKind = 255 // errorToken
-                } else {
-                    tokenKind = 5 // stringLiteral
-                }
-
-            case .singleQuote:
-                cursor += 1
-                var escaped = false
-                var closed = false
-                while cursor < end {
-                    let c = cursor.pointee
-                    if escaped {
-                        escaped = false
-                        cursor += 1
-                    } else if c == 0x5C {
-                        escaped = true
-                        cursor += 1
-                    } else if c == 0x27 {
-                        cursor += 1
-                        closed = true
-                        break
-                    } else if c == 0x0A || c == 0x0D {
-                        tokenFlag |= flagHasError
-                        break
-                    } else {
-                        cursor += 1
-                    }
-                }
-                if !closed {
-                    tokenFlag |= flagHasError
-                    tokenKind = 255 // errorToken
-                } else {
-                    tokenKind = 4 // charLiteral
                 }
 
             case .lParen:
@@ -594,6 +578,7 @@ public struct CLexer: ~Copyable {
             if ptr[0] == 0x5F && ptr[1] == 0x4E && ptr[2] == 0x75 && ptr[3] == 0x6C && ptr[4] == 0x6C && ptr[5] == 0x61 && ptr[6] == 0x62 && ptr[7] == 0x6C && ptr[8] == 0x65 { return 30 } // _Nullable
             if ptr[0] == 0x63 && ptr[1] == 0x6F && ptr[2] == 0x6E && ptr[3] == 0x73 && ptr[4] == 0x74 && ptr[5] == 0x65 && ptr[6] == 0x78 && ptr[7] == 0x70 && ptr[8] == 0x72 { return 48 } // constexpr
             if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x63 && ptr[3] == 0x6F && ptr[4] == 0x6E && ptr[5] == 0x73 && ptr[6] == 0x74 && ptr[7] == 0x5F && ptr[8] == 0x5F { return 14 } // __const__
+            if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x61 && ptr[3] == 0x6C && ptr[4] == 0x69 && ptr[5] == 0x67 && ptr[6] == 0x6E && ptr[7] == 0x6F && ptr[8] == 0x66 { return 45 } // __alignof
         case 10:
             if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x69 && ptr[3] == 0x6E && ptr[4] == 0x6C && ptr[5] == 0x69 && ptr[6] == 0x6E && ptr[7] == 0x65 && ptr[8] == 0x5F && ptr[9] == 0x5F { return 26 } // __inline__
             if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x72 && ptr[3] == 0x65 && ptr[4] == 0x73 && ptr[5] == 0x74 && ptr[6] == 0x72 && ptr[7] == 0x69 && ptr[8] == 0x63 && ptr[9] == 0x74 { return 30 } // __restrict

@@ -1,0 +1,2 @@
+#line abc
+int x;

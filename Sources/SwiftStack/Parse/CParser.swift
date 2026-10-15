@@ -11,9 +11,13 @@ public struct CParser: ~Copyable {
     private var cursor: Int = 1
     private var parseTree: ParseTree
 
-    // Scoped ordinary-identifier namespace for C disambiguation (`T * x` vs `x * y`): each scope maps a
-    // name to whether it is a typedef name there, so an inner variable named `T` hides an outer typedef `T`.
-    private var typedefScopes: [[String: Bool]] = []
+    // Scoped ordinary-identifier namespace for C disambiguation (`T * x` vs `x * y`): each name maps to its
+    // bindings, innermost last, recording whether it is a typedef name in that scope, so an inner variable
+    // named `T` hides an outer typedef `T`. `scopeNames` lists the names bound in each open scope.
+    private var nameBindings: [String: [(depth: Int, isTypedef: Bool)]] = [:]
+    private var scopeNames: [[String]] = [[]]
+    /// The source file of the last token whose bytes were read (consecutive tokens share a file).
+    private let fileCache = FileCache()
     // Struct/union member names live in their own namespace and never hide typedef names.
     private var memberDeclarationDepth: Int = 0
 
@@ -42,44 +46,49 @@ public struct CParser: ~Copyable {
         self.parseTree = ParseTree()
 
         // `__builtin_va_list` is the only typedef name the compiler itself provides (used by <stdarg.h>)
-        var globals: [String: Bool] = ["__builtin_va_list": true]
-        for name in predeclaredTypedefs { globals[name] = true }
-        self.typedefScopes = [globals]
+        bind("__builtin_va_list", isTypedef: true)
+        for name in predeclaredTypedefs { bind(name, isTypedef: true) }
     }
 
     // MARK: - Scopes
 
     private mutating func pushScope() {
-        typedefScopes.append([:])
+        scopeNames.append([])
     }
 
     private mutating func popScope() {
-        if typedefScopes.count > 1 {
-            typedefScopes.removeLast()
+        guard scopeNames.count > 1 else { return }
+        for name in scopeNames.removeLast() {
+            nameBindings[name]?.removeLast()
+            if nameBindings[name]?.isEmpty == true { nameBindings[name] = nil }
+        }
+    }
+
+    private mutating func bind(_ name: String, isTypedef: Bool) {
+        let depth = scopeNames.count
+        if let last = nameBindings[name]?.last, last.depth == depth {
+            nameBindings[name]![nameBindings[name]!.count - 1].isTypedef = isTypedef
+        } else {
+            nameBindings[name, default: []].append((depth, isTypedef))
+            scopeNames[depth - 1].append(name)
         }
     }
 
     private mutating func registerTypedef(_ name: String) {
-        if !typedefScopes.isEmpty {
-            typedefScopes[typedefScopes.count - 1][name] = true
-        }
+        bind(name, isTypedef: true)
     }
 
     /// Records an ordinary identifier (variable, parameter) declared in the current scope.
     private mutating func registerOrdinaryName(_ tok: TokenId) {
-        guard memberDeclarationDepth == 0, !typedefScopes.isEmpty,
-              tok.isValid, CTokenKind(rawValue: tokens.pointee.kind(of: tok)) == .identifier else { return }
+        guard memberDeclarationDepth == 0, tok.isValid, CTokenKind(rawValue: tokens.pointee.kind(of: tok)) == .identifier else { return }
         let name = tokenSpelling(of: tok)
         if isTypedefName(name) {
-            typedefScopes[typedefScopes.count - 1][name] = false
+            bind(name, isTypedef: false)
         }
     }
 
     private func isTypedefName(_ name: String) -> Bool {
-        for scope in typedefScopes.reversed() {
-            if let isTypedef = scope[name] { return isTypedef }
-        }
-        return false
+        nameBindings[name]?.last?.isTypedef ?? false
     }
 
     // MARK: - Token Inspection
@@ -137,21 +146,51 @@ public struct CParser: ~Copyable {
     }
 
     public func tokenSpelling(of id: TokenId) -> String {
-        guard id.isValid else { return "" }
-        let s = tokens.pointee.start(of: id)
-        let e = tokens.pointee.end(of: id)
-        let len = Int(e.rawValue - s.rawValue)
-        guard len >= 0 else { return "" }
+        String(decoding: tokenBytes(of: id), as: UTF8.self)
+    }
 
+    final class FileCache {
+        var start: UInt32 = 1
+        var end: UInt32 = 0
+        var base: UnsafePointer<UInt8>? = nil
+    }
+
+    /// The source bytes of a token, without allocating.
+    private func tokenBytes(of id: TokenId) -> UnsafeBufferPointer<UInt8> {
+        guard id.isValid else { return UnsafeBufferPointer(start: nil, count: 0) }
+        let s = tokens.pointee.start(of: id).rawValue
+        let e = tokens.pointee.end(of: id).rawValue
+        guard e >= s else { return UnsafeBufferPointer(start: nil, count: 0) }
+        let len = Int(e - s)
+        if s >= fileCache.start && e <= fileCache.end, let base = fileCache.base {
+            return UnsafeBufferPointer(start: base + Int(s - fileCache.start), count: len)
+        }
         if let sm = sourceManager {
-            if let (file, off) = sm.file(containing: s) {
-                guard let base = file.buffer.baseAddress, Int(off) + len <= file.length else { return "" }
-                return String(decoding: UnsafeBufferPointer(start: base + Int(off), count: len), as: UTF8.self)
+            if let (file, off) = sm.file(containing: SourceLocation(s)) {
+                guard let base = file.buffer.baseAddress, Int(off) + len <= file.length else { return UnsafeBufferPointer(start: nil, count: 0) }
+                fileCache.start = s - off
+                fileCache.end = fileCache.start + UInt32(file.length)
+                fileCache.base = UnsafePointer(base)
+                return UnsafeBufferPointer(start: base + Int(off), count: len)
             }
         }
-        let sRaw = Int(s.rawValue)
-        guard sRaw >= 0, sRaw + len <= sourceLength else { return "" }
-        return String(decoding: UnsafeBufferPointer(start: sourceBuffer + sRaw, count: len), as: UTF8.self)
+        guard Int(s) + len <= sourceLength else { return UnsafeBufferPointer(start: nil, count: 0) }
+        return UnsafeBufferPointer(start: sourceBuffer + Int(s), count: len)
+    }
+
+    /// Whether a token is spelled `word`, without allocating.
+    private func token(_ id: TokenId, is word: StaticString) -> Bool {
+        let bytes = tokenBytes(of: id)
+        guard bytes.count == word.utf8CodeUnitCount, let p = bytes.baseAddress else { return false }
+        return memcmp(p, word.utf8Start, bytes.count) == 0
+    }
+
+    /// Whether an identifier token is reserved (starts with `_`) or `asm`: the GNU keywords and builtin type
+    /// names this parser recognizes all are, so other identifiers skip those comparisons.
+    private func isReservedOrAsm(_ id: TokenId) -> Bool {
+        let bytes = tokenBytes(of: id)
+        guard let first = bytes.first else { return false }
+        return first == UInt8(ascii: "_") || (bytes.count == 3 && first == UInt8(ascii: "a"))
     }
 
     // MARK: - Public Entry Point
@@ -168,12 +207,9 @@ public struct CParser: ~Copyable {
             }
 
             // Skip top-level extension attributes / keywords
-            if currentKind == .identifier {
-                let sp = tokenSpelling(of: currentTokenId)
-                if sp == "__extension__" {
-                    advance()
-                    continue
-                }
+            if currentKind == .identifier && token(currentTokenId, is: "__extension__") {
+                advance()
+                continue
             }
 
             let prevCursor = cursor
@@ -200,11 +236,11 @@ public struct CParser: ~Copyable {
     // MARK: - Attributes & Modifiers
 
     /// Consumes attributes: C23 `[[...]]`, `alignas(...)`, GNU `__attribute__((...))`, `__declspec(...)`, `__asm__("...")`.
-    private mutating func parseAttributes() {
+    /// Each becomes an `attributeSpec` node unless `emit` is false (attributes of a statement, which has one node).
+    private mutating func parseAttributes(emit: Bool = true) {
         while !isAtEnd {
             if currentKind == .lBracket && peekKind() == .lBracket {
                 // C23 [[attribute]]
-                let start = parseTree.count
                 let anchor = advance() // [
                 advance() // [
                 var depth = 2
@@ -216,59 +252,19 @@ public struct CParser: ~Copyable {
                     }
                     advance()
                 }
-                let subSize = parseTree.count - start + 1
-                parseTree.append(kind: .attributeSpec, token: anchor, subtreeSize: subSize)
+                if emit { parseTree.appendLeaf(kind: .attributeSpec, token: anchor) }
             } else if currentKind == .kwAlignas {
                 let anchor = advance()
-                if currentKind == .lParen {
-                    advance()
-                    var depth = 1
-                    while !isAtEnd && depth > 0 {
-                        if currentKind == .lParen { depth += 1 }
-                        else if currentKind == .rParen {
-                            depth -= 1
-                            if depth == 0 { advance(); break }
-                        }
-                        advance()
-                    }
-                }
-                parseTree.appendLeaf(kind: .attributeSpec, token: anchor)
-            } else if currentKind == .identifier {
-                let sp = tokenSpelling(of: currentTokenId)
-                if sp == "__attribute__" || sp == "__attribute" || sp == "__declspec" {
-                    let start = parseTree.count
+                skipBalancedParens()
+                if emit { parseTree.appendLeaf(kind: .attributeSpec, token: anchor) }
+            } else if currentKind == .identifier && isReservedOrAsm(currentTokenId) {
+                let tok = currentTokenId
+                if token(tok, is: "__attribute__") || token(tok, is: "__attribute") || token(tok, is: "__declspec") ||
+                   token(tok, is: "__asm__") || token(tok, is: "__asm") || token(tok, is: "asm") {
                     let anchor = advance()
-                    if currentKind == .lParen {
-                        advance()
-                        var depth = 1
-                        while !isAtEnd && depth > 0 {
-                            if currentKind == .lParen { depth += 1 }
-                            else if currentKind == .rParen {
-                                depth -= 1
-                                if depth == 0 { advance(); break }
-                            }
-                            advance()
-                        }
-                    }
-                    let subSize = parseTree.count - start + 1
-                    parseTree.append(kind: .attributeSpec, token: anchor, subtreeSize: subSize)
-                } else if sp == "__asm__" || sp == "__asm" || sp == "asm" {
-                    let anchor = advance()
-                    if currentKind == .lParen {
-                        advance()
-                        var depth = 1
-                        while !isAtEnd && depth > 0 {
-                            if currentKind == .lParen { depth += 1 }
-                            else if currentKind == .rParen {
-                                depth -= 1
-                                if depth == 0 { advance(); break }
-                            }
-                            advance()
-                        }
-                    }
-                    parseTree.appendLeaf(kind: .attributeSpec, token: anchor)
-                } else if sp == "__extension__" || sp == "__inline" || sp == "__inline__" ||
-                          sp == "__restrict" || sp == "__restrict__" || sp == "_Noreturn" {
+                    skipBalancedParens()
+                    if emit { parseTree.appendLeaf(kind: .attributeSpec, token: anchor) }
+                } else if token(tok, is: "__extension__") || token(tok, is: "_Noreturn") {
                     advance()
                 } else {
                     break
@@ -279,13 +275,42 @@ public struct CParser: ~Copyable {
         }
     }
 
+    /// Skips a parenthesized group `( ... )` if one starts at the cursor.
+    private mutating func skipBalancedParens() {
+        guard currentKind == .lParen else { return }
+        advance()
+        var depth = 1
+        while !isAtEnd && depth > 0 {
+            if currentKind == .lParen { depth += 1 }
+            else if currentKind == .rParen {
+                depth -= 1
+                if depth == 0 { advance(); break }
+            }
+            advance()
+        }
+    }
+
+    private func isAttributeStart() -> Bool {
+        switch currentKind {
+        case .lBracket: return peekKind() == .lBracket
+        case .kwAlignas: return true
+        case .identifier:
+            let tok = currentTokenId
+            guard isReservedOrAsm(tok) else { return false }
+            return token(tok, is: "__attribute__") || token(tok, is: "__attribute") || token(tok, is: "__declspec") ||
+                token(tok, is: "__asm__") || token(tok, is: "__asm") || token(tok, is: "asm") || token(tok, is: "__extension__") ||
+                token(tok, is: "_Noreturn")
+        default: return false
+        }
+    }
+
     // MARK: - Declarations
 
     private func isBuiltinExtendedTypeName(_ sp: String) -> Bool {
         switch sp {
-        case "__builtin_va_list", "__gnuc_va_list",
+        case "__builtin_va_list", "__gnuc_va_list", "__auto_type",
              "__int128", "__int128_t", "__uint128_t",
-             "__float128", "__float80", "__ibm128",
+             "__float128", "__float80", "__ibm128", "__bf16",
              "_Float16", "_Float32", "_Float32x", "_Float64", "_Float64x", "_Float128",
              "_Decimal32", "_Decimal64", "_Decimal128",
              "_Complex", "__complex__", "__complex", "_Imaginary":
@@ -295,20 +320,22 @@ public struct CParser: ~Copyable {
         }
     }
 
-    private mutating func isTypeStart() -> Bool {
-        switch currentKind {
+    /// Whether the token `offset` tokens ahead can begin declaration specifiers (C23 6.7).
+    private func isTypeStart(offset: Int = 0) -> Bool {
+        switch peekKind(offset: offset) {
         case .kwVoid, .kwChar, .kwShort, .kwInt, .kwLong, .kwFloat, .kwDouble,
              .kwSigned, .kwUnsigned, .kwBool, .kwAtomic, .kwStruct, .kwUnion, .kwEnum,
-             .kwTypeof, .kwTypeofUnqual, .kwNullptr,
-             .kwConst, .kwVolatile, .kwRestrict, .kwAlignas,
+             .kwTypeof, .kwTypeofUnqual,
+             .kwConst, .kwVolatile, .kwRestrict, .kwAlignas, .kwTypedef,
              .kwStatic, .kwExtern, .kwAuto, .kwRegister, .kwThreadLocal, .kwConstexpr, .kwInline:
             return true
-        case .kwTypedef:
-            return true
         case .identifier:
-            let sp = tokenSpelling(of: currentTokenId)
-            return isTypedefName(sp) || sp == "_BitInt" || sp == "__typeof__" || sp == "__typeof" ||
-                   isBuiltinExtendedTypeName(sp)
+            let idx = cursor + offset
+            guard idx < tokens.pointee.count else { return false }
+            let tok = TokenId(UInt32(idx))
+            let sp = tokenSpelling(of: tok)
+            if isTypedefName(sp) { return true }
+            return isReservedOrAsm(tok) && (sp == "_BitInt" || sp == "__typeof__" || sp == "__typeof" || isBuiltinExtendedTypeName(sp))
         default:
             return false
         }
@@ -317,16 +344,10 @@ public struct CParser: ~Copyable {
     private mutating func parseExternalDeclaration() -> NodeId {
         parseAttributes()
         guard !isAtEnd else { return .nilId }
-
         if currentKind == .kwStaticAssert {
             return parseStaticAssert()
         }
-
-        if currentKind == .kwTypedef {
-            return parseTypedefDeclaration()
-        }
-
-        return parseDeclarationOrFunction()
+        return parseDeclaration(allowFunctionDefinition: true)
     }
 
     private mutating func parseStaticAssert() -> NodeId {
@@ -345,116 +366,13 @@ public struct CParser: ~Copyable {
         return parseTree.append(kind: .staticAssertDecl, token: anchor, subtreeSize: subSize)
     }
 
-    private mutating func parseTypedefDeclaration() -> NodeId {
-        let start = parseTree.count
-        let anchor = advance() // typedef
-        parseAttributes()
-        _ = parseType()
-        parseAttributes()
-
-        var lastNameTok = anchor
-        var isFirstDeclarator = true
-
-        // Parse declarators. The first declarator's `*` and `[N]` wrap the type node (as for variables); each
-        // further declarator (`typedef struct X *A, *B;`) becomes a `fieldDecl` child named by its token.
-        while !isAtEnd && currentKind != .semicolon {
-            let prevCursor = cursor
-            let declStart = parseTree.count
-            parseAttributes()
-            while currentKind == .star || isQualifierOrStorage(currentKind) {
-                if currentKind == .star {
-                    let star = advance()
-                    if isFirstDeclarator {
-                        let subSize = parseTree.count - start + 1
-                        parseTree.append(kind: .pointerType, token: star, subtreeSize: subSize)
-                    } else {
-                        parseTree.appendLeaf(kind: .pointerType, token: star)
-                    }
-                } else {
-                    advance()
-                }
-                parseAttributes()
-            }
-            var declNameTok: TokenId = .nilId
-            if currentKind == .lParen {
-                // Function pointer or parenthesized declarator: `typedef void (*name)(int)`
-                advance()
-                parseAttributes()
-                while currentKind == .star || isQualifierOrStorage(currentKind) {
-                    advance()
-                    parseAttributes()
-                }
-                if currentKind == .identifier {
-                    let nameTok = advance()
-                    let name = tokenSpelling(of: nameTok)
-                    registerTypedef(name)
-                    declNameTok = nameTok
-                }
-                var pDepth = 1
-                while !isAtEnd && pDepth > 0 {
-                    if currentKind == .lParen { pDepth += 1 }
-                    else if currentKind == .rParen {
-                        pDepth -= 1
-                        if pDepth == 0 { advance(); break }
-                    }
-                    advance()
-                }
-            } else if currentKind == .identifier {
-                let nameTok = advance()
-                let name = tokenSpelling(of: nameTok)
-                registerTypedef(name)
-                declNameTok = nameTok
-            }
-            parseAttributes()
-            // Array suffixes are modeled; function suffixes are skipped (sema marks the type unmodeled)
-            while currentKind == .lBracket || currentKind == .lParen {
-                if currentKind == .lBracket {
-                    let lBrk = advance()
-                    if currentKind != .rBracket { _ = parseExpression() }
-                    expect(.rBracket)
-                    if isFirstDeclarator {
-                        parseTree.append(kind: .arrayType, token: lBrk, subtreeSize: parseTree.count - start + 1)
-                    } else {
-                        parseTree.append(kind: .arrayType, token: lBrk, subtreeSize: parseTree.count - declStart + 1)
-                    }
-                } else {
-                    advance()
-                    var depth = 1
-                    while !isAtEnd && depth > 0 {
-                        if currentKind == .lBracket || currentKind == .lParen { depth += 1 }
-                        else if currentKind == .rBracket || currentKind == .rParen {
-                            depth -= 1
-                            if depth == 0 { advance(); break }
-                        }
-                        advance()
-                    }
-                }
-                parseAttributes()
-            }
-            if declNameTok.isValid {
-                if isFirstDeclarator {
-                    lastNameTok = declNameTok
-                } else {
-                    parseTree.append(kind: .fieldDecl, token: declNameTok, subtreeSize: parseTree.count - declStart + 1)
-                }
-            }
-            isFirstDeclarator = false
-            if currentKind == .comma {
-                advance()
-            } else if cursor == prevCursor {
-                advance()
-            } else {
-                break
-            }
-        }
-        expect(.semicolon)
-
-        let subSize = parseTree.count - start + 1
-        return parseTree.append(kind: .typedefDecl, token: lastNameTok, subtreeSize: subSize)
-    }
-
-    /// Parses a declaration (variable, struct/union/enum tag, or function definition).
-    private mutating func parseDeclarationOrFunction() -> NodeId {
+    /// Parses a declaration (C23 6.7) or, at file scope, a function definition (6.9.1).
+    ///
+    /// Tree shape: `varDecl`/`typedefDecl` (token: first declarator's name) with children `declSpecs`, then each
+    /// `declarator` followed by its initializer, if any. A definition is a `functionDecl` with children `declSpecs`,
+    /// `declarator`, and the body's `compoundStmt`. A declaration without declarators (`struct S { ... };`) is a
+    /// `varDecl` whose token is the `;`.
+    private mutating func parseDeclaration(allowFunctionDefinition: Bool = false) -> NodeId {
         let start = parseTree.count
         parseAttributes()
 
@@ -466,13 +384,8 @@ public struct CParser: ~Copyable {
         if currentKind == .kwStaticAssert {
             return parseStaticAssert()
         }
-        if currentKind == .kwTypedef {
-            return parseTypedefDeclaration()
-        }
-
-        // Parse declaration specifiers (storage class, qualifiers, type)
         guard isTypeStart() else { return .nilId }
-        _ = parseType()
+        let isTypedef = parseDeclarationSpecifiers()
 
         // Tag declarations without declarators: `struct Foo { ... };` or `enum E { ... };`
         if currentKind == .semicolon {
@@ -481,388 +394,250 @@ public struct CParser: ~Copyable {
             return parseTree.append(kind: .varDecl, token: semi, subtreeSize: subSize)
         }
 
-        // Anonymous bitfield `int : 0;`
-        if currentKind == .colon {
-            let colonTok = advance()
-            _ = parseAssignmentExpression()
-            expect(.semicolon)
-            let subSize = parseTree.count - start + 1
-            return parseTree.append(kind: .varDecl, token: colonTok, subtreeSize: subSize)
-        }
-
-        parseAttributes()
-
-        // Parse pointers and qualifiers if any: `* const restrict`
-        while currentKind == .star || isQualifierOrStorage(currentKind) {
-            if currentKind == .star {
-                let star = advance()
-                parseAttributes()
-                let subSize = parseTree.count - start + 1
-                parseTree.append(kind: .pointerType, token: star, subtreeSize: subSize)
+        var firstName: TokenId = .nilId
+        var isFirst = true
+        while true {
+            let prevCursor = cursor
+            let d = parseDeclarator(.named)
+            if isTypedef {
+                if d.name.isValid { registerTypedef(tokenSpelling(of: d.name)) }
             } else {
-                advance()
-                parseAttributes()
+                registerOrdinaryName(d.name)
             }
-        }
-
-        var nameTok: TokenId = currentTokenId
-        if currentKind == .identifier { registerOrdinaryName(nameTok) }
-        var hasParenDeclarator = false
-        var hasInnerParamList = false
-        if currentKind == .lParen {
-            hasParenDeclarator = true
-            // Function pointer declarator: `void (*fn)(int)`, `int (*fn(int))(int)`, or `void (*(*x)(void*))(void)`
-            var outerParens = 0
-            while currentKind == .lParen || currentKind == .star || isQualifierOrStorage(currentKind) {
-                if currentKind == .lParen {
-                    outerParens += 1
-                    advance()
-                } else if currentKind == .star {
-                    let star = advance()
-                    let subSize = parseTree.count - start + 1
-                    parseTree.append(kind: .pointerType, token: star, subtreeSize: subSize)
-                } else {
-                    advance()
-                }
-                parseAttributes()
-            }
-            if currentKind == .identifier {
-                nameTok = advance()
-            }
+            if isFirst { firstName = d.name }
             parseAttributes()
-            if outerParens == 1 && currentKind == .lParen {
-                hasInnerParamList = true
-                advance()
-                _ = parseParameterList()
-                expect(.rParen)
-                parseAttributes()
-            }
-            var pDepth = outerParens
-            while !isAtEnd && pDepth > 0 {
-                if currentKind == .lParen { pDepth += 1 }
-                else if currentKind == .rParen {
-                    pDepth -= 1
-                    if pDepth == 0 { advance(); break }
-                }
-                advance()
-            }
-            // Consume parameter list(s) following `(*fn)`
-            while currentKind == .lParen || currentKind == .lBracket {
-                advance()
-                var depth = 1
-                while !isAtEnd && depth > 0 {
-                    if currentKind == .lParen || currentKind == .lBracket { depth += 1 }
-                    else if currentKind == .rParen || currentKind == .rBracket {
-                        depth -= 1
-                        if depth == 0 { advance(); break }
-                    }
-                    advance()
-                }
-                parseAttributes()
-            }
-        } else if currentKind == .identifier {
-            nameTok = advance()
-        } else {
-            return .nilId
-        }
-        parseAttributes()
-
-        if hasParenDeclarator && (hasInnerParamList || currentKind == .lBrace) {
-            if currentKind == .lBrace {
+            if isFirst && allowFunctionDefinition && !isTypedef && d.shape == .function && currentKind == .lBrace {
+                // The parameters are in scope in the body, hiding typedef names they reuse
+                pushScope()
+                for p in d.params { registerOrdinaryName(p) }
                 _ = parseCompoundStatement()
+                popScope()
                 let subSize = parseTree.count - start + 1
-                return parseTree.append(kind: .functionDecl, token: nameTok, subtreeSize: subSize)
-            } else if hasInnerParamList && currentKind == .semicolon {
-                advance()
-                let subSize = parseTree.count - start + 1
-                return parseTree.append(kind: .functionDecl, token: nameTok, subtreeSize: subSize)
+                return parseTree.append(kind: .functionDecl, token: d.name, subtreeSize: subSize)
             }
-        }
-
-        // Function definition or declaration
-        if currentKind == .lParen {
-            advance()
-            _ = parseParameterList()
-            expect(.rParen)
-            parseAttributes()
-
-            if currentKind == .lBrace {
-                // Function definition with body
-                _ = parseCompoundStatement()
-                let subSize = parseTree.count - start + 1
-                return parseTree.append(kind: .functionDecl, token: nameTok, subtreeSize: subSize)
-            } else {
-                // Function prototype declaration
-                expect(.semicolon)
-                let subSize = parseTree.count - start + 1
-                return parseTree.append(kind: .functionDecl, token: nameTok, subtreeSize: subSize)
-            }
-        }
-
-        // Variable or array declaration
-        while currentKind == .lBracket {
-            let lBrk = advance()
-            while isQualifierOrStorage(currentKind) { advance() }
-            if currentKind != .rBracket {
-                _ = parseExpression()
-            }
-            expect(.rBracket)
-            let subSize = parseTree.count - start + 1
-            parseTree.append(kind: .arrayType, token: lBrk, subtreeSize: subSize)
-        }
-        parseAttributes()
-
-        // Bitfield width: `: expr`
-        if currentKind == .colon {
-            advance()
-            _ = parseAssignmentExpression()
-        }
-
-        // Initializer: `=`
-        if currentKind == .equal {
-            advance()
-            _ = parseInitializer()
-        }
-
-        // Additional declarators in the same statement: `int a, b = 2;` or `Expr *pE, sEAlt;`
-        while currentKind == .comma {
-            advance()
-            let extraStart = parseTree.count
-            var extraNameTok: TokenId = .nilId
-            parseAttributes()
-            while currentKind == .star || isQualifierOrStorage(currentKind) {
-                if currentKind == .star {
-                    let star = advance()
-                    parseTree.appendLeaf(kind: .pointerType, token: star)
-                } else {
-                    advance()
-                }
-                parseAttributes()
-            }
-            if currentKind == .lParen {
-                let lPar = advance()
-                parseTree.appendLeaf(kind: .pointerType, token: lPar)
-                var depth = 1
-                while !isAtEnd && depth > 0 {
-                    if currentKind == .lParen { depth += 1 }
-                    else if currentKind == .rParen {
-                        depth -= 1
-                        if depth == 0 { advance(); break }
-                    }
-                    if currentKind == .identifier && extraNameTok.isNil {
-                        extraNameTok = currentTokenId
-                    }
-                    advance()
-                }
-                while currentKind == .lParen || currentKind == .lBracket {
-                    advance()
-                    var d2 = 1
-                    while !isAtEnd && d2 > 0 {
-                        if currentKind == .lParen || currentKind == .lBracket { d2 += 1 }
-                        else if currentKind == .rParen || currentKind == .rBracket {
-                            d2 -= 1
-                            if d2 == 0 { advance(); break }
-                        }
-                        advance()
-                    }
-                }
-            } else if currentKind == .identifier {
-                extraNameTok = advance()
-                registerOrdinaryName(extraNameTok)
-                while currentKind == .lBracket {
-                    let arrStart = parseTree.count
-                    let lBrk = advance()
-                    while isQualifierOrStorage(currentKind) { advance() }
-                    if currentKind != .rBracket { _ = parseExpression() }
-                    expect(.rBracket)
-                    let arrSize = parseTree.count - arrStart + 1
-                    parseTree.append(kind: .arrayType, token: lBrk, subtreeSize: arrSize)
-                }
-            }
-            parseAttributes()
-            if currentKind == .colon {
-                advance()
-                _ = parseAssignmentExpression()
-            }
+            isFirst = false
             if currentKind == .equal {
                 advance()
                 _ = parseInitializer()
             }
-            if extraNameTok.isValid {
-                let extraSize = parseTree.count - extraStart + 1
-                parseTree.append(kind: .fieldDecl, token: extraNameTok, subtreeSize: extraSize)
+            if currentKind == .comma && cursor != prevCursor {
+                advance()
+                continue
             }
+            break
         }
-
         expect(.semicolon)
         let subSize = parseTree.count - start + 1
-        return parseTree.append(kind: .varDecl, token: nameTok, subtreeSize: subSize)
+        return parseTree.append(kind: isTypedef ? .typedefDecl : .varDecl, token: firstName, subtreeSize: subSize)
     }
 
-    // MARK: - Types
-
-    /// Parses type specifiers, qualifiers, and tags.
+    /// Parses declaration specifiers (C23 6.7.1-6.7.5) into a `declSpecs` node: a `specifier` leaf per keyword,
+    /// typedef name or builtin type name; nodes for struct/union/enum, `typeof`, `_Atomic(T)` and `_BitInt(N)`
+    /// specifiers; and attribute nodes. Returns whether `typedef` was among them.
     @discardableResult
-    private mutating func parseType() -> NodeId {
+    private mutating func parseDeclarationSpecifiers() -> Bool {
         let start = parseTree.count
-        var anchorTok = currentTokenId
-
-        var hasStorage = false
-        var lastStorageTok = currentTokenId
-        // Consume leading qualifiers / storage specifiers: `const`, `static`, `inline`, `auto`, etc.
-        while isQualifierOrStorage(currentKind) {
-            hasStorage = true
-            lastStorageTok = advance()
-            if lastStorageTok != .nilId && tokens.pointee.kind(of: lastStorageTok) == CTokenKind.kwAtomic.rawValue && currentKind == .lParen {
-                // _Atomic(type)
-                advance()
-                _ = parseType()
-                while currentKind == .star { advance() }
-                expect(.rParen)
-                let subSize = parseTree.count - start + 1
-                return parseTree.append(kind: .typeSpec, token: lastStorageTok, subtreeSize: subSize)
-            }
-            parseAttributes()
-        }
-
-        // C23 auto type inference: if storage/qualifier was seen and no type specifier follows
-        if hasStorage && !isTypeStart() {
-            let subSize = parseTree.count - start + 1
-            return parseTree.append(kind: .typeSpec, token: lastStorageTok, subtreeSize: subSize)
-        }
-
-        switch currentKind {
-        case .kwStruct, .kwUnion:
-            let isUnion = (currentKind == .kwUnion)
-            anchorTok = advance()
-            parseAttributes()
-
-            // Optional tag name
-            if currentKind == .identifier {
-                anchorTok = advance()
-                parseAttributes()
-            }
-
-            // Member specification `{ ... }`
-            if currentKind == .lBrace {
-                advance()
-                memberDeclarationDepth += 1
-                defer { memberDeclarationDepth -= 1 }
-                while !isAtEnd && currentKind != .rBrace {
-                    let prevCursor = cursor
-                    parseAttributes()
-                    if currentKind == .rBrace { break }
-                    if isTypeStart() {
-                        _ = parseDeclarationOrFunction()
-                    } else if currentKind == .kwStaticAssert {
-                        _ = parseStaticAssert()
-                    } else if currentKind == .semicolon {
-                        advance()
-                    } else {
-                        // Not a member declaration: record the syntax error instead of skipping the token
-                        parseTree.appendLeaf(kind: .errorNode, token: advance(), hasError: true)
-                    }
-                    if cursor == prevCursor && !isAtEnd {
-                        parseTree.appendLeaf(kind: .errorNode, token: advance(), hasError: true)
-                    }
+        let anchor = currentTokenId
+        var sawTypeSpecifier = false
+        var isTypedef = false
+        loop: while !isAtEnd {
+            switch currentKind {
+            case .kwTypedef:
+                isTypedef = true
+                parseTree.appendLeaf(kind: .specifier, token: advance())
+            case .kwConst, .kwVolatile, .kwRestrict, .kwStatic, .kwExtern, .kwAuto, .kwRegister, .kwThreadLocal,
+                 .kwConstexpr, .kwInline:
+                parseTree.appendLeaf(kind: .specifier, token: advance())
+            case .kwAtomic:
+                if peekKind() == .lParen {
+                    // `_Atomic ( type-name )` is a type specifier; plain `_Atomic` is a qualifier
+                    let aStart = parseTree.count
+                    let anchorTok = advance()
+                    advance()
+                    _ = parseTypeName()
+                    expect(.rParen)
+                    parseTree.append(kind: .atomicType, token: anchorTok, subtreeSize: parseTree.count - aStart + 1)
+                    sawTypeSpecifier = true
+                } else {
+                    parseTree.appendLeaf(kind: .specifier, token: advance())
                 }
-                expect(.rBrace)
+            case .kwVoid, .kwChar, .kwShort, .kwInt, .kwLong, .kwFloat, .kwDouble, .kwSigned, .kwUnsigned, .kwBool:
+                parseTree.appendLeaf(kind: .specifier, token: advance())
+                sawTypeSpecifier = true
+            case .kwStruct, .kwUnion:
+                _ = parseStructOrUnionSpecifier()
+                sawTypeSpecifier = true
+            case .kwEnum:
+                _ = parseEnumSpecifier()
+                sawTypeSpecifier = true
+            case .kwTypeof, .kwTypeofUnqual:
+                _ = parseTypeofSpecifier(isUnqual: currentKind == .kwTypeofUnqual)
+                sawTypeSpecifier = true
+            case .kwAlignas, .lBracket:
+                guard isAttributeStart() else { break loop }
                 parseAttributes()
+            case .identifier:
+                let sp = tokenSpelling(of: currentTokenId)
+                if sp == "__typeof__" || sp == "__typeof" {
+                    _ = parseTypeofSpecifier(isUnqual: false)
+                    sawTypeSpecifier = true
+                } else if sp == "_BitInt" {
+                    let bStart = parseTree.count
+                    let anchorTok = advance()
+                    expect(.lParen)
+                    _ = parseAssignmentExpression()
+                    expect(.rParen)
+                    parseTree.append(kind: .bitIntType, token: anchorTok, subtreeSize: parseTree.count - bStart + 1)
+                    sawTypeSpecifier = true
+                } else if isBuiltinExtendedTypeName(sp) || (!sawTypeSpecifier && isTypedefName(sp)) {
+                    // A typedef name is a type specifier only if no other one has been seen: in `T T;` or
+                    // `unsigned T;` the second name is the declarator's identifier
+                    parseTree.appendLeaf(kind: .specifier, token: advance())
+                    sawTypeSpecifier = true
+                } else if isAttributeStart() {
+                    parseAttributes()
+                } else {
+                    break loop
+                }
+            default:
+                break loop
             }
-            let subSize = parseTree.count - start + 1
-            return parseTree.append(kind: isUnion ? .unionType : .structType, token: anchorTok, subtreeSize: subSize)
+        }
+        if parseTree.count == start {
+            parseTree.appendLeaf(kind: .errorNode, token: currentTokenId, hasError: true)
+        }
+        parseTree.append(kind: .declSpecs, token: anchor, subtreeSize: parseTree.count - start + 1)
+        return isTypedef
+    }
 
-        case .kwEnum:
+    /// `struct`/`union` specifier (C23 6.7.2.1). Members are `fieldDecl` nodes; the node's token is the tag name
+    /// (or the keyword for an anonymous type).
+    private mutating func parseStructOrUnionSpecifier() -> NodeId {
+        let start = parseTree.count
+        let isUnion = (currentKind == .kwUnion)
+        var anchorTok = advance()
+        parseAttributes()
+        if currentKind == .identifier {
             anchorTok = advance()
             parseAttributes()
-            if currentKind == .identifier {
-                anchorTok = advance()
+        }
+        if currentKind == .lBrace {
+            advance()
+            memberDeclarationDepth += 1
+            defer { memberDeclarationDepth -= 1 }
+            while !isAtEnd && currentKind != .rBrace {
+                let prevCursor = cursor
+                parseAttributes()
+                if currentKind == .rBrace { break }
+                if currentKind == .kwStaticAssert {
+                    _ = parseStaticAssert()
+                } else if currentKind == .semicolon {
+                    advance()
+                } else if isTypeStart() {
+                    _ = parseMemberDeclaration()
+                } else {
+                    // Not a member declaration: record the syntax error instead of skipping the token
+                    parseTree.appendLeaf(kind: .errorNode, token: advance(), hasError: true)
+                }
+                if cursor == prevCursor && !isAtEnd {
+                    parseTree.appendLeaf(kind: .errorNode, token: advance(), hasError: true)
+                }
+            }
+            expect(.rBrace)
+            parseAttributes()
+        }
+        let subSize = parseTree.count - start + 1
+        return parseTree.append(kind: isUnion ? .unionType : .structType, token: anchorTok, subtreeSize: subSize)
+    }
+
+    /// A member declaration (C23 6.7.2.1): `fieldDecl` with children `declSpecs`, then each `declarator`
+    /// followed by its bit-field width, if any. An unnamed bit-field has an empty declarator whose token is the `:`.
+    private mutating func parseMemberDeclaration() -> NodeId {
+        let start = parseTree.count
+        parseDeclarationSpecifiers()
+        var firstName = currentTokenId
+        var isFirst = true
+        while currentKind != .semicolon {
+            let prevCursor = cursor
+            var name: TokenId
+            if currentKind == .colon {
+                name = currentTokenId
+                parseTree.appendLeaf(kind: .declarator, token: name)
+            } else {
+                name = parseDeclarator(.named).name
                 parseAttributes()
             }
-            // C23 underlying type specification: `enum E : unsigned char`
             if currentKind == .colon {
                 advance()
-                _ = parseType()
-            }
-            if currentKind == .lBrace {
-                advance()
-                while !isAtEnd && currentKind != .rBrace {
-                    let prevCursor = cursor
-                    if currentKind == .identifier {
-                        let enumStart = parseTree.count
-                        let enumName = advance()
-                        parseAttributes()
-                        if currentKind == .equal {
-                            advance()
-                            _ = parseAssignmentExpression()
-                        }
-                        let enumSub = parseTree.count - enumStart + 1
-                        parseTree.append(kind: .enumeratorDecl, token: enumName, subtreeSize: enumSub)
-                    }
-                    if currentKind == .comma {
-                        advance()
-                    } else if cursor == prevCursor && !isAtEnd && currentKind != .rBrace {
-                        parseTree.appendLeaf(kind: .errorNode, token: advance(), hasError: true)
-                    } else {
-                        break
-                    }
-                }
-                expect(.rBrace)
+                _ = parseConditionalExpression()
                 parseAttributes()
             }
-            let subSize = parseTree.count - start + 1
-            return parseTree.append(kind: .enumType, token: anchorTok, subtreeSize: subSize)
-
-        case .kwTypeof, .kwTypeofUnqual:
-            let isUnqual = (currentKind == .kwTypeofUnqual)
-            anchorTok = advance()
-            expect(.lParen)
-            if isTypeStart() {
-                _ = parseTypeNameInParens()
-            } else {
-                _ = parseExpression()
-            }
-            expect(.rParen)
-            let subSize = parseTree.count - start + 1
-            return parseTree.append(kind: isUnqual ? .typeofUnqualType : .typeofType, token: anchorTok, subtreeSize: subSize)
-
-        case .kwVoid, .kwChar, .kwShort, .kwInt, .kwLong, .kwFloat, .kwDouble,
-             .kwSigned, .kwUnsigned, .kwBool, .kwNullptr:
-            anchorTok = advance()
-            // Consume multiple specifiers: `unsigned long long`, `signed char`, `double _Complex`, etc.
-            while isPrimitiveTypeSpecifier(currentKind) || isQualifierOrStorage(currentKind) ||
-                  (currentKind == .identifier && isBuiltinExtendedTypeName(tokenSpelling(of: currentTokenId))) {
-                advance()
-            }
-            let subSize = parseTree.count - start + 1
-            return parseTree.append(kind: .typeSpec, token: anchorTok, subtreeSize: subSize)
-
-        case .identifier:
-            let sp = tokenSpelling(of: currentTokenId)
-            if sp == "_BitInt" {
-                anchorTok = advance()
-                if currentKind == .lParen {
-                    advance()
-                    _ = parseExpression()
-                    expect(.rParen)
-                }
-                let subSize = parseTree.count - start + 1
-                return parseTree.append(kind: .typeSpec, token: anchorTok, subtreeSize: subSize)
-            } else if isTypedefName(sp) || isBuiltinExtendedTypeName(sp) {
-                anchorTok = advance()
-                while isQualifierOrStorage(currentKind) || isPrimitiveTypeSpecifier(currentKind) ||
-                      (currentKind == .identifier && isBuiltinExtendedTypeName(tokenSpelling(of: currentTokenId))) {
-                    advance()
-                }
-                let subSize = parseTree.count - start + 1
-                return parseTree.append(kind: .typeSpec, token: anchorTok, subtreeSize: subSize)
-            } else {
-                return parseTree.appendLeaf(kind: .errorNode, token: currentTokenId, hasError: true)
-            }
-
-        default:
-            return parseTree.appendLeaf(kind: .errorNode, token: currentTokenId, hasError: true)
+            if isFirst { firstName = name }
+            isFirst = false
+            guard currentKind == .comma, cursor != prevCursor else { break }
+            advance()
         }
+        expect(.semicolon)
+        return parseTree.append(kind: .fieldDecl, token: firstName, subtreeSize: parseTree.count - start + 1)
+    }
+
+    /// `enum` specifier (C23 6.7.2.2): children are the fixed underlying type's `declSpecs` (if any) and the
+    /// `enumeratorDecl` nodes. `enum E : T` is a fixed underlying type unless the `:` starts a bit-field width.
+    private mutating func parseEnumSpecifier() -> NodeId {
+        let start = parseTree.count
+        var anchorTok = advance()
+        parseAttributes()
+        if currentKind == .identifier {
+            anchorTok = advance()
+            parseAttributes()
+        }
+        if currentKind == .colon && isTypeStart(offset: 1) {
+            advance()
+            parseDeclarationSpecifiers()
+        }
+        if currentKind == .lBrace {
+            advance()
+            while !isAtEnd && currentKind != .rBrace {
+                let prevCursor = cursor
+                if currentKind == .identifier {
+                    let enumStart = parseTree.count
+                    let enumName = advance()
+                    parseAttributes()
+                    if currentKind == .equal {
+                        advance()
+                        _ = parseConditionalExpression()
+                    }
+                    let enumSub = parseTree.count - enumStart + 1
+                    parseTree.append(kind: .enumeratorDecl, token: enumName, subtreeSize: enumSub)
+                }
+                if currentKind == .comma {
+                    advance()
+                } else if cursor == prevCursor && !isAtEnd && currentKind != .rBrace {
+                    parseTree.appendLeaf(kind: .errorNode, token: advance(), hasError: true)
+                } else {
+                    break
+                }
+            }
+            expect(.rBrace)
+            parseAttributes()
+        }
+        let subSize = parseTree.count - start + 1
+        return parseTree.append(kind: .enumType, token: anchorTok, subtreeSize: subSize)
+    }
+
+    /// `typeof ( expression )` / `typeof ( type-name )` (C23 6.7.2.5), also GNU `__typeof__`.
+    private mutating func parseTypeofSpecifier(isUnqual: Bool) -> NodeId {
+        let start = parseTree.count
+        let anchorTok = advance()
+        expect(.lParen)
+        if isTypeStart() {
+            _ = parseTypeName()
+        } else {
+            _ = parseExpression()
+        }
+        expect(.rParen)
+        let subSize = parseTree.count - start + 1
+        return parseTree.append(kind: isUnqual ? .typeofUnqualType : .typeofType, token: anchorTok, subtreeSize: subSize)
     }
 
     private func isQualifierOrStorage(_ kind: CTokenKind) -> Bool {
@@ -875,96 +650,158 @@ public struct CParser: ~Copyable {
         }
     }
 
-    private func isPrimitiveTypeSpecifier(_ kind: CTokenKind) -> Bool {
-        switch kind {
-        case .kwVoid, .kwChar, .kwShort, .kwInt, .kwLong, .kwFloat, .kwDouble,
-             .kwSigned, .kwUnsigned, .kwBool:
-            return true
-        default:
+    private func isTypeQualifier(_ kind: CTokenKind) -> Bool {
+        kind == .kwConst || kind == .kwVolatile || kind == .kwRestrict || kind == .kwAtomic
+    }
+
+    // MARK: - Declarators
+
+    enum DeclaratorMode {
+        /// A declarator in a declaration: it declares an identifier.
+        case named
+        /// An abstract declarator, in a type name (C23 6.7.8).
+        case abstract
+        /// A parameter declarator, which may be either.
+        case either
+    }
+
+    /// What a declarator makes its identifier: decides whether `{` may follow as a function body.
+    enum DeclaratorShape {
+        case plain, pointer, array, function
+    }
+
+    /// Parses a declarator (C23 6.7.7) into a `declarator` node whose token is the declared identifier (`nilId` if
+    /// abstract). Its children, in source order: a `pointerType` leaf per `*`, each followed by `specifier` leaves for
+    /// its qualifiers; the nested `declarator` of a parenthesized one; then an `arrayType` (child: the size
+    /// expression) or `functionType` (child: the `paramList`) node per suffix. Semantic analysis derives the type.
+    /// Returns the identifier, the declarator's shape, and the parameter names of the function suffix that makes
+    /// the identifier a function, if any.
+    private mutating func parseDeclarator(_ mode: DeclaratorMode) -> (name: TokenId, shape: DeclaratorShape, params: [TokenId]) {
+        let start = parseTree.count
+        guard currentDepth < maxDepth else {
+            parseTree.appendLeaf(kind: .errorNode, token: currentTokenId, hasError: true)
+            return (.nilId, .plain, [])
+        }
+        currentDepth += 1
+        defer { currentDepth -= 1 }
+
+        parseAttributes()
+        var hasPointer = false
+        while currentKind == .star {
+            parseTree.appendLeaf(kind: .pointerType, token: advance())
+            hasPointer = true
+            while isTypeQualifier(currentKind) || isAttributeStart() {
+                if isTypeQualifier(currentKind) {
+                    parseTree.appendLeaf(kind: .specifier, token: advance())
+                } else {
+                    parseAttributes()
+                }
+            }
+        }
+
+        var name: TokenId = .nilId
+        var inner: (shape: DeclaratorShape, params: [TokenId]) = (.plain, [])
+        if currentKind == .identifier && mode != .abstract && !isAttributeStart() {
+            name = advance()
+        } else if currentKind == .lParen && (mode == .named || startsNestedDeclarator()) {
+            advance()
+            let nested = parseDeclarator(mode)
+            expect(.rParen)
+            name = nested.name
+            inner = (nested.shape, nested.params)
+        } else if mode == .named {
+            // A declarator must declare an identifier
+            parseTree.appendLeaf(kind: .errorNode, token: currentTokenId, hasError: true)
+        }
+        parseAttributes()
+
+        var firstSuffix: DeclaratorShape? = nil
+        var firstParams: [TokenId] = []
+        while (currentKind == .lBracket && peekKind() != .lBracket) || currentKind == .lParen {
+            let suffixStart = parseTree.count
+            if currentKind == .lBracket {
+                let lBrk = advance()
+                // `[static N]`, `[const N]`, `[*]` (C23 6.7.7.3)
+                while isQualifierOrStorage(currentKind) {
+                    parseTree.appendLeaf(kind: .specifier, token: advance())
+                }
+                if currentKind == .star && peekKind() == .rBracket {
+                    advance()
+                } else if currentKind != .rBracket {
+                    _ = parseAssignmentExpression()
+                }
+                expect(.rBracket)
+                parseTree.append(kind: .arrayType, token: lBrk, subtreeSize: parseTree.count - suffixStart + 1)
+                if firstSuffix == nil { firstSuffix = .array }
+            } else {
+                let lPar = advance()
+                let names = parseParameterList()
+                expect(.rParen)
+                parseTree.append(kind: .functionType, token: lPar, subtreeSize: parseTree.count - suffixStart + 1)
+                if firstSuffix == nil {
+                    firstSuffix = .function
+                    firstParams = names
+                }
+            }
+            parseAttributes()
+        }
+
+        let shape: (DeclaratorShape, [TokenId])
+        if inner.shape != .plain {
+            shape = inner
+        } else if let s = firstSuffix {
+            shape = (s, firstParams)
+        } else {
+            shape = (hasPointer ? .pointer : .plain, [])
+        }
+        parseTree.append(kind: .declarator, token: name, subtreeSize: parseTree.count - start + 1)
+        return (name, shape.0, shape.1)
+    }
+
+    /// In an abstract or parameter declarator, whether `(` opens a nested declarator (`(*)`, `(*name)`) rather
+    /// than a parameter list (`()`, `(int)`, `(T x)`).
+    private func startsNestedDeclarator() -> Bool {
+        switch peekKind() {
+        case .rParen, .ellipsis:
             return false
+        case .star, .caret, .lParen:
+            return true
+        case .lBracket:
+            return peekKind(offset: 2) != .lBracket
+        case .identifier:
+            let sp = tokenSpelling(of: TokenId(UInt32(cursor + 1)))
+            if sp == "__attribute__" || sp == "__attribute" || sp == "__declspec" { return true }
+            return !isTypeStart(offset: 1)
+        default:
+            return !isTypeStart(offset: 1)
         }
     }
 
-    private mutating func parseParameterList() -> NodeId {
+    /// Parses a parameter type list (C23 6.7.7.4) into a `paramList` node of `paramDecl` nodes (children:
+    /// `declSpecs`, `declarator`), with a `paramDecl` leaf for `...`. Returns the parameter names.
+    private mutating func parseParameterList() -> [TokenId] {
         let start = parseTree.count
-        var paramCount = 0
-
-        if currentKind == .rParen {
-            // f() in C23 means f(void)
-            let subSize = parseTree.count - start + 1
-            return parseTree.append(kind: .paramList, token: currentTokenId, subtreeSize: subSize)
-        }
+        var names: [TokenId] = []
 
         while !isAtEnd && currentKind != .rParen {
             let prevCursor = cursor
             parseAttributes()
             if currentKind == .ellipsis {
-                let elTok = advance()
-                parseTree.appendLeaf(kind: .paramDecl, token: elTok)
-                paramCount += 1
+                parseTree.appendLeaf(kind: .paramDecl, token: advance())
                 break
             }
-
             let pStart = parseTree.count
-            _ = parseType()
-            parseAttributes()
-            while currentKind == .star || isQualifierOrStorage(currentKind) {
-                if currentKind == .star {
-                    let star = advance()
-                    let subSize = parseTree.count - pStart + 1
-                    parseTree.append(kind: .pointerType, token: star, subtreeSize: subSize)
-                } else {
-                    advance()
-                }
-                parseAttributes()
+            let pTok = currentTokenId
+            if isTypeStart() {
+                parseDeclarationSpecifiers()
+            } else {
+                // C23 has no identifier lists or implicit `int`
+                parseTree.appendLeaf(kind: .errorNode, token: pTok, hasError: true)
             }
-            var nameTok = currentTokenId
-            if currentKind == .lParen {
-                // Function pointer parameter: `int (*cmp)(const void *, const void *)`
-                advance()
-                parseAttributes()
-                while currentKind == .star || isQualifierOrStorage(currentKind) {
-                    advance()
-                    parseAttributes()
-                }
-                if currentKind == .identifier {
-                    nameTok = advance()
-                }
-                var pDepth = 1
-                while !isAtEnd && pDepth > 0 {
-                    if currentKind == .lParen { pDepth += 1 }
-                    else if currentKind == .rParen {
-                        pDepth -= 1
-                        if pDepth == 0 { advance(); break }
-                    }
-                    advance()
-                }
-                while currentKind == .lParen || currentKind == .lBracket {
-                    advance()
-                    var depth = 1
-                    while !isAtEnd && depth > 0 {
-                        if currentKind == .lParen || currentKind == .lBracket { depth += 1 }
-                        else if currentKind == .rParen || currentKind == .rBracket {
-                            depth -= 1
-                            if depth == 0 { advance(); break }
-                        }
-                        advance()
-                    }
-                }
-            } else if currentKind == .identifier {
-                nameTok = advance()
-            }
+            let d = parseDeclarator(.either)
             parseAttributes()
-            while currentKind == .lBracket {
-                advance()
-                while isQualifierOrStorage(currentKind) { advance() }
-                if currentKind != .rBracket { _ = parseExpression() }
-                expect(.rBracket)
-            }
-            parseAttributes()
-            let pSize = parseTree.count - pStart + 1
-            parseTree.append(kind: .paramDecl, token: nameTok, subtreeSize: pSize)
-            paramCount += 1
+            names.append(d.name)
+            parseTree.append(kind: .paramDecl, token: d.name.isValid ? d.name : pTok, subtreeSize: parseTree.count - pStart + 1)
 
             if currentKind == .comma {
                 advance()
@@ -976,7 +813,20 @@ public struct CParser: ~Copyable {
         }
 
         let subSize = parseTree.count - start + 1
-        return parseTree.append(kind: .paramList, token: currentTokenId, subtreeSize: subSize)
+        parseTree.append(kind: .paramList, token: currentTokenId, subtreeSize: subSize)
+        return names
+    }
+
+    /// A type name (C23 6.7.8): `typeName` node with children `declSpecs` and, if present, an abstract `declarator`.
+    private mutating func parseTypeName() -> NodeId {
+        let start = parseTree.count
+        let anchor = currentTokenId
+        parseAttributes()
+        parseDeclarationSpecifiers()
+        if currentKind == .star || currentKind == .lParen || (currentKind == .lBracket && peekKind() != .lBracket) || isAttributeStart() {
+            _ = parseDeclarator(.abstract)
+        }
+        return parseTree.append(kind: .typeName, token: anchor, subtreeSize: parseTree.count - start + 1)
     }
 
     // MARK: - Initializers
@@ -1041,6 +891,19 @@ public struct CParser: ~Copyable {
         }
         currentDepth += 1
         defer { currentDepth -= 1 }
+
+        // Attributes of a statement: `[[fallthrough]];`, `__attribute__((fallthrough));`, `[[maybe_unused]] int x;`
+        if (currentKind == .lBracket && peekKind() == .lBracket) || (currentKind == .identifier &&
+            (token(currentTokenId, is: "__attribute__") || token(currentTokenId, is: "__attribute"))) {
+            // An attribute declaration `[[fallthrough]];` is a null statement anchored at its first attribute
+            let attrTok = currentTokenId
+            parseAttributes(emit: false)
+            if currentKind == .semicolon {
+                advance()
+                return parseTree.appendLeaf(kind: .exprStmt, token: attrTok)
+            }
+            return parseStatement()
+        }
 
         switch currentKind {
         case .lBrace:
@@ -1137,7 +1000,7 @@ public struct CParser: ~Copyable {
             if currentKind == .semicolon {
                 advance()
             } else if isTypeStart() {
-                _ = parseDeclarationOrFunction()
+                _ = parseDeclaration()
             } else {
                 _ = parseExpression()
                 expect(.semicolon)
@@ -1184,8 +1047,7 @@ public struct CParser: ~Copyable {
 
         case .identifier:
             // GNU asm statement: `__asm__ [volatile|inline|goto] ( template : outputs : inputs : clobbers ) ;`
-            let sp = tokenSpelling(of: currentTokenId)
-            if sp == "__asm__" || sp == "__asm" || sp == "asm" {
+            if token(currentTokenId, is: "__asm__") || token(currentTokenId, is: "__asm") || token(currentTokenId, is: "asm") {
                 let start = parseTree.count
                 let anchor = advance()
                 while isQualifierOrStorage(currentKind) || currentKind == .kwGoto ||
@@ -1224,7 +1086,7 @@ public struct CParser: ~Copyable {
         default:
             // Declaration or expression statement
             if isTypeStart() {
-                return parseDeclarationOrFunction()
+                return parseDeclaration()
             } else {
                 let start = parseTree.count
                 let anchor = currentTokenId
@@ -1242,12 +1104,12 @@ public struct CParser: ~Copyable {
         pushScope()
 
         while !isAtEnd && currentKind != .rBrace {
-            while currentKind == .identifier && tokenSpelling(of: currentTokenId) == "__extension__" {
+            while currentKind == .identifier && token(currentTokenId, is: "__extension__") {
                 advance()
             }
             if currentKind == .rBrace { break }
             if isTypeStart() {
-                _ = parseDeclarationOrFunction()
+                _ = parseDeclaration()
             } else {
                 _ = parseStatement()
             }
@@ -1326,55 +1188,15 @@ public struct CParser: ~Copyable {
         return left
     }
 
-    private mutating func parseTypeNameInParens() -> NodeId {
-        let typeStart = parseTree.count
-        var lastNode = parseType()
-        parseAttributes()
-        while currentKind == .star || isQualifierOrStorage(currentKind) {
-            if currentKind == .star {
-                let star = advance()
-                let pSub = parseTree.count - typeStart + 1
-                lastNode = parseTree.append(kind: .pointerType, token: star, subtreeSize: pSub)
-            } else {
-                advance()
-            }
-            parseAttributes()
-        }
-        // Abstract function pointer or array declarator in type name: `void (*)(int)` or `int [4]`
-        while currentKind == .lParen || currentKind == .lBracket {
-            if currentKind == .lBracket {
-                let lBrk = advance()
-                if currentKind != .rBracket { _ = parseExpression() }
-                expect(.rBracket)
-                let aSub = parseTree.count - typeStart + 1
-                lastNode = parseTree.append(kind: .arrayType, token: lBrk, subtreeSize: aSub)
-            } else {
-                let lPar = advance()
-                var depth = 1
-                while !isAtEnd && depth > 0 {
-                    if currentKind == .lParen { depth += 1 }
-                    else if currentKind == .rParen {
-                        depth -= 1
-                        if depth == 0 { advance(); break }
-                    }
-                    advance()
-                }
-                let pSub = parseTree.count - typeStart + 1
-                lastNode = parseTree.append(kind: .pointerType, token: lPar, subtreeSize: pSub)
-            }
-        }
-        return lastNode
-    }
-
     private mutating func parseCastOrUnaryExpression() -> NodeId {
-        while currentKind == .identifier && tokenSpelling(of: currentTokenId) == "__extension__" {
+        while currentKind == .identifier && token(currentTokenId, is: "__extension__") {
             advance()
         }
         // Cast expression or compound literal: `(type)expr` or `(type){ ... }`
         if currentKind == .lParen && isTypeSpecifierInParenthesis() {
             let start = parseTree.count
             let lParen = advance()
-            _ = parseTypeNameInParens()
+            _ = parseTypeName()
             expect(.rParen)
             if currentKind == .lBrace {
                 _ = parseInitializer()
@@ -1402,7 +1224,7 @@ public struct CParser: ~Copyable {
             let opTok = advance()
             if currentKind == .lParen && isTypeSpecifierInParenthesis() {
                 advance()
-                _ = parseTypeNameInParens()
+                _ = parseTypeName()
                 expect(.rParen)
             } else {
                 _ = parseCastOrUnaryExpression()
@@ -1414,7 +1236,7 @@ public struct CParser: ~Copyable {
         return parsePostfixExpression()
     }
 
-    private mutating func isTypeSpecifierInParenthesis() -> Bool {
+    private func isTypeSpecifierInParenthesis() -> Bool {
         let next = peekKind(offset: 1)
         switch next {
         case .kwVoid, .kwChar, .kwShort, .kwInt, .kwLong, .kwFloat, .kwDouble,
@@ -1425,7 +1247,9 @@ public struct CParser: ~Copyable {
             let idx = cursor + 1
             guard idx < tokens.pointee.count else { return false }
             let sp = tokenSpelling(of: TokenId(UInt32(idx)))
-            return isTypedefName(sp) || isBuiltinExtendedTypeName(sp) || sp == "_BitInt" || sp == "__typeof__" || sp == "__typeof"
+            // A type name may start with a GNU attribute: `(__attribute__((noinline)) int (*)(void))`
+            return isTypedefName(sp) || isBuiltinExtendedTypeName(sp) || sp == "_BitInt" || sp == "__typeof__" ||
+                   sp == "__typeof" || sp == "__attribute__" || sp == "__attribute"
         default:
             return false
         }
@@ -1482,7 +1306,7 @@ public struct CParser: ~Copyable {
         while !isAtEnd && currentKind != .rParen {
             let prevCursor = cursor
             if isTypeStart() {
-                _ = parseTypeNameInParens()
+                _ = parseTypeName()
             } else {
                 _ = parseAssignmentExpression()
             }
@@ -1502,7 +1326,7 @@ public struct CParser: ~Copyable {
         let tok = currentTokenId
         switch currentKind {
         case .identifier:
-            if tokenSpelling(of: tok) == "_Generic" {
+            if token(tok, is: "_Generic") {
                 let gStart = parseTree.count
                 let gTok = advance()
                 expect(.lParen)
@@ -1516,7 +1340,7 @@ public struct CParser: ~Copyable {
                         expect(.colon)
                         _ = parseAssignmentExpression()
                     } else {
-                        _ = parseTypeNameInParens()
+                        _ = parseTypeName()
                         expect(.colon)
                         _ = parseAssignmentExpression()
                     }

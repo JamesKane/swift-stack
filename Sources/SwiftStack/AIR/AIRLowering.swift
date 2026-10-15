@@ -148,13 +148,15 @@ public struct AIRLowering {
             }
 
         case .varDecl:
+            // Children: `declSpecs`, then each `declarator` followed by its initializer, if any
             let children = tree.pointee.children(of: stmtNode)
-            var initVal: ValueId? = nil
-            if children.count > 1 {
-                initVal = lowerExpression(children[1], airFn: &airFn, currentBlock: &currentBlock)
-            }
-
-            if let sym = semResult.symbolRefs[stmtNode], case .local(let offset) = sym.storage {
+            for (idx, declarator) in children.enumerated() where tree.pointee.kind(of: declarator) == .declarator {
+                var initVal: ValueId? = nil
+                if idx + 1 < children.count, tree.pointee.kind(of: children[idx + 1]) != .declarator,
+                   tree.pointee.kind(of: children[idx + 1]) != .attributeSpec {
+                    initVal = lowerExpression(children[idx + 1], airFn: &airFn, currentBlock: &currentBlock)
+                }
+                guard let sym = semResult.symbolRefs[declarator], case .local(let offset) = sym.storage else { continue }
                 let absOff = UInt32(abs(offset))
                 let ptrVal = ValueId.instResult(airFn.appendInstruction(
                     opcode: .alloca,

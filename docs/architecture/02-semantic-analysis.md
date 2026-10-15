@@ -122,7 +122,7 @@ That is 16 bytes per type across six columns.
 | Area | Features |
 |---|---|
 | Keywords and types | `bool`/`true`/`false`; `nullptr`/`nullptr_t`; `alignas`/`alignof`; `static_assert` (message optional); `thread_local`; `typeof`/`typeof_unqual`; `_Generic`; `auto` type inference (single declarator, C23 rules); enums with fixed underlying type (`enum E : unsigned char`) |
-| Declarations | Unprototyped `f()` means `f(void)`; K&R definitions are removed; improved tag compatibility (redeclaring an identical `struct` in the same scope); empty initializer `{}`; compound literals with storage-class specifiers (`static`, `constexpr`, `register`, `thread_local`); labels before declarations and at the end of compound statements |
+| Declarations | Unprototyped `f()` means `f(void)`; K&R definitions are removed; improved tag compatibility (redeclaring an identical `struct` in the same scope; Clang, the M1 reference, does not implement it yet, so a same-scope redefinition is currently diagnosed as Clang does); empty initializer `{}`; compound literals with storage-class specifiers (`static`, `constexpr`, `register`, `thread_local`); labels before declarations and at the end of compound statements |
 | Integers | Two's complement; `_BitInt(N)` (§4.2.2); checked arithmetic `ckd_add`/`ckd_sub`/`ckd_mul` as builtins |
 | Constants | `constexpr` objects (§4.2.3); `u8` character literals; binary literals; digit separators |
 | Attributes | `[[nodiscard]]`, `[[nodiscard("…")]]`, `[[maybe_unused]]`, `[[deprecated]]`, `[[deprecated("…")]]`, `[[fallthrough]]`, `[[noreturn]]` (and deprecated `[[_Noreturn]]`), `[[reproducible]]`, `[[unsequenced]]`; unknown vendor attributes warn and are ignored; `__has_c_attribute` reports the supported set |
@@ -149,6 +149,7 @@ That is 16 bytes per type across six columns.
   - Arithmetic values must be exactly representable in the target type, with no truncation.
   - Pointers are restricted to null.
   - Any operation with undefined behavior is a diagnostic.
+- **Current implementation.** The M1 evaluator folds integer constant expressions over the parse tree with C's typing: literal types from value, base and suffix (C23 6.4.4.1), the integer promotions and usual arithmetic conversions, conversion by casts, and `sizeof`/`alignof` of any type or expression (typed by the checker). `constexpr` integer objects are named constants. It does not yet cover the other constant-expression forms.
 - **Shared evaluator.** The same evaluator handles integer constant expressions (array bounds, `case` labels, `static_assert`, enumerators, bit-field widths), `_BitInt` constants, and constant initializers of static-storage objects. Results go into a contiguous constant buffer that becomes initialized data in `.rodata`/`.data`.
 
 #### 4.2.4 `typeof` and `typeof_unqual`
@@ -170,6 +171,12 @@ Both are resolved by type-checking the operand without evaluating it, except tha
 - **`_Complex`.** `__STDC_NO_COMPLEX__` is defined to 1.
 - **Decimal floating point** (`_Decimal32/64/128`). Not supported; `__STDC_IEC_60559_DFP__` is not defined.
 - **`<threads.h>`.** A library concern for the C runtime ([08](08-runtime-and-stdlib.md)).
+
+#### 4.2.7 Tags and layout
+
+- **Tag scopes.** Struct, union and enum tags live in the scope stack, not in the TypePool. A definition, or a bare `struct S;`, introduces a new type in the current scope that hides an outer tag; a reference resolves to the innermost visible tag, or declares a new incomplete one. Completing a forward declaration keeps its `TypeId`, so a tentative definition whose type is completed later in the unit is valid (6.9.2).
+- **Layout.** Members are placed by the x86-64 System V rules, which the AArch64 and RISC-V psABIs share for ordinary members and bit-fields. A bit-field shares the storage unit of its declared type with the preceding bits unless it would cross that unit's boundary; a zero-width bit-field closes the unit; unnamed bit-fields do not affect alignment. `__attribute__((packed))` and `__attribute__((mode(...)))` are applied; `aligned` is not yet. `_BitInt(N)` is sized by the x86-64 rules on every target for now (§4.2.2 requires each psABI's).
+- **Enumerations.** Without a fixed underlying type, the enumerated type is compatible with `unsigned int` when no value is negative and with `int` otherwise (64-bit types when a value needs them), as in GCC and Clang. An enumeration constant has type `int` when its value fits.
 
 ### 4.3 Swift type checking
 

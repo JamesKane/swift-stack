@@ -228,45 +228,9 @@ enum CCorpora {
 
 /// Known accept/reject divergences from Clang, each with its cause. The test fails on any other divergence,
 /// and also when a listed one disappears, so the list always matches reality.
-let knownAcceptRejectDivergences: [String: String] = [
-    "a05_bitint.c": "`uwb`/`wb` literal suffixes not lexed",
-    "b03_wb_suffix.c": "`uwb`/`wb` literal suffixes not lexed",
-    "a21_tag_compat.c": "struct redefinition in the same scope not diagnosed",
-    "b24_enum_redef.c": "enumerator redefinition not diagnosed",
-    "r28_neg_array.c": "negative array size not diagnosed",
-    "r29_bitfield_too_wide.c": "bit-field width larger than its type not diagnosed",
-    "b01_attrs_ok.c": "`[[fallthrough]];` parsed as an expression statement",
-    "b11_void_var.c": "file-scope `void` object not diagnosed",
-    "b13_ternary.c": "struct/pointer `?:` operand mismatch not diagnosed when cast to void",
-    "s5.c": "enum fixed underlying type ignored in sizeof",
-    "x3.c": "incomplete struct object not diagnosed",
-    "y11.c": "`_BitInt(N)` size not modeled",
-    "y12.c": "`_BitInt(N)` size not modeled",
-    "z11_bitint_size.c": "`_BitInt(N)` size not modeled",
-    "y1.c": "block-scope struct tag does not shadow the file-scope tag (TypePool caches tags by name)",
-    "y4.c": "integer constant evaluation is untyped (`sizeof(1ull)`)",
-    "y5.c": "integer constant evaluation is untyped (`-1 < 0u`)",
-    "z8_ull.c": "integer constant evaluation is untyped",
-    "y6.c": "`sizeof` of an array expression in constant evaluation",
-    "y7.c": "`sizeof` of an array expression in constant evaluation",
-    "y9.c": "`sizeof` of an array expression in constant evaluation",
-    "z6_array_size.c": "`sizeof` of an array expression in constant evaluation",
-    "z7_ptr_arr.c": "`sizeof` through a parenthesized declarator",
-    "z15_sizeof_complit.c": "`sizeof` of a compound literal in constant evaluation",
-    "z1_bitfield_size.c": "bit-fields are laid out as whole storage units",
-]
+let knownAcceptRejectDivergences: [String: String] = [:]
 
-let knownCTestsuiteDivergences: [String: String] = [
-    "00053.c": "member lookup through an anonymous/nested aggregate",
-    "00089.c": "member lookup on a function-pointer struct member",
-    "00098.c": "parse: unsupported declarator form",
-    "00121.c": "parse: unsupported declarator form",
-    "00152.c": "`#line` directive not implemented",
-    "00162.c": "parse: unsupported declarator form",
-    "00201.c": "macro rescanning: painted-blue / function-like name after expansion",
-    "00210.c": "parse: unsupported declarator form",
-    "00220.c": "parse: unsupported declarator form",
-]
+let knownCTestsuiteDivergences: [String: String] = [:]
 
 @Suite("M1 — C front end accept/reject against Clang")
 struct M1AcceptRejectTests {
