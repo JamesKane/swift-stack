@@ -62,6 +62,28 @@ func main() {
             options.language = .swift
         } else if arg == "--lang=c" {
             options.language = .c
+        } else if arg == "--lang=asm" {
+            options.language = .assembly
+        } else if arg == "-c" {
+            options.compileOnly = true
+        } else if arg.hasPrefix("--arch=") {
+            let a = String(arg.dropFirst("--arch=".count)).lowercased()
+            switch a {
+            case "x86_64", "amd64": options.targetArch = .x86_64
+            case "aarch64", "arm64": options.targetArch = .aarch64
+            case "riscv64", "rv64": options.targetArch = .riscv64
+            default: break
+            }
+        } else if arg == "-target" && i + 1 < args.count {
+            i += 1
+            let triple = args[i].lowercased()
+            if triple.hasPrefix("aarch64") || triple.hasPrefix("arm64") {
+                options.targetArch = .aarch64
+            } else if triple.hasPrefix("riscv64") || triple.hasPrefix("rv64") {
+                options.targetArch = .riscv64
+            } else {
+                options.targetArch = .x86_64
+            }
         } else if arg == "-I" && i + 1 < args.count {
             i += 1
             options.includePaths.append(args[i])

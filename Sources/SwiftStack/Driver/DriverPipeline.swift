@@ -13,12 +13,15 @@ import Musl
 public enum SourceLanguage {
     case swift
     case c
+    case assembly
 }
 
 public struct DriverOptions {
     public var inputFiles: [String] = []
     public var outputBinaryPath: String? = nil
     public var runBinary: Bool = false
+    public var compileOnly: Bool = false
+    public var targetArch: AssemblerArch = .x86_64
     public var dumpStage: String? = nil
     public var showStats: Bool = false
     public var timePhases: Bool = false
@@ -58,7 +61,7 @@ public final class DriverPipeline {
     public private(set) var tokenBuffer: TokenBuffer
     public private(set) var phaseTimings: [PhaseTiming] = []
 
-    // M0.5 Vertical Slice Statistics
+    // M0.5 / M2 Vertical Slice Statistics
     public private(set) var parseTreeNodeCount: Int = 0
     public private(set) var parseTreeCommittedBytes: Int = 0
     public private(set) var parseTreeReservedBytes: Int = 0
@@ -67,6 +70,10 @@ public final class DriverPipeline {
     public private(set) var airReservedBytes: Int = 0
     public private(set) var lirInstructionCount: Int = 0
     public private(set) var encodedFunctions: [EncodedFunction] = []
+    public private(set) var lastObjectSectionCount: Int = 0
+    public private(set) var lastObjectSymbolCount: Int = 0
+    public private(set) var lastObjectRelocCount: Int = 0
+    public private(set) var lastObjectBytesCommitted: Int = 0
     public private(set) var lastOutputSize: Int = 0
 
     public init(options: DriverOptions) {
@@ -82,6 +89,12 @@ public final class DriverPipeline {
         guard !options.inputFiles.isEmpty else {
             FileHandle.standardError.write(Data("Error: no input files provided\n".utf8))
             return 1
+        }
+
+        // Check if primary input is an assembly file (`.s` or `.S` or `--lang=asm`)
+        let firstFile = options.inputFiles[0]
+        if options.language == .assembly || firstFile.hasSuffix(".s") || firstFile.hasSuffix(".S") {
+            return try runAssemblyPipeline(path: firstFile)
         }
 
         var totalBytes = 0
@@ -572,10 +585,99 @@ public final class DriverPipeline {
         if lirInstructionCount > 0 {
             print("LIRFunction:      \(lirInstructionCount) insts  | Committed: \(lirInstructionCount * 28) B | Reserved: \(lirInstructionCount * 28) B (28 B/row SoA vs 32 B/row AoS)")
         }
+        if lastObjectSectionCount > 0 {
+            print("RelocatableObj:   \(lastObjectSectionCount) sections | \(lastObjectSymbolCount) symbols | \(lastObjectRelocCount) relocs | \(lastObjectBytesCommitted) B SoA")
+        }
         if lastOutputSize > 0 {
-            print("Output Binary:    \(lastOutputSize) bytes (ELF64 static executable)")
+            print("Output Binary:    \(lastOutputSize) bytes")
         }
         print("Peak RSS:         \(peakRssKB) KB")
+    }
+
+    private func runAssemblyPipeline(path: String) throws -> Int32 {
+        var diagnostics = DiagnosticBag()
+        let t0 = ss_monotonic_time_ns()
+        let obj = try Assembler.assembleFile(
+            path: path,
+            arch: options.targetArch,
+            includePaths: options.includePaths,
+            defines: options.defines,
+            sourceManager: sourceManager,
+            diagnostics: &diagnostics
+        )
+        let t1 = ss_monotonic_time_ns()
+        let dur = Double(t1 - t0) / 1_000_000_000.0
+        let totalBytes = (try? Data(contentsOf: URL(fileURLWithPath: path)).count) ?? 0
+
+        phaseTimings.append(PhaseTiming(
+            name: "Assembly (\(options.targetArch))",
+            durationSeconds: dur,
+            bytesProcessed: totalBytes,
+            itemsProcessed: Int(obj.sectionCount)
+        ))
+        self.lastObjectSectionCount = Int(obj.sectionCount)
+        self.lastObjectSymbolCount = Int(obj.symbolCount)
+        self.lastObjectRelocCount = Int(obj.relocCount)
+        self.lastObjectBytesCommitted = obj.bytesCommitted
+
+        if diagnostics.errorCount > 0 {
+            let rendered = DiagnosticRenderer.render(diagnostics: diagnostics, sourceManager: sourceManager)
+            FileHandle.standardError.write(Data(rendered.utf8))
+            return 1
+        }
+
+        if options.dumpStage == "asm" || options.dumpStage == "disasm" || options.dumpStage == "code" {
+            dumpRelocatableDisassembly(object: obj)
+            if options.showStats { printStats(totalBytes: totalBytes) }
+            if options.timePhases { printTimePhases() }
+            return 0
+        }
+
+        let outputPath = options.outputBinaryPath ?? "a.o"
+        let elfBytes = ELFObjectWriter.write(obj)
+        try Data(elfBytes).write(to: URL(fileURLWithPath: outputPath))
+        self.lastOutputSize = elfBytes.count
+
+        if options.showStats { printStats(totalBytes: totalBytes) }
+        if options.timePhases { printTimePhases() }
+        return 0
+    }
+
+    public func dumpRelocatableDisassembly(object: borrowing RelocatableObject) {
+        print("=== RelocatableObject Disassembly (\(object.arch), \(object.sectionCount) sections) ===")
+        for sIdx in 0..<object.sectionCount {
+            let handle = SectionIndex(UInt32(sIdx))
+            let name = object.sectionName(handle)
+            let flags = SectionFlags(rawValue: object.sectionFlags[handle])
+            guard flags.contains(.execInstr) else { continue }
+            let bytes = Array(object.sectionData(handle))
+            print("Section \(name) (\(bytes.count) bytes):")
+            switch object.arch {
+            case .x86_64:
+                let disasm = X86Disassembler()
+                var offset = 0
+                while offset < bytes.count {
+                    guard let (inst, len) = try? disasm.disassembleOne(bytes, at: offset), len > 0 else { break }
+                    print(String(format: "  %4x: %@", offset, inst.attString))
+                    offset += len
+                }
+            case .aarch64:
+                var offset = 0
+                while offset + 4 <= bytes.count {
+                    let word = UInt32(bytes[offset])
+                        | (UInt32(bytes[offset + 1]) << 8)
+                        | (UInt32(bytes[offset + 2]) << 16)
+                        | (UInt32(bytes[offset + 3]) << 24)
+                    let text = A64Disassembler.disassemble(word) ?? String(format: ".inst 0x%08x", word)
+                    print(String(format: "  %4x: %@", offset, text))
+                    offset += 4
+                }
+            case .riscv64:
+                for item in RV64Disassembler.disassemble(bytes) {
+                    print(String(format: "  %4x: %@", item.offset, item.text))
+                }
+            }
+        }
     }
 
     public func printTimePhases() {

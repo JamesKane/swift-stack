@@ -33,6 +33,7 @@ public enum DiagCategory: UInt8, Sendable, BitwiseCopyable, CustomStringConverti
     case parse = 3
     case sema = 4
     case codegen = 5
+    case assembler = 6
 
     public var description: String {
         switch self {
@@ -42,6 +43,7 @@ public enum DiagCategory: UInt8, Sendable, BitwiseCopyable, CustomStringConverti
         case .parse: return "parse"
         case .sema: return "sema"
         case .codegen: return "codegen"
+        case .assembler: return "assembler"
         }
     }
 }
@@ -154,6 +156,12 @@ public final class DiagnosticRegistry: @unchecked Sendable {
         // Driver diagnostics
         register(DiagnosticInfo(id: .driverInputFileNotFound, name: "driver.file_not_found", severity: .error, category: .driver, messageTemplate: "no such file or directory: '%@'"))
         register(DiagnosticInfo(id: .driverUnrecognizedOption, name: "driver.unrecognized_option", severity: .warning, category: .driver, messageTemplate: "unrecognized command-line option '%@'"))
+
+        // Assembler diagnostics
+        register(DiagnosticInfo(id: .asmUnknownDirective, name: "assembler.unknown_directive", severity: .error, category: .assembler, messageTemplate: "unknown assembler directive '%@'"))
+        register(DiagnosticInfo(id: .asmInvalidInstruction, name: "assembler.invalid_instruction", severity: .error, category: .assembler, messageTemplate: "invalid instruction '%@'"))
+        register(DiagnosticInfo(id: .asmInvalidExpression, name: "assembler.invalid_expression", severity: .error, category: .assembler, messageTemplate: "invalid assembler expression '%@'"))
+        register(DiagnosticInfo(id: .asmUndefinedSymbol, name: "assembler.undefined_symbol", severity: .error, category: .assembler, messageTemplate: "undefined local symbol '%@'"))
     }
 }
 
@@ -201,6 +209,12 @@ extension DiagId {
     // Driver (80..99)
     public static let driverInputFileNotFound   = DiagId(80)
     public static let driverUnrecognizedOption  = DiagId(81)
+
+    // Assembler (100..119)
+    public static let asmUnknownDirective       = DiagId(100)
+    public static let asmInvalidInstruction     = DiagId(101)
+    public static let asmInvalidExpression      = DiagId(102)
+    public static let asmUndefinedSymbol        = DiagId(103)
 }
 
 /// A secondary attached note pointing to an auxiliary location.

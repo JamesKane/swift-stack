@@ -2,9 +2,10 @@
 
 > A clean-room implementation of Swift 6.x and ISO C23: frontends, semantic analysis, optimizer, code generators, assemblers, linker, debug-info format and runtimes. Every persistent compiler data structure is a flat, index-addressed table (Data-Oriented Design).
 
-**Status:** Milestone M0 (Foundation & Measurement), Milestone M0.5 (Vertical Slice), and Milestone M1 (C23 Frontend, Preprocessor, SemIR, and Diagnostics) implemented and verified.
+**Status:** Milestone M0 (Foundation & Measurement), Milestone M0.5 (Vertical Slice), Milestone M1 (C23 Frontend, Preprocessor, SemIR, and Diagnostics), and Milestone M2 (Encoders, Object Model, and Assemblers) implemented and verified.
+- **Encoders, Object Model & Multi-Arch Assemblers (M2):** Shared table-driven instruction encoders and disassemblers (`Encode/`) for **x86-64** (including 2/3-byte VEX, BMI1/BMI2, SSE4.2, and `.code16`/`.code32`/`.code64`), **AArch64** (including LSE atomics, NEON, and SVE), and **RV64** (RVA23 profile: RV64IMAFDCV, Zicsr, Zba/Zbb/Zbs, Zicbom/Zicboz, Zicond, 16-bit RVC, and RVV 1.0) verified via exhaustive table round-trip (`encode -> disassemble -> re-encode` across 1,064 instruction descriptors). Deterministic (`D6`) ELF64 relocatable (`ET_REL`) object reader and writer (`Object/`), and `.s`/`.S` assemblers (`Asm/`) with C23 preprocessing, `.macro`/`.rept`/`.irp`/`.if` expansion, and branch relaxation — verified **100% byte-for-byte identical** to `clang -c` across all **Todhchai OS** floor entry stubs (`amd64.S`, `arm64.S`, `rv64.S`) and all **21 Croi microkernel** architecture assembly files (`kernel/arch/{amd64,arm64,rv64}/*.S`). See [M2 Report](docs/architecture/milestones/M2-encoders-object-assemblers.md).
 - **C23 Frontend & Real-World Corpora (M1):** Preprocesses, parses into a postorder SoA `ParseTree`, and type-checks into typed `SemIR` (`DeclTable`, `TypePool`, `SemInstBlock`) across the full **SQLite amalgamation** (`sqlite3.c`, 268,827 lines / 9.5 MB / 26,942 declarations), **Lua 5.4** (35/35 `.c` files), **Todhchai OS C sources** (31/31 `.c` files), and **Linux host glibc headers** (`<stdio.h>`, `<stdlib.h>`, `<stdint.h>`, `<string.h>`, `<pthread.h>`, `<sys/mman.h>`, `<elf.h>`).
-- **Vertical Slice & Verification (M0 / M0.5):** Compiles, links, and runs the C subset corpus end-to-end to standalone static Linux x86-64 executables with zero external dependencies, passes all 21 automated test suites in release mode (with zero warnings), and enforces all 5 CI verification gates. See [M0.5 Vertical Slice Report](docs/architecture/milestones/M0.5-vertical-slice.md) and [Baselines](Benchmarks/baselines/M0.5-vertical-slice.md).
+- **Vertical Slice & Verification (M0 / M0.5):** Compiles, links, and runs the C subset corpus end-to-end to standalone static Linux x86-64 executables with zero external dependencies, passes all 27 automated tests in release mode (with zero warnings), and enforces all 5 CI verification gates. See [M0.5 Vertical Slice Report](docs/architecture/milestones/M0.5-vertical-slice.md) and [Baselines](Benchmarks/baselines/M0.5-vertical-slice.md).
 
 ---
 
@@ -135,10 +136,10 @@ Budgets from [14](docs/architecture/14-measurement-methodology.md) are tracked c
 |---|---|---|---|---|---|
 | **B1** | Lexing throughput (single core) | ≥ 600 MB/s (≤ 5.8 cyc/B) | **520.4 MB/s** (C23 single-pass)<br>774 MB/s (C23 rep-tester best-of-50)* | `swiftc`: ~11.6 MB/s<br>`clang -E`: ~65.6 MB/s | **NOT MET (PARTIAL)** (Single-pass falls short of 600 MB/s budget; rep-tester subject to boost noise) |
 | **B2** | Lex + parse throughput (single core) | ≥ 300 MB/s (≤ 11.7 cyc/B) | Full C23 preprocessor + postorder `ParseTree` + `SemIR` active across `synth_50k.c`, `sqlite3.c` (268K LOC), Lua, and Todhchai | `clang -fsyntax-only`: ~45 MB/s | **ACTIVE (M1)** |
-| **B3** | End-to-end debug build (single core) | ≥ 100,000 lines/s (≤ 35,000 cyc/line) | **13.5 – 14.4 ms** total ($1.5 – 2.0\text{ ms}$ in-process pipeline) | `clang -O0` + external linker: 23 – 28 ms | **PROVISIONAL** ($1.7\times$ faster than Clang on micro-programs; full C23 codegen in M2) |
+| **B3** | End-to-end debug build (single core) | ≥ 100,000 lines/s (≤ 35,000 cyc/line) | **13.5 – 14.4 ms** total ($1.5 – 2.0\text{ ms}$ in-process pipeline) | `clang -O0` + external linker: 23 – 28 ms | **PROVISIONAL** ($1.7\times$ faster than Clang on micro-programs; full C23 codegen in M3) |
 | **B5** | Link time, system-service image | < 50 ms | **< 1 ms** (in-process static ELF writer) | External `ld.bfd` / `ld.lld` | **MET** (slice) |
 | **B8** | Peak RSS (100K-line build) | < 256 MB | **21.3 MB** RSS (cold) | `swiftc` + LLVM (> 500 MB) | **MET** (slice) |
-| **D6** | Output Determinism | 100% bitwise reproducible | Verified byte-identical across runs (including callee collisions) | Clang / LLD | **MET** |
+| **D6** | Output Determinism | 100% bitwise reproducible | Verified byte-identical across runs (including ELF64 `ET_REL` & callee collisions) | Clang / LLD | **MET** |
 
 ---
 
@@ -161,8 +162,13 @@ swift test
 bash Scripts/ci-check.sh
 ```
 
-### Preprocess, parse, type-check, and compile C23 programs
+### Preprocess, parse, type-check, assemble, and compile programs
 ```sh
+# Assemble x86-64, AArch64, or RV64 (.s or C23-preprocessed .S) into ELF64 ET_REL (.o):
+./.build/release/swift-stack -c --target=x86_64 -Iinclude path/to/file.S -o out.o
+./.build/release/swift-stack -c --target=aarch64 -Iinclude path/to/file.S -o out.o
+./.build/release/swift-stack -c --target=riscv64 -Iinclude path/to/file.S -o out.o
+
 # Dump typed SemIR (DeclTable + SemInstBlocks) with include paths and defines:
 ./.build/release/swift-stack -Iinclude -DFOO=1 --dump=sem-ir path/to/file.c
 

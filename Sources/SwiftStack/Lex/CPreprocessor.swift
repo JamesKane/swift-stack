@@ -77,6 +77,7 @@ public final class CPreprocessor {
     public var diagnostics: DiagnosticBag
     public var includePaths: [String] = []
     public var systemIncludePaths: [String] = []
+    public var assemblerMode: Bool = false
 
     private var macros: [String: PPMacro] = [:]
     private var pragmaOnceFiles: Set<String> = []
@@ -89,6 +90,41 @@ public final class CPreprocessor {
         self.diagnostics = diagnostics
         setupDefaultIncludePaths()
         setupPredefinedMacros()
+    }
+
+    /// Configures target-architecture predefined macros (`x86_64`, `aarch64`, or `riscv64`).
+    public func configureTargetArch(_ arch: String) {
+        undefMacro("__x86_64__")
+        undefMacro("__x86_64")
+        undefMacro("__amd64__")
+        undefMacro("__amd64")
+        undefMacro("__aarch64__")
+        undefMacro("__ARM_64BIT_STATE")
+        undefMacro("__ARM_ARCH")
+        undefMacro("__riscv")
+        undefMacro("__riscv_xlen")
+
+        switch arch.lowercased() {
+        case "aarch64", "arm64":
+            defineMacro("__aarch64__", replacement: "1")
+            defineMacro("__ARM_64BIT_STATE", replacement: "1")
+            defineMacro("__ARM_ARCH", replacement: "8")
+        case "riscv64", "rv64":
+            defineMacro("__riscv", replacement: "1")
+            defineMacro("__riscv_xlen", replacement: "64")
+        default:
+            defineMacro("__x86_64__", replacement: "1")
+            defineMacro("__x86_64", replacement: "1")
+            defineMacro("__amd64__", replacement: "1")
+            defineMacro("__amd64", replacement: "1")
+        }
+    }
+
+    /// Enables `assembler-with-cpp` mode for `.S` assembly source files (05-assembler.md §4.1).
+    public func enableAssemblerMode(arch: String = "x86_64") {
+        assemblerMode = true
+        configureTargetArch(arch)
+        defineMacro("__ASSEMBLER__", replacement: "1")
     }
 
     private func setupDefaultIncludePaths() {
@@ -359,6 +395,51 @@ public final class CPreprocessor {
         }
     }
 
+    /// Preprocesses a file in `assembler-with-cpp` mode and returns reconstructed assembly source text.
+    public func preprocessToText(fileId: FileId) -> String {
+        let sf = sourceManager[fileId]
+        activeInclusions.append(sf.path)
+        defer { activeInclusions.removeLast() }
+
+        var rawTB = TokenBuffer()
+        let lexer = CLexer(fileId: fileId, buffer: sf.buffer, length: sf.length, baseLocation: sf.baseLocation)
+        lexer.lexInto(&rawTB)
+
+        var rawTokens: [PPToken] = []
+        rawTokens.reserveCapacity(Int(rawTB.count))
+        for i in 1..<Int(rawTB.count) {
+            let tid = TokenId(UInt32(i))
+            let k = CTokenKind(rawValue: rawTB.kind(of: tid)) ?? .errorToken
+            if k == .eof { break }
+            let f = TokenFlags(rawValue: rawTB.flag(of: tid))
+            let s = rawTB.start(of: tid)
+            let e = rawTB.end(of: tid)
+            let off = Int(s.rawValue - sf.baseLocation.rawValue)
+            let len = Int(e.rawValue - s.rawValue)
+            let txt = (off >= 0 && len >= 0 && off + len <= sf.length) ?
+                String(decoding: UnsafeBufferPointer(start: sf.buffer.baseAddress! + off, count: len), as: UTF8.self) : ""
+            rawTokens.append(PPToken(kind: k, flags: f, location: s, endLocation: e, spelling: txt))
+        }
+
+        var processedTokens: [PPToken] = []
+        processTokenStream(rawTokens, currentFilePath: sf.path, into: &processedTokens)
+
+        var out = ""
+        out.reserveCapacity(sf.length)
+        for (idx, tok) in processedTokens.enumerated() {
+            if idx > 0 {
+                if tok.isLeadingNewline {
+                    out.append("\n")
+                } else if tok.isLeadingSpace {
+                    out.append(" ")
+                }
+            }
+            out.append(tok.spelling)
+        }
+        out.append("\n")
+        return out
+    }
+
     // MARK: - Directive Processing & Macro Expansion
 
     private func processTokenStream(
@@ -559,7 +640,9 @@ public final class CPreprocessor {
             case "line":
                 break // Ignored for now
             default:
-                diagnostics.report(.ppInvalidDirective, at: first.location, args: [first.spelling])
+                if !assemblerMode {
+                    diagnostics.report(.ppInvalidDirective, at: first.location, args: [first.spelling])
+                }
             }
         }
     }
@@ -713,6 +796,9 @@ public final class CPreprocessor {
 
             var includedTokens: [PPToken] = []
             processTokenStream(rawTokens, currentFilePath: sf.path, into: &includedTokens)
+            if !includedTokens.isEmpty {
+                includedTokens[0].flags = TokenFlags(rawValue: includedTokens[0].flags.rawValue | TokenFlags.maskLeadingNewline)
+            }
             output.append(contentsOf: includedTokens)
         } catch {
             diagnostics.report(.ppFileNotFound, at: location, args: [targetFile])
@@ -962,7 +1048,12 @@ public final class CPreprocessor {
 
         if !macro.isFunctionLike {
             // Object-like macro: substitute replacement tokens directly, preserving their SourceLocations
-            for rep in macro.replacementTokens {
+            for (rIdx, var rep) in macro.replacementTokens.enumerated() {
+                if rIdx == 0 {
+                    var raw = rep.flags.rawValue & ~(TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)
+                    raw |= tokens[index].flags.rawValue & (TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)
+                    rep.flags = TokenFlags(rawValue: raw)
+                }
                 output.append(rep)
             }
             return index + 1
@@ -1109,10 +1200,21 @@ public final class CPreprocessor {
                 let isAdjacentToPaste = (repIdx + 1 < macro.replacementTokens.count && macro.replacementTokens[repIdx + 1].kind == .hashHash) ||
                                         (repIdx > 0 && macro.replacementTokens[repIdx - 1].kind == .hashHash)
                 if isAdjacentToPaste {
-                    subst.append(contentsOf: arg)
+                    var argCopy = arg
+                    if !argCopy.isEmpty {
+                        var raw = argCopy[0].flags.rawValue & ~(TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)
+                        raw |= rep.flags.rawValue & (TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)
+                        argCopy[0].flags = TokenFlags(rawValue: raw)
+                    }
+                    subst.append(contentsOf: argCopy)
                 } else {
                     var preExpandedArg: [PPToken] = []
                     expandAllMacros(arg, disabled: disabled, into: &preExpandedArg)
+                    if !preExpandedArg.isEmpty {
+                        var raw = preExpandedArg[0].flags.rawValue & ~(TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)
+                        raw |= rep.flags.rawValue & (TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)
+                        preExpandedArg[0].flags = TokenFlags(rawValue: raw)
+                    }
                     subst.append(contentsOf: preExpandedArg)
                 }
             } else {
@@ -1122,6 +1224,11 @@ public final class CPreprocessor {
             repIdx += 1
         }
 
+        if !subst.isEmpty {
+            var raw = subst[0].flags.rawValue & ~(TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)
+            raw |= tokens[index].flags.rawValue & (TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)
+            subst[0].flags = TokenFlags(rawValue: raw)
+        }
         output.append(contentsOf: subst)
         return nextIdx
     }
