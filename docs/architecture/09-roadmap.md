@@ -134,16 +134,20 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
 
 ### M3 — C end-to-end at `-O0` (x86-64)
 
+The phase plan is in [milestones/M3-plan.md](milestones/M3-plan.md). The M0.5 back end (AIR lowering from the parse tree, the allocator, the emitter and `StaticELFWriter`) is replaced, not extended.
+
 - **Deliverables:**
+  - a per-target data layout, and SemIR complete enough to lower from: implicit conversions, lvalues, control flow and static initializer values ([02](02-semantic-analysis.md), [10](10-semantic-ir-and-name-resolution.md));
   - C lowering to AIR ([03](03-intermediate-representation.md));
-  - LIR, SSA linear-scan register allocation, x86-64 code generation ([04](04-backend.md));
-  - linker for VectraOS static ELF (`ET_EXEC` and static PIE) and Linux static/dynamic ELF ([06](06-linker.md));
-  - CUD and `.eh_frame`;
-  - minimal SDI plus an `ssdb` symbolizer ([07](07-debugging-and-sdi.md)).
+  - LIR, SSA linear-scan register allocation, x86-64 code generation with the full System V ABI, including `long double` (X87 class, so the encoder gains the x87 subset that code needs) ([04](04-backend.md));
+  - `-c` and `-S` output, `.eh_frame`, and DWARF 5 `.debug_line` from the code generator and from the assembler's `.file`/`.loc` (`-g` line information for gdb and perf on Linux; variable information stays in SDI);
+  - linker for VectraOS static ELF (`ET_EXEC` and static PIE) and Linux static/dynamic ELF, reading foreign `.o` and `.a` inputs ([06](06-linker.md));
+  - CUD and minimal SDI plus an `ssdb` symbolizer ([07](07-debugging-and-sdi.md));
   - `--record`/`--replay` compile bundles ([15](15-driver-and-diagnostics.md)), so every M3 bug report and fuzzer find is one reproducible file.
 - **Exit:**
-  - c-testsuite and SQLite's test suite pass on Linux x86-64 via differential execution against Clang;
-  - a C program built by Swift-Stack, linked against VectraOS's user runtime, runs on VectraOS in QEMU;
+  - c-testsuite and the GCC torture `execute` tests pass on Linux x86-64 via differential execution against Clang;
+  - the SQLite amalgamation and its shell, built and linked by Swift-Stack, give the same results as Clang's build on a scripted SQL corpus (sqllogictest or equivalent). SQLite's TCL test suite (`testfixture`, dynamically linked against the host's libtcl) is a follow-on gate after M3, once dynamic linking has been proven;
+  - a C program built by Swift-Stack, linked against VectraOS's user runtime, runs on VectraOS in QEMU. A Swift-Stack test builds VectraOS out of tree in its own build directory, substitutes the program, and boots it with VectraOS's `tools/qemu.sh`, without changing VectraOS sources;
   - `ssdb` symbolizes a crash backtrace.
 
 ### M4 — Tier 0 Swift
