@@ -1,7 +1,8 @@
 // Regression corpus: `.cfi_*` -> `.eh_frame`. DW_CFA_advance_loc / advance_loc1 / advance_loc2 / advance_loc4
 // for growing gaps, multiple FDEs, a second CIE (`.cfi_signal_frame` + `.cfi_return_column`), remember/restore
 // state, signed (`_sf`) offsets, `.cfi_escape`, CFI across a relaxed branch, and a function in another section.
-// The signal frame comes last: GNU `as` emits FDEs in source order, LLVM MC sorts them by CIE (05 §4.11).
+// The signal frame comes last, so the FDE order is also GNU `as`'s source order and this file stays in the GNU
+// comparison; `cfi_cie_order.s` covers LLVM MC's grouping of FDEs by CIE (05 §4.11).
 
 #define FRAME 24
 

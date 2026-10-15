@@ -178,12 +178,14 @@ public final class DiagnosticRegistry: @unchecked Sendable {
         register(DiagnosticInfo(id: .asmUndefinedSymbol, name: "assembler.undefined_symbol", severity: .error, category: .assembler, messageTemplate: "undefined local symbol '%@'"))
         register(DiagnosticInfo(id: .asmBranchOutOfRange, name: "assembler.branch_out_of_range", severity: .error, category: .assembler, messageTemplate: "branch target out of range"))
         register(DiagnosticInfo(id: .asmInvalidOperands, name: "assembler.invalid_operands", severity: .error, category: .assembler, messageTemplate: "invalid operands or out-of-range immediate for '%@'"))
-        register(DiagnosticInfo(id: .asmMacroMissingArgument, name: "assembler.macro_missing_argument", severity: .error, category: .assembler, messageTemplate: "missing value for required parameter '%@' of macro '%@'"))
-        register(DiagnosticInfo(id: .asmMacroBadArgument, name: "assembler.macro_bad_argument", severity: .error, category: .assembler, messageTemplate: "%@ in invocation of macro '%@'"))
+        register(DiagnosticInfo(id: .asmMacroMissingArgument, name: "assembler.macro_missing_argument", severity: .error, category: .assembler, messageTemplate: "missing value for required parameter '%@' in macro '%@'"))
+        register(DiagnosticInfo(id: .asmMacroError, name: "assembler.macro_error", severity: .error, category: .assembler, messageTemplate: "%@"))
         register(DiagnosticInfo(id: .asmUnterminatedBlock, name: "assembler.unterminated_block", severity: .error, category: .assembler, messageTemplate: "missing '%@' for '%@'"))
         register(DiagnosticInfo(id: .asmFileNotFound, name: "assembler.file_not_found", severity: .error, category: .assembler, messageTemplate: "cannot open '%@'"))
         register(DiagnosticInfo(id: .asmUnsupportedDirective, name: "assembler.unsupported_directive", severity: .error, category: .assembler, messageTemplate: "unsupported directive '%@'"))
-        register(DiagnosticInfo(id: .asmMacroNestedTooDeeply, name: "assembler.macro_nested_too_deeply", severity: .error, category: .assembler, messageTemplate: "macros nested too deeply expanding '%@'"))
+        register(DiagnosticInfo(id: .asmMacroNestedTooDeeply, name: "assembler.macro_nested_too_deeply", severity: .error, category: .assembler, messageTemplate: "macros cannot be nested more than %@ levels deep"))
+        register(DiagnosticInfo(id: .asmMacroWarning, name: "assembler.macro_warning", severity: .warning, category: .assembler, messageTemplate: "%@"))
+        register(DiagnosticInfo(id: .asmCFIError, name: "assembler.cfi_error", severity: .error, category: .assembler, messageTemplate: "%@"))
     }
 }
 
@@ -254,11 +256,13 @@ extension DiagId {
     public static let asmBranchOutOfRange       = DiagId(104)
     public static let asmInvalidOperands        = DiagId(105)
     public static let asmMacroMissingArgument   = DiagId(106)
-    public static let asmMacroBadArgument       = DiagId(107)
+    public static let asmMacroError             = DiagId(107)
     public static let asmUnterminatedBlock      = DiagId(108)
     public static let asmFileNotFound           = DiagId(109)
     public static let asmUnsupportedDirective   = DiagId(110)
     public static let asmMacroNestedTooDeeply   = DiagId(111)
+    public static let asmMacroWarning           = DiagId(112)
+    public static let asmCFIError               = DiagId(113)
 }
 
 /// A secondary attached note pointing to an auxiliary location.

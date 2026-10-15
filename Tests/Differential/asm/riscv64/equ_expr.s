@@ -1,6 +1,6 @@
 // Regression corpus: `.equ`/`.set` whose value is a label difference (resolved at once when the labels are
-// already fixed, after layout for forward references) used in immediates, data and `.size`, and GNU
-// expression operator precedence.
+// already fixed, after layout for forward references) used in immediates, data and `.size`, and the
+// GNU-style expression operator precedence LLVM MC uses for ELF.
 
     .section .rodata
 msg:

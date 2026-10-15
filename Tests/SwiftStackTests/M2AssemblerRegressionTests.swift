@@ -4,8 +4,9 @@ import Testing
 
 // Regressions for M2 assembler defects. Some behavior has no clang/GNU oracle (clang reports out-of-range
 // AArch64/RISC-V branches as errors, whereas 05-assembler.md §4.5 requires relaxing them; diagnostics and
-// malformed-ELF handling are ours alone). The rest pin GNU `as` output captured from the host assembler, so
-// they hold even where no oracle is installed; `Tests/Differential/asm/` compares the same features live.
+// malformed-ELF handling are ours alone). The rest pin LLVM MC output (`llvm-mc`/`clang -c`, the reference
+// assembler; 05-assembler.md §4.11), so they hold even where no oracle is installed;
+// `Tests/Differential/asm/` compares the same features live.
 
 @Suite("M2 — Assembler regressions")
 struct M2AssemblerRegressionTests {
@@ -135,7 +136,7 @@ struct M2AssemblerRegressionTests {
         values.flatMap { v in (0..<8).map { UInt8(truncatingIfNeeded: v >> (8 * $0)) } }
     }
 
-    @Test("`.cfi_*` emit DW_CFA_advance_loc/1/2/4 and one FDE per procedure, as GNU as")
+    @Test("`.cfi_*` emit DW_CFA_advance_loc/1/2/4 and one FDE per procedure, as LLVM MC")
     func cfiAdvanceLoc() {
         let a = Self.assembleObject("""
             .text
@@ -159,8 +160,8 @@ struct M2AssemblerRegressionTests {
             .cfi_endproc
         """, .x86_64)
         #expect(a.errors == 0)
-        // GNU as 2.46 (`objdump -s -j .eh_frame`): CIE, FDE f (advance_loc 1, advance_loc1 100, advance_loc2 300,
-        // advance_loc4 70000), FDE g (advance_loc 4)
+        // llvm-mc 21 (`llvm-objdump -s -j .eh_frame`; GNU as 2.46 agrees): CIE, FDE f (advance_loc 1, advance_loc1
+        // 100, advance_loc2 300, advance_loc4 70000), FDE g (advance_loc 4)
         #expect(a.sections[".eh_frame"] == [
             0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x7A, 0x52, 0x00, 0x01, 0x78, 0x10, 0x01,
             0x1B, 0x0C, 0x07, 0x08, 0x90, 0x01, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00,
@@ -174,6 +175,79 @@ struct M2AssemblerRegressionTests {
         // PC-begin of each FDE: .text + 0 and .text + 0x11302 (local targets compared as section + offset)
         #expect(relocs.map { r in (a.symbols[r.symbol]?.value ?? 0) &+ UInt64(bitPattern: r.addend) } == [0, 0x11302])
         #expect(relocs.allSatisfy { a.symbols[$0.symbol]?.section == ".text" })
+    }
+
+    @Test("FDEs are grouped by CIE key as in LLVM MC, not kept in source order as in GNU as")
+    func cfiFDEOrderByCIE() {
+        let a = Self.assembleObject("""
+            .text
+        a:  .cfi_startproc
+            pushq %rbp
+            .cfi_def_cfa_offset 16
+            popq %rbp
+            ret
+            .cfi_endproc
+        b:  .cfi_startproc
+            .cfi_signal_frame
+            nop
+            .cfi_def_cfa_offset 16
+            ret
+            .cfi_endproc
+        c:  .cfi_startproc
+            subq $8, %rsp
+            .cfi_adjust_cfa_offset 8
+            ret
+            .cfi_endproc
+        d:  .cfi_startproc simple
+            .cfi_def_cfa %rsp, 8
+            ret
+            .cfi_endproc
+        e:  .cfi_startproc
+            .cfi_return_column 16
+            ret
+            .cfi_endproc
+        f:  .cfi_startproc
+            .cfi_return_column 5
+            .cfi_signal_frame
+            ret
+            .cfi_endproc
+        g:  .cfi_startproc
+            ret
+            .cfi_endproc
+        """, .x86_64)
+        #expect(a.errors == 0)
+        // llvm-mc 21: FDEs stable-sorted by (signal frame, simple, return column; an explicit column sorts before
+        // the default and gets its own CIE even when equal to it), one CIE before each group:
+        // CIE, e | CIE, a, c, g | CIE (simple), d | CIE zRS ra=5, f | CIE zRS, b
+        #expect(a.sections[".eh_frame"] == [
+            0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x7A, 0x52, 0x00, 0x01, 0x78, 0x10, 0x01,
+            0x1B, 0x0C, 0x07, 0x08, 0x90, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x7A, 0x52, 0x00, 0x01, 0x78, 0x10, 0x01, 0x1B, 0x0C, 0x07, 0x08,
+            0x90, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x41, 0x0E, 0x10, 0x10, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x44, 0x0E, 0x10, 0x10, 0x00, 0x00, 0x00,
+            0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x7A, 0x52, 0x00, 0x01, 0x78, 0x10, 0x01,
+            0x1B, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x07, 0x08, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x7A, 0x52, 0x53, 0x00, 0x01, 0x78, 0x05, 0x01, 0x1B, 0x0C, 0x07, 0x08, 0x90, 0x01, 0x00,
+            0x10, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x7A, 0x52, 0x53,
+            0x00, 0x01, 0x78, 0x10, 0x01, 0x1B, 0x0C, 0x07, 0x08, 0x90, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00,
+            0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x41, 0x0E, 0x10,
+        ])
+        let relocs = a.relocs[".eh_frame"] ?? []
+        #expect(relocs.map(\.offset) == [0x20, 0x4C, 0x60, 0x74, 0x9C, 0xC8, 0xF4])
+        // pc_begin targets in emission order: e, a, c, g, d, f, b
+        #expect(relocs.map { r in (a.symbols[r.symbol]?.value ?? 0) &+ UInt64(bitPattern: r.addend) } == [0xB, 0x0, 0x5, 0xD, 0xA, 0xC, 0x3])
+
+        // LLVM MC rejects CFI outside a procedure and a procedure started inside another
+        let bad = Self.assembleObject(".cfi_def_cfa_offset 16\n.cfi_startproc\n.cfi_startproc\n.cfi_endproc\n.cfi_endproc\n", .x86_64, fileName: "cfi.s")
+        #expect(bad.errors == 3)
+        #expect(bad.rendered.contains("cfi.s:1:1: error: this directive must appear between .cfi_startproc and .cfi_endproc directives"))
+        #expect(bad.rendered.contains("cfi.s:3:1: error: starting new .cfi frame before finishing the previous one"))
+        #expect(bad.rendered.contains("cfi.s:5:1: error: this directive must appear between .cfi_startproc and .cfi_endproc directives"))
     }
 
     @Test("`.equ`/`.set` of a label difference resolve to constants, including forward references")
@@ -201,9 +275,15 @@ struct M2AssemblerRegressionTests {
         #expect(a.symbols["len"]?.section == "*ABS*" && a.symbols["len"]?.value == 7)
         #expect(a.symbols["code_len"]?.section == "*ABS*" && a.symbols["code_len"]?.value == 6)
         #expect(a.symbols["start"]?.size == 6)
+
+        // llvm-mc 21: a fixed label difference in another section is folded at once, so reassigning the symbol
+        // later does not change an earlier use
+        let reassigned = Self.assembleObject(".text\na: nop\nmovl $1, %eax\nb:\n.data\n.set y, b - a\n.byte y\n.set y, 3\n.byte y\n", .x86_64)
+        #expect(reassigned.errors == 0)
+        #expect(reassigned.sections[".data"] == [6, 3])
     }
 
-    @Test("Expressions use GNU as operator precedence and semantics")
+    @Test("Expressions use LLVM MC's ELF (GNU-compatible) operator precedence and semantics")
     func gnuExpressionPrecedence() {
         let a = Self.assembleObject("""
             .data
@@ -212,8 +292,8 @@ struct M2AssemblerRegressionTests {
             .quad 5 ! 1, -7 / 2, -7 % 2, -16 >> 2, ~1 & 3, !1 + 1, 2 > 1 + 1
         """, .x86_64)
         #expect(a.errors == 0)
-        // GNU as 2.46: `<<` binds tighter than `+`, `| ^ & !` share a level above `+ -`, comparisons yield -1,
-        // `>>` is a logical shift
+        // llvm-mc 21 (GNU as 2.46 agrees): `<<` binds tighter than `+`, `| ^ & !` share a level above `+ -`,
+        // comparisons yield -1, `>>` is a logical shift
         #expect(a.sections[".data"] == Self.le64([
             17, 17, 6, 0, 4,
             -1, 0, -1, -1, 1, 1,
@@ -243,21 +323,119 @@ struct M2AssemblerRegressionTests {
             emit 9 -2
         """, .x86_64)
         #expect(a.errors == 0)
-        // GNU as 2.46. A blank separates arguments between complete terms (`emit 9 -2`; LLVM MC instead reads
-        // `9 -2` as one argument), and a `:vararg` parameter takes the rest of the line verbatim.
-        #expect(a.sections[".data"] == [1, 2, 3, 4, 5, 3, 9, 6, 7, 8, 9, 0xFE])
+        // llvm-mc 21. A blank separates arguments unless an operator follows it (`emit 6 7, 8` passes `6` and
+        // `7, 8`; `emit 9 -2` passes `9-2` as one argument, where GNU as passes `9` and `-2`), and a `:vararg`
+        // parameter takes the rest of the line verbatim.
+        #expect(a.sections[".data"] == [1, 2, 3, 4, 5, 3, 9, 6, 7, 8, 7])
         #expect(a.symbols["foo_3"]?.value == 5)
         #expect(a.symbols["bar_9"]?.value == 6)
 
         let missing = Self.assembleObject(".macro m a:req\n.byte \\a\n.endm\nm\n", .x86_64, fileName: "req.s")
         #expect(missing.errors == 1)
-        #expect(missing.rendered.contains("req.s:4:1: error: missing value for required parameter 'a' of macro 'm'"))
+        #expect(missing.rendered.contains("req.s:4:1: error: missing value for required parameter 'a' in macro 'm'"))
 
-        // Runaway recursion is diagnosed (GNU as: "macros nested too deeply"), not a stack overflow
+        // Runaway recursion is diagnosed at LLVM MC's 20-level limit, not a stack overflow
         let recursive = Self.assembleObject(".macro r\nr\n.endm\nr\n", .x86_64, fileName: "rec.s")
         #expect(recursive.errors == 1)
-        #expect(recursive.rendered.contains("rec.s:2:1: error: macros nested too deeply expanding 'r'"))
+        #expect(recursive.rendered.contains("rec.s:2:1: error: macros cannot be nested more than 20 levels deep"))
         #expect(recursive.rendered.contains("rec.s:4:1: note: in expansion of macro 'r'"))
+    }
+
+    @Test("Macro and `.irp` arguments split, substitute and number (`\\@`) as in LLVM MC")
+    func macroArgumentsLLVM() {
+        let a = Self.assembleObject("""
+            .macro two a, b=100
+            .byte \\a
+            .byte \\b
+            .endm
+            .macro str s
+            .ascii "<\\s>"
+            .endm
+            .macro at
+            .byte \\@
+            .endm
+            .data
+            at
+            at
+            two 1 2
+            two 3 -4
+            two 5 - 6
+            two -9 10
+            two (1 + 2) 4
+            two 6 <<1
+            two , 17
+            two b=18, a=19
+            str "a b"
+            .irp r, 1 2, 4 -1
+            .byte \\r
+            .endr
+            .irp r, 5, , 7
+            .byte 9\\r
+            .endr
+            .irp r,
+            .byte 0xEE
+            .endr
+            .irpc c, 789
+            .byte \\c
+            .endr
+        """, .x86_64)
+        #expect(a.errors == 0)
+        // llvm-mc 21: an operator joins blank-separated tokens (`3 -4` is `3-4`), only parentheses group, a string
+        // argument loses its quotes, `\\@` counts from 0, and `.irp` values split like macro arguments
+        // (`.irp r,` iterates zero times)
+        #expect(a.sections[".data"] == [
+            0, 1, 1, 2, 0xFF, 100, 0xFF, 100, 0xF7, 10, 3, 4, 12, 100, 17, 19, 18,
+        ] + Array("<a b>".utf8) + [1, 2, 3, 95, 9, 97, 7, 8, 9])
+
+        // Rejected by llvm-mc 21 with these messages (the previous GNU-style parser accepted most of them silently)
+        let bad = Self.assembleObject("""
+            .macro two a, b=100
+            .byte \\a, \\b
+            .endm
+            .macro none
+            .endm
+            .data
+            two b=1, 2
+            two c=1
+            two 1, 2, 3
+            two (1
+            two 1=2
+            none 5
+            .macro bad x:foo
+            .endm
+            .macro dup x, x
+            .endm
+            .macro va x:vararg, y
+            .endm
+            .macro two
+            .endm
+            .purgem nosuch
+            .irp r 1 2
+            .endr
+            .irpc c, ab cd
+            .endr
+        """, .x86_64, fileName: "m.s")
+        #expect(bad.errors == 13)
+        for expected in [
+            "m.s:7:5: error: cannot mix positional and keyword arguments",
+            "m.s:8:5: error: parameter named 'c' does not exist for macro 'two'",
+            "m.s:9:5: error: too many positional arguments",
+            "m.s:10:5: error: unbalanced parentheses in macro argument",
+            "m.s:11:5: error: unexpected token in macro instantiation",
+            "m.s:12:5: error: Wrong number of arguments",
+            "m.s:13:5: error: foo is not a valid parameter qualifier for 'x' in macro 'bad'",
+            "m.s:15:5: error: macro 'dup' has multiple parameters named 'x'",
+            "m.s:17:5: error: vararg parameter 'x' should be the last parameter",
+            "m.s:19:5: error: macro 'two' is already defined",
+            "m.s:21:5: error: macro 'nosuch' is not defined",
+            "m.s:22:5: error: expected comma",
+            "m.s:24:5: error: unexpected token in '.irpc' directive",
+        ] {
+            #expect(bad.rendered.contains(expected), Comment(rawValue: expected))
+        }
+        let warn = Self.assembleObject(".macro rq x:req=3\n.endm\n", .x86_64, fileName: "w.s")
+        #expect(warn.errors == 0)
+        #expect(warn.rendered.contains("w.s:1:1: warning: pointless default value for required parameter 'x' in macro 'rq'"))
     }
 
     @Test("Assembler diagnostics carry file:line:col through .include, macros, .rept and .S preprocessing")

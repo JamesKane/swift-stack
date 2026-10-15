@@ -1,6 +1,6 @@
 // Regression corpus: `.equ`/`.set` whose value is a label difference (backward and forward references,
 // across an alignment, chained, used in immediates, displacements, data and `.size`; an alias of an undefined
-// symbol redirects relocations to it), and GNU expression operator precedence
+// symbol redirects relocations to it), and the GNU-style expression operator precedence LLVM MC uses for ELF
 // (`* / % << >>` > `| & ^ !` > `+ -` > comparisons (-1 = true) > `&&` > `||`).
 
     .text

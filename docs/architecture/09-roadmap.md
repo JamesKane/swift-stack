@@ -129,7 +129,7 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
   - `Object` with ELF relocatable read/write;
   - AT&T-syntax x86-64 assembler, AArch64 and RV64 assemblers, `.S` preprocessing ([05](05-assembler.md)).
 - **Exit:**
-  - the Todhchai assembly stubs assemble byte-identically to GNU `as` (modulo documented, intentional encoding choices);
+  - the Todhchai assembly stubs assemble byte-identically to LLVM MC (clang's integrated assembler), the reference assembler; differences from GNU `as` are documented, not matched ([05](05-assembler.md) §4.11);
   - encoder/disassembler round-trip is exhaustive over the instruction tables.
 
 ### M3 — C end-to-end at `-O0` (x86-64)
@@ -250,7 +250,7 @@ Source ──┬──► oracle (swiftc / clang / GNU as / ld.lld) ──► ar
 | C frontend and execution | Clang | Accept/reject; stdout and exit code for c-testsuite, GCC torture `execute` tests (fetched, GPL, run as data), SQLite tests |
 | C random programs | Clang, GCC | Csmith and YARPGen generated programs: checksum output. Run continuously, not per commit. |
 | Portable SIMD | `swiftc` | Per-operation results for every `SIMDn` operation and element type at each ISA baseline ([17](17-simd-and-vectorization.md) §6) |
-| Assembler | GNU `as` / `llvm-mc` | Section bytes and relocations |
+| Assembler | `llvm-mc` / `clang -c` (reference); GNU `as` apart from documented differences ([05](05-assembler.md) §4.11) | Section bytes and relocations |
 | Linker | `ld.lld` | Program behavior. `readelf`/`llvm-readobj` structural validation. Bytes are not compared, since layout legitimately differs. |
 | Debug info | DWARF from Clang where applicable | Line tables and variable locations at sampled PCs |
 

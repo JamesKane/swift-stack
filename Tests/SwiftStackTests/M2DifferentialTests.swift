@@ -77,19 +77,29 @@ enum AsmCorpora {
 }
 
 /// Differences from GNU `as` on x86-64 that are intentional and documented in 05-assembler.md §4.11.
-/// Swift-Stack follows LLVM MC for these, and the clang comparison still checks those sections exactly:
+/// LLVM MC is the reference assembler, Swift-Stack matches it, and the clang comparison checks these sections
+/// exactly:
 /// - `.text` alignment (LLVM MC: 4, GNU: 1);
 /// - multi-byte NOP padding (LLVM MC: one 6-byte `nopw`; GNU: `nop` + 5-byte `nopl`);
 /// - a memory displacement given by a label difference unresolved at parse time is encoded as `disp32`
-///   (GNU `as` relaxes it to `disp8`), which changes the size of the containing section.
+///   (GNU `as` relaxes it to `disp8`), which changes the size of the containing section;
+/// - `.eh_frame` FDE order and CIE sharing (LLVM MC groups FDEs by CIE key; GNU keeps source order and shares
+///   CIEs by content). Only `cfi_cie_order.s` has FDEs with different CIEs out of key order.
 func gnuDocumentedDifferences(for file: AsmCorpusFile) -> DiffOptions {
     var opts = DiffOptions(compareAlignment: false)
     if file.path.hasSuffix("/kernel/arch/amd64/smp.S") {
         opts.excludedSections = [".text.arch_ap_prepare_trampoline"]  // `lea T_OFF(t_gdt)(%rsi), %rax`
         opts.bytesExemptSections = [".text.ap_trampoline"]              // NOP padding before `.balign 8` data
     }
+    if file.path.hasSuffix("/Differential/asm/x86_64/cfi_cie_order.s") {
+        opts.excludedSections = [".eh_frame"]
+    }
     return opts
 }
+
+/// In-repo files GNU `as` cannot assemble, compared with clang only: `macro_args.s` uses macro arguments that
+/// LLVM MC splits at operators after a blank and GNU `as` splits differently or rejects (05-assembler.md §4.11).
+let gnuIncompatibleFiles: Set<String> = ["macro_args.s"]
 
 @Suite("M2 — Differential assembly against clang and GNU as")
 struct M2DifferentialAssemblyTests {
@@ -119,7 +129,8 @@ struct M2DifferentialAssemblyTests {
     @Test(
         "x86-64 corpora match GNU as (relocations, symbols, data; documented encoding choices excepted)",
         .enabled(if: AsmCorpora.hasGNUAs),
-        arguments: (AsmCorpora.inRepo + AsmCorpora.todhchai + AsmCorpora.croi).filter { $0.arch == .x86_64 }
+        arguments: (AsmCorpora.inRepo.filter { !gnuIncompatibleFiles.contains(URL(fileURLWithPath: $0.path).lastPathComponent) }
+            + AsmCorpora.todhchai + AsmCorpora.croi).filter { $0.arch == .x86_64 }
     )
     func x86VsGNU(_ file: AsmCorpusFile) throws {
         try Self.check(file, oracle: DifferentialAssembly.assembleWithGNU(path: file.path, includePaths: file.includePaths), options: gnuDocumentedDifferences(for: file), oracleName: "GNU as")

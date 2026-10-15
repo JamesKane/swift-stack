@@ -118,7 +118,8 @@ public enum AsmExprValue: Sendable, Equatable {
     }
 }
 
-/// Evaluates GNU `as` integer and symbolic expressions with GNU `as` operator precedence (not C's).
+/// Evaluates assembler integer and symbolic expressions with the GNU-style operator precedence (not C's) that
+/// LLVM MC uses for ELF targets.
 public enum AsmExprEvaluator {
 
     /// Evaluates an expression string using `constants` (from `.equ`/`.set`/`=`) and optional section symbol positions.
@@ -411,7 +412,8 @@ public enum AsmExprEvaluator {
         return Int64(s, radix: 10)
     }
 
-    // Precedence-climbing parser with GNU `as` operator ranks (binutils `expr.c`), which differ from C:
+    // Precedence-climbing parser with LLVM MC's ELF operator ranks (`AsmParser::getGNUBinOpPrecedence`, the same as
+    // binutils `expr.c`), which differ from C:
     //   5: `*` `/` `%` `<<` `>>`     4: `|` `&` `^` `!` (or-not)     3: `+` `-`
     //   2: `==` `!=` `<>` `<` `>` `<=` `>=` (true is -1)     1: `&&`     0: `||` (1 or 0)
     // All binary operators are left-associative; comparisons are signed; `>>` is a logical shift.
@@ -674,14 +676,15 @@ public enum AsmMacroEngine {
         var constants: [String: Int64] = [:]
         var definedSymbols: Set<String> = []
         var macroCounter = 0
-        /// Current macro expansion nesting (bounded like GNU `as`, so runaway recursion is diagnosed).
+        /// Current macro, `.rept` and `.irp` expansion nesting (bounded like LLVM MC, so runaway recursion is
+        /// diagnosed).
         var macroDepth = 0
         /// Set by `.exitm`; unwinds the enclosing `.if`/`.rept` blocks up to the macro boundary.
         var exitRequested = false
     }
 
     private static let maxIncludeDepth = 64
-    private static let maxMacroDepth = 100   // GNU `as` `max_macro_nest`
+    private static let maxMacroDepth = 20    // LLVM MC `-asm-macro-max-nesting-depth` default
 
     /// Splits `text` into statements (`physicalFile` is the `SourceManager` buffer holding `text`, or nil for
     /// preprocessor output whose locations come from line markers), expands includes, macros, repetitions and
@@ -888,7 +891,7 @@ public enum AsmMacroEngine {
                     continue
                 }
             case UInt8(ascii: ";"):
-                // `;` separates statements on the same line in GNU `as` for all three targets
+                // `;` separates statements on the same line for all three targets (LLVM MC `SeparatorString`)
                 // (e.g. `1: wfe; b 1b` in croi/kernel/arch/arm64/smp.S).
                 flush()
                 i += 1
@@ -950,15 +953,21 @@ public enum AsmMacroEngine {
                     diagnostics.report(.asmUnterminatedBlock, at: stmt.loc, args: [".endm", ".macro"])
                     return out
                 }
-                let (name, params) = parseMacroHeader(restText)
-                if !name.isEmpty {
-                    ctx.macros[name] = AsmMacroDef(name: name, params: params, body: Array(stmts[(i + 1)..<end]))
+                if let (name, params) = parseMacroHeader(restText, loc: stmt.loc, diagnostics: &diagnostics) {
+                    if ctx.macros[name] != nil {
+                        diagnostics.report(.asmMacroError, at: stmt.loc, args: ["macro '\(name)' is already defined"])
+                    } else {
+                        ctx.macros[name] = AsmMacroDef(name: name, params: params, body: Array(stmts[(i + 1)..<end]))
+                    }
                 }
                 i = end + 1
                 continue
 
             case ".purgem":
-                ctx.macros[restText.trimmingCharacters(in: .whitespaces)] = nil
+                let name = restText.trimmingCharacters(in: .whitespaces)
+                if ctx.macros.removeValue(forKey: name) == nil {
+                    diagnostics.report(.asmMacroError, at: stmt.loc, args: ["macro '\(name)' is not defined"])
+                }
                 i += 1
                 continue
 
@@ -981,16 +990,11 @@ public enum AsmMacroEngine {
                     }
                     iterations = Array(repeating: [:], count: Int(max(0, min(count, 1 << 20))))
                 } else {
-                    let parts = splitCommaSeparated(restText)
-                    let param = parts.first?.trimmingCharacters(in: .whitespaces) ?? ""
-                    let values = Array(parts.dropFirst())
-                    if lowerFirst == ".irp" {
-                        iterations = values.map { [param: $0] }
-                    } else {
-                        let chars = values.joined(separator: ",").filter { !$0.isWhitespace }
-                        iterations = chars.map { [param: String($0)] }
-                    }
+                    guard let (param, values) = parseRepeatList(lowerFirst, restText, loc: stmt.loc, diagnostics: &diagnostics) else { continue }
+                    iterations = values.map { [param: $0] }
                 }
+                ctx.macroDepth += 1
+                defer { ctx.macroDepth -= 1 }
                 for bindings in iterations {
                     let substituted = bindings.isEmpty ? body : body.map {
                         AsmStatement(text: substituteMacroParams(in: $0.text, bindings: bindings, counter: ctx.macroCounter), loc: $0.loc)
@@ -1054,14 +1058,15 @@ public enum AsmMacroEngine {
             default:
                 if let macro = ctx.macros[firstWord] {
                     guard ctx.macroDepth < maxMacroDepth else {
-                        // Only the outermost use: one note per level would be 100 notes
+                        // Only the outermost use: one note per level would be 20 notes
                         let outermost = AsmLoc(stmt.loc.location, notes: Array(stmt.loc.notes.suffix(1)))
-                        diagnostics.report(.asmMacroNestedTooDeeply, at: outermost, args: [macro.name])
+                        diagnostics.report(.asmMacroNestedTooDeeply, at: outermost, args: [String(maxMacroDepth)])
                         i += 1
                         continue
                     }
-                    ctx.macroCounter += 1
+                    // `\@` is the number of macro instantiations before this one (the first is 0)
                     let body = instantiateMacro(macro, arch: ctx.arch, argsText: restText, invocation: stmt, counter: ctx.macroCounter, diagnostics: &diagnostics)
+                    ctx.macroCounter += 1
                     ctx.macroDepth += 1
                     out.append(contentsOf: expandBlock(body, ctx: &ctx, diagnostics: &diagnostics))
                     ctx.macroDepth -= 1
@@ -1108,42 +1113,68 @@ public enum AsmMacroEngine {
 
     // MARK: Macros
 
-    /// Parses `.macro name[,] p1[=default], p2:req, rest:vararg` (parameters separated by commas or blanks).
-    private static func parseMacroHeader(_ header: String) -> (String, [AsmMacroParam]) {
-        var trimmed = header.trimmingCharacters(in: .whitespaces)
-        // `p = 5` and `p=5` are the same parameter; join them before splitting on blanks
-        while let r = trimmed.range(of: #"\s*=\s*"#, options: .regularExpression) {
-            let replaced = trimmed.replacingCharacters(in: r, with: "\u{1}")
-            if replaced == trimmed { break }
-            trimmed = replaced
+    /// Parses `.macro name[,] p1[=default] p2:req, rest:vararg` as LLVM MC's `parseDirectiveMacro` does:
+    /// parameters are separated by commas or blanks, a default value is one macro argument, and a malformed
+    /// header (unknown qualifier, duplicate parameter, `:vararg` not last) is an error that drops the macro.
+    private static func parseMacroHeader(_ header: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) -> (String, [AsmMacroParam])? {
+        var p = MacroArgParser(header)
+        func fail(_ message: String) -> (String, [AsmMacroParam])? {
+            diagnostics.report(.asmMacroError, at: loc, args: [message])
+            return nil
         }
-        let tokens = trimmed.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map {
-            String($0).replacingOccurrences(of: "\u{1}", with: "=")
-        }
-        guard let name = tokens.first else { return ("", []) }
+        guard let nameTok = p.current, nameTok.kind == .identifier else { return fail("expected identifier in '.macro' directive") }
+        let name = nameTok.text
+        p.advance()
+        if p.current?.kind == .comma { p.advance() }
         var params: [AsmMacroParam] = []
-        for tok in tokens.dropFirst() {
-            var spec = tok
+        while let tok = p.current {
+            if let last = params.last, last.vararg {
+                return fail("vararg parameter '\(last.name)' should be the last parameter")
+            }
+            guard tok.kind == .identifier else { return fail("expected identifier in '.macro' directive") }
+            let param = tok.text
+            if params.contains(where: { $0.name == param }) {
+                return fail("macro '\(name)' has multiple parameters named '\(param)'")
+            }
+            p.advance()
+            var required = false
+            var vararg = false
+            if p.current?.text == ":" {
+                p.advance()
+                guard let qualifier = p.current, qualifier.kind == .identifier else {
+                    return fail("missing parameter qualifier for '\(param)' in macro '\(name)'")
+                }
+                switch qualifier.text {
+                case "req":    required = true
+                case "vararg": vararg = true
+                default:       return fail("\(qualifier.text) is not a valid parameter qualifier for '\(param)' in macro '\(name)'")
+                }
+                p.advance()
+            }
             var defaultValue = ""
-            if let eq = spec.firstIndex(of: "=") {
-                defaultValue = String(spec[spec.index(after: eq)...])
-                spec = String(spec[..<eq])
+            if p.current?.isEqual == true {
+                p.advance()
+                do {
+                    defaultValue = macroArgumentText(try p.argument(vararg: false), vararg: vararg)
+                } catch {
+                    return fail(error.message)
+                }
+                if required {
+                    diagnostics.report(.asmMacroWarning, at: loc, args: ["pointless default value for required parameter '\(param)' in macro '\(name)'"])
+                }
             }
-            var qualifier = ""
-            if let colon = spec.firstIndex(of: ":") {
-                qualifier = spec[spec.index(after: colon)...].lowercased()
-                spec = String(spec[..<colon])
-            }
-            guard !spec.isEmpty else { continue }
-            params.append(AsmMacroParam(name: spec, defaultValue: defaultValue, required: qualifier == "req", vararg: qualifier == "vararg"))
+            params.append(AsmMacroParam(name: param, defaultValue: defaultValue, required: required, vararg: vararg))
+            if p.current?.kind == .comma { p.advance() }
+            p.skipSpace()
         }
         return (name, params)
     }
 
-    /// Binds positional and `name=value` keyword arguments (GNU `as` semantics: quoted arguments lose their
-    /// quotes, an empty argument takes the default, and a `:vararg` parameter takes all remaining arguments),
-    /// then substitutes them into the body. Each produced statement keeps its body location plus a note
-    /// pointing at the invocation.
+    /// Binds positional and `name=value` keyword arguments with LLVM MC's `parseMacroArguments` rules (an empty
+    /// argument takes the default, keyword arguments may not be followed by positional ones, a string argument
+    /// is substituted without its quotes, and a `:vararg` parameter takes the rest of the line verbatim), then
+    /// substitutes them into the body. Any argument error is diagnosed and the macro is not expanded. Each
+    /// produced statement keeps its body location plus a note pointing at the invocation.
     private static func instantiateMacro(
         _ macro: AsmMacroDef,
         arch: AssemblerArch,
@@ -1152,41 +1183,33 @@ public enum AsmMacroEngine {
         counter: Int,
         diagnostics: inout DiagnosticBag
     ) -> [AsmStatement] {
-        let chars = Array(argsText.trimmingCharacters(in: .whitespaces))
-        let supplied = splitMacroArguments(chars)
+        var parser = MacroArgParser(argsText)
+        let values: [[MacroToken]]
+        do {
+            values = try parser.arguments(params: macro.params, macroName: macro.name)
+        } catch {
+            diagnostics.report(.asmMacroError, at: invocation.loc, args: [error.message])
+            return []
+        }
+        // Only possible for a macro without parameters invoked with arguments
+        guard values.count == macro.params.count else {
+            diagnostics.report(.asmMacroError, at: invocation.loc, args: ["Wrong number of arguments"])
+            return []
+        }
         var bindings: [String: String] = [:]
-        var bound: Set<String> = []
-        for p in macro.params { bindings[p.name] = p.defaultValue }
-        var positional = 0
-        var argIndex = 0
-        while argIndex < supplied.count {
-            let arg = supplied[argIndex].text
-            argIndex += 1
-            if let eq = arg.firstIndex(of: "="),
-               case let key = arg[..<eq].trimmingCharacters(in: .whitespaces),
-               macro.params.contains(where: { $0.name == key }) {
-                let value = unquoteMacroArgument(String(arg[arg.index(after: eq)...]).trimmingCharacters(in: .whitespaces))
-                if !value.isEmpty { bindings[key] = value; bound.insert(key) }
-                continue
+        var missing = false
+        for (p, value) in zip(macro.params, values) {
+            if value.isEmpty {
+                if p.required {
+                    diagnostics.report(.asmMacroMissingArgument, at: invocation.loc, args: [p.name, macro.name])
+                    missing = true
+                }
+                bindings[p.name] = p.defaultValue
+            } else {
+                bindings[p.name] = macroArgumentText(value, vararg: p.vararg)
             }
-            guard positional < macro.params.count else {
-                diagnostics.report(.asmMacroBadArgument, at: invocation.loc, args: ["too many positional arguments", macro.name])
-                break
-            }
-            let param = macro.params[positional]
-            positional += 1
-            if param.vararg {
-                // The rest of the line verbatim, separators included (`emit 1 2, 3` gives `rest` = `2, 3`)
-                bindings[param.name] = String(chars[supplied[argIndex - 1].start...])
-                bound.insert(param.name)
-                break
-            }
-            let value = unquoteMacroArgument(arg)
-            if !value.isEmpty { bindings[param.name] = value; bound.insert(param.name) }
         }
-        for p in macro.params where p.required && !bound.contains(p.name) {
-            diagnostics.report(.asmMacroMissingArgument, at: invocation.loc, args: [p.name, macro.name])
-        }
+        if missing { return [] }
 
         let note = DiagNote(message: "in expansion of macro '\(macro.name)'", location: GlobalLocation(unitId: UnitId(0), location: invocation.loc.location))
         let notes = [note] + invocation.loc.notes
@@ -1202,89 +1225,233 @@ public enum AsmMacroEngine {
         return result
     }
 
-    private static func unquoteMacroArgument(_ arg: String) -> String {
-        if arg.count >= 2, arg.first == "\"", arg.last == "\"", let bytes = parseAsmStringLiteral(arg) {
-            return String(decoding: bytes, as: UTF8.self)
+    /// The `.irp`/`.irpc` header `param, values...`: the parameter name and, as LLVM MC lexes them, the value
+    /// list (`.irp`: one value per macro argument, blanks separating as in macro calls; `.irpc`: one character
+    /// per iteration of a single token). Errors are reported and give nil.
+    private static func parseRepeatList(_ kind: String, _ text: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) -> (String, [String])? {
+        var p = MacroArgParser(text)
+        func fail(_ message: String) -> (String, [String])? {
+            diagnostics.report(.asmMacroError, at: loc, args: [message])
+            return nil
         }
-        return arg
+        guard let paramTok = p.current, paramTok.kind == .identifier else { return fail("expected identifier in '\(kind)' directive") }
+        p.advance()
+        guard p.current?.kind == .comma else { return fail("expected comma") }
+        p.advance()
+        let values: [[MacroToken]]
+        do {
+            values = try p.arguments(params: nil, macroName: kind)
+        } catch {
+            return fail(error.message)
+        }
+        if kind == ".irp" {
+            return (paramTok.text, values.map { macroArgumentText($0, vararg: false) })
+        }
+        guard values.count == 1, values[0].count == 1 else { return fail("unexpected token in '.irpc' directive") }
+        return (paramTok.text, macroArgumentText(values[0], vararg: false).map { String($0) })
     }
 
-    /// Splits macro arguments as GNU `as` does after its input scrubber: commas separate arguments, and so do
-    /// blanks between two complete terms (`m 4 5`, `m x -5`), but not blanks next to a binary operator
-    /// (`m 1 + 2` is one argument). Quoted strings and parenthesized/bracketed groups are kept together.
-    /// Each argument is returned trimmed, with the offset in `chars` where it starts.
-    private static func splitMacroArguments(_ chars: [Character]) -> [(text: String, start: Int)] {
-        guard !chars.isEmpty else { return [] }
-        func endsTerm(_ c: Character) -> Bool {
-            c.isLetter || c.isNumber || c == "_" || c == "." || c == "$" || c == ")" || c == "]" || c == "\"" || c == "'"
+    /// The text substituted for a macro argument: its tokens concatenated without the blanks that separated
+    /// them (`m 1 + 2` gives `1+2`; blanks inside parentheses are kept), and each string literal without its
+    /// quotes or escape processing. A `:vararg` value keeps strings quoted.
+    private static func macroArgumentText(_ tokens: [MacroToken], vararg: Bool) -> String {
+        var out = ""
+        for t in tokens {
+            if t.kind == .string && !vararg {
+                out += t.text.count >= 2 && t.text.hasSuffix("\"") ? String(t.text.dropFirst().dropLast()) : String(t.text.dropFirst())
+            } else {
+                out += t.text
+            }
         }
-        func startsTerm(at j: Int) -> Bool {
-            let c = chars[j]
-            if c == "-" { return j + 1 < chars.count && !chars[j + 1].isWhitespace }
-            return c.isLetter || c.isNumber || c == "_" || c == "." || c == "$" || c == "(" || c == "["
-                || c == "\"" || c == "'" || c == "%" || c == "#" || c == "\\"
+        return out
+    }
+
+    /// A token of macro argument text, classified the way LLVM MC's `AsmLexer` classifies it where macro
+    /// argument splitting depends on it.
+    fileprivate struct MacroToken {
+        enum Kind { case space, comma, lparen, rparen, op, string, identifier, other }
+        let kind: Kind
+        let text: String
+        /// Byte offset in the parsed text (for the verbatim rest of line taken by a `:vararg` parameter).
+        let offset: Int
+        var isEqual: Bool { kind == .op && text == "=" }
+    }
+
+    fileprivate struct MacroSyntaxError: Error {
+        let message: String
+    }
+
+    /// Splits macro arguments as LLVM MC's `AsmParser::parseMacroArguments`/`parseMacroArgument` do (GNU `as`
+    /// differs; 05-assembler.md §4.4 and §4.11): a comma ends an argument, and so does a blank, unless the next
+    /// token is an operator (`+ - ~ ! * / | ^ & == != < <= << <> > >= >> && || = .`), which joins the tokens on
+    /// both sides into one argument (`m 4 -5` passes `4-5`, `m 4 5` passes `4` and `5`). Only parentheses
+    /// group (`m (1 2)` is one argument, `m [x0, #8]` is two).
+    fileprivate struct MacroArgParser {
+        private let source: [UInt8]
+        private let tokens: [MacroToken]
+        private var pos = 0
+
+        init(_ text: String) {
+            source = Array(text.utf8)
+            tokens = MacroArgParser.tokenize(source)
+            skipSpace()
         }
-        var parts: [(text: String, start: Int)] = []
-        var current = ""
-        var start = 0
-        var depth = 0
-        var inString = false
-        func finish(nextStart: Int) {
-            parts.append((current.trimmingCharacters(in: .whitespaces), start))
-            current = ""
-            start = nextStart
+
+        var current: MacroToken? { pos < tokens.count ? tokens[pos] : nil }
+
+        /// Consumes the current token and any blanks after it.
+        mutating func advance() {
+            pos += 1
+            skipSpace()
         }
-        var i = 0
-        while i < chars.count {
-            let c = chars[i]
-            if inString {
-                current.append(c)
-                if c == "\\" && i + 1 < chars.count {
+
+        mutating func skipSpace() {
+            if current?.kind == .space { pos += 1 }
+        }
+
+        /// `parseMacroArgument`: one argument's tokens (empty if the argument is empty).
+        mutating func argument(vararg: Bool) throws(MacroSyntaxError) -> [MacroToken] {
+            if vararg {
+                guard let first = current else { return [] }
+                pos = tokens.count
+                let rest = String(decoding: source[first.offset...], as: UTF8.self).trimmingCharacters(in: .whitespaces)
+                return [MacroToken(kind: .other, text: rest, offset: first.offset)]
+            }
+            var parenLevel = 0
+            var tokensOfArgument: [MacroToken] = []
+            while true {
+                if current?.isEqual == true { throw MacroSyntaxError(message: "unexpected token in macro instantiation") }
+                if parenLevel == 0 {
+                    if current?.kind == .comma { break }
+                    var spaceEaten = false
+                    if current?.kind == .space {
+                        pos += 1
+                        spaceEaten = true
+                    }
+                    // A blank followed by an operator does not end the argument; blanks after an operator are ignored
+                    if let tok = current, tok.kind == .op {
+                        tokensOfArgument.append(tok)
+                        advance()
+                        continue
+                    }
+                    if spaceEaten { break }
+                }
+                guard let tok = current else { break }
+                if tok.kind == .lparen {
+                    parenLevel += 1
+                } else if tok.kind == .rparen && parenLevel > 0 {
+                    parenLevel -= 1
+                }
+                tokensOfArgument.append(tok)
+                pos += 1
+            }
+            if parenLevel != 0 { throw MacroSyntaxError(message: "unbalanced parentheses in macro argument") }
+            return tokensOfArgument
+        }
+
+        /// `parseMacroArguments`: the value of each parameter, by index (empty where none was given). With
+        /// `params == nil` (an `.irp`/`.irpc` list) any number of values is accepted.
+        mutating func arguments(params: [AsmMacroParam]?, macroName: String) throws(MacroSyntaxError) -> [[MacroToken]] {
+            let paramCount = params?.count ?? 0
+            var values = [[MacroToken]](repeating: [], count: paramCount)
+            var namedFound = false
+            var parameter = 0
+            while paramCount == 0 || parameter < paramCount {
+                var name = ""
+                if let tok = current, tok.kind == .identifier {
+                    var peek = pos + 1
+                    if peek < tokens.count && tokens[peek].kind == .space { peek += 1 }
+                    if peek < tokens.count && tokens[peek].isEqual {
+                        name = tok.text
+                        pos = peek
+                        advance()
+                        namedFound = true
+                    }
+                }
+                if namedFound && name.isEmpty { throw MacroSyntaxError(message: "cannot mix positional and keyword arguments") }
+                let vararg = parameter < paramCount && params?[parameter].vararg == true
+                let value = try argument(vararg: vararg)
+                var index = parameter
+                if !name.isEmpty {
+                    guard let named = params?.firstIndex(where: { $0.name == name }) else {
+                        throw MacroSyntaxError(message: "parameter named '\(name)' does not exist for macro '\(macroName)'")
+                    }
+                    index = named
+                }
+                if !value.isEmpty {
+                    if values.count <= index { values += [[MacroToken]](repeating: [], count: index + 1 - values.count) }
+                    values[index] = value
+                }
+                guard let next = current else { return values }
+                if next.kind == .comma { advance() }
+                parameter += 1
+            }
+            throw MacroSyntaxError(message: "too many positional arguments")
+        }
+
+        private static let twoCharOperators: Set<String> = ["==", "!=", "<<", ">>", "<=", ">=", "<>", "&&", "||"]
+
+        private static func tokenize(_ b: [UInt8]) -> [MacroToken] {
+            func isIdentChar(_ c: UInt8) -> Bool { AsmMacroEngine.isMacroNameByte(c) || c == UInt8(ascii: "@") || c == UInt8(ascii: "?") }
+            var tokens: [MacroToken] = []
+            var i = 0
+            while i < b.count {
+                let start = i
+                let c = b[i]
+                var kind = MacroToken.Kind.other
+                switch c {
+                case 0x20, 0x09:
+                    while i < b.count && (b[i] == 0x20 || b[i] == 0x09) { i += 1 }
+                    kind = .space
+                case UInt8(ascii: ","):
                     i += 1
-                    current.append(chars[i])
-                } else if c == "\"" {
-                    inString = false
+                    kind = .comma
+                case UInt8(ascii: "("):
+                    i += 1
+                    kind = .lparen
+                case UInt8(ascii: ")"):
+                    i += 1
+                    kind = .rparen
+                case UInt8(ascii: "\""):
+                    i += 1
+                    while i < b.count && b[i] != UInt8(ascii: "\"") { i += b[i] == UInt8(ascii: "\\") ? 2 : 1 }
+                    i = min(i + 1, b.count)
+                    kind = .string
+                case UInt8(ascii: "'"):
+                    // Character constant: `'a'`, `'\n'` (or GNU's unterminated `'a`)
+                    i += 1
+                    if i < b.count && b[i] == UInt8(ascii: "\\") { i += 1 }
+                    if i < b.count { i += 1 }
+                    if i < b.count && b[i] == UInt8(ascii: "'") { i += 1 }
+                default:
+                    if i + 1 < b.count, twoCharOperators.contains(String(decoding: b[i...(i + 1)], as: UTF8.self)) {
+                        i += 2
+                        kind = .op
+                    } else if c == UInt8(ascii: "."), i + 1 >= b.count || !isIdentChar(b[i + 1]) {
+                        i += 1
+                        kind = .op
+                    } else if "+-~/*=|^&!<>".utf8.contains(c) {
+                        i += 1
+                        kind = .op
+                    } else if isIdentChar(c) {
+                        while i < b.count && isIdentChar(b[i]) { i += 1 }
+                        let letter = (c | 0x20) >= UInt8(ascii: "a") && (c | 0x20) <= UInt8(ascii: "z")
+                        kind = letter || c == UInt8(ascii: "_") || c == UInt8(ascii: ".") ? .identifier : .other
+                    } else {
+                        i += 1
+                    }
                 }
-                i += 1
-                continue
+                tokens.append(MacroToken(kind: kind, text: String(decoding: b[start..<i], as: UTF8.self), offset: start))
             }
-            switch c {
-            case "\"": inString = true; current.append(c)
-            case "(", "[": depth += 1; current.append(c)
-            case ")", "]": depth = max(0, depth - 1); current.append(c)
-            case "'":
-                current.append(c)
-                if i + 1 < chars.count { i += 1; current.append(chars[i]) }
-            case "," where depth == 0:
-                var j = i + 1
-                while j < chars.count && chars[j].isWhitespace { j += 1 }
-                finish(nextStart: j)
-                i = j
-                continue
-            case _ where c.isWhitespace && depth == 0:
-                var j = i
-                while j < chars.count && chars[j].isWhitespace { j += 1 }
-                if j < chars.count, chars[j] != ",", let last = current.last, endsTerm(last), startsTerm(at: j) {
-                    finish(nextStart: j)
-                    i = j
-                    continue
-                }
-                current.append(contentsOf: chars[i..<j])
-                i = j
-                continue
-            default: current.append(c)
-            }
-            i += 1
+            return tokens
         }
-        finish(nextStart: chars.count)
-        return parts
     }
 
     private static func isMacroNameByte(_ c: UInt8) -> Bool {
         (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F || c == 0x2E || c == 0x24
     }
 
-    /// Substitutes `\name` (longest name, as GNU `as` scans it), `\@` (invocation counter), and removes the `\()`
+    /// Substitutes `\name` (longest name, as LLVM MC's `expandMacro` scans it), `\@` (invocation counter), and removes the `\()`
     /// separator (`\reg\().4s`). A `\name` that is not a parameter is left untouched.
     private static func substituteMacroParams(in line: String, bindings: [String: String], counter: Int) -> String {
         let bytes = Array(line.utf8)
@@ -1677,18 +1844,28 @@ public final class AsmSectionBuilder {
 
 // MARK: - 6. CFI & `.eh_frame` Builder (`05-assembler.md` §4.9)
 
-/// Tracks `.cfi_*` directives and synthesizes `.eh_frame` CIE + FDE records byte-identical to GNU `as` and
-/// LLVM MC: each directive's DWARF CFA instruction is placed after a `DW_CFA_advance_loc{,1,2,4}` from the
-/// previous directive's address (resolved after layout), CIEs are shared between FDEs with the same
-/// augmentation/return column and emitted before their first FDE (FDEs stay in source order, as in GNU `as`),
-/// and records are padded with `DW_CFA_nop` to 4 bytes, the last one so the section size is a multiple of 8.
+/// Tracks `.cfi_*` directives and synthesizes `.eh_frame` CIE + FDE records byte-identical to LLVM MC
+/// (`MCDwarf.cpp` `FrameEmitterImpl`): each directive's DWARF CFA instruction is placed after a
+/// `DW_CFA_advance_loc{,1,2,4}` from the previous directive's address (resolved after layout); FDEs are
+/// stable-sorted by CIE key and each group is preceded by its CIE, so FDEs with different CIEs are not in source
+/// order (GNU `as` keeps source order and shares CIEs by content; 05-assembler.md §4.11); records are padded with
+/// `DW_CFA_nop` to 4 bytes, the last FDE so the section size is a multiple of 8.
 public final class AsmCFIBuilder {
-    /// CIE-level properties; FDEs with equal keys share one CIE.
-    struct CIEKey: Hashable {
+    /// CIE-level properties (LLVM MC `CIEKey`); FDEs with equal keys share one CIE, and FDEs are ordered by key.
+    struct CIEKey: Hashable, Comparable {
         var signalFrame = false
-        var returnColumn: UInt64
         /// `.cfi_startproc simple`: no default initial instructions.
         var simple = false
+        /// `.cfi_return_column`, or nil for the target default. An explicit column is a different key even when
+        /// it equals the default, and sorts before it (LLVM MC compares it with `INT_MAX` for "unset").
+        var returnColumn: UInt64? = nil
+
+        static func < (a: CIEKey, b: CIEKey) -> Bool {
+            func rank(_ k: CIEKey) -> (Int, Int, UInt64) {
+                (k.signalFrame ? 1 : 0, k.simple ? 1 : 0, k.returnColumn ?? UInt64(Int32.max))
+            }
+            return rank(a) < rank(b)
+        }
     }
 
     /// One DWARF CFA instruction, emitted at the address of `label`.
@@ -1765,7 +1942,7 @@ public final class AsmCFIBuilder {
         procedures.append(ProcedureCFI(
             sectionIndex: sectionIndex,
             startLabel: start,
-            key: CIEKey(returnColumn: defaultReturnColumn, simple: simple)
+            key: CIEKey(simple: simple)
         ))
         activeProcIndex = procedures.count - 1
         (cfaRegister, cfaOffset) = initialCFA
@@ -1785,10 +1962,7 @@ public final class AsmCFIBuilder {
             emitEhFrame = splitCommaSeparated(args).contains { $0.trimmingCharacters(in: .whitespaces) == ".eh_frame" }
             return true
         }
-        guard let idx = activeProcIndex else {
-            // GNU `as` rejects CFI outside `.cfi_startproc`; accept it silently like the previous behavior
-            return true
-        }
+        guard let idx = activeProcIndex else { return false }  // the caller diagnoses CFI outside a procedure
         let parts = splitCommaSeparated(args)
         func value(_ i: Int) -> Int64? {
             guard i < parts.count else { return nil }
@@ -1968,23 +2142,27 @@ public final class AsmCFIBuilder {
         let procs = procedures.filter { !$0.endLabel.isEmpty }
         guard emitEhFrame, !procs.isEmpty else { return [] }
 
+        // Stable sort by CIE key, so each CIE is emitted once, right before its group of FDEs
+        let sorted = procs.enumerated().sorted { ($0.element.key, $0.offset) < ($1.element.key, $1.offset) }.map(\.element)
         var records: [Record] = []
         var size = 0
-        var cieOffsets: [CIEKey: Int] = [:]
+        var cieOffset = 0
+        var lastKey: CIEKey? = nil
 
-        for (procIdx, proc) in procs.enumerated() {
+        for (procIdx, proc) in sorted.enumerated() {
             guard let start = labelOffset(proc.startLabel), let end = labelOffset(proc.endLabel) else { continue }
-            let isLast = procIdx == procs.count - 1
+            let isLast = procIdx == sorted.count - 1
 
-            if cieOffsets[proc.key] == nil {
-                cieOffsets[proc.key] = size
+            if proc.key != lastKey {
+                lastKey = proc.key
+                cieOffset = size
                 let cie = padded(cieBody(proc.key), alignment: 4, at: size)
                 records.append(Record(bytes: cie, pcBeginLabel: nil))
                 size += cie.count
             }
 
             var body: [UInt8] = []
-            appendLE(UInt64(size + 4 - cieOffsets[proc.key]!), width: 4, to: &body)  // CIE_pointer (relative)
+            appendLE(UInt64(size + 4 - cieOffset), width: 4, to: &body)              // CIE_pointer (relative)
             appendLE(0, width: 4, to: &body)                                         // pc_begin (relocated)
             appendLE(UInt64(max(0, end.1 - start.1)), width: 4, to: &body)           // pc_range
             body.append(0)                                                           // augmentation data length
@@ -2009,7 +2187,7 @@ public final class AsmCFIBuilder {
         body.append(0)
         appendULEB128(1, to: &body)                           // code_alignment_factor
         appendSLEB128(dataAlignmentFactor, to: &body)         // data_alignment_factor
-        appendULEB128(key.returnColumn, to: &body)            // return_address_register
+        appendULEB128(key.returnColumn ?? defaultReturnColumn, to: &body)  // return_address_register
         body.append(1)                                        // augmentation data length
         body.append(0x1B)                                     // FDE encoding: DW_EH_PE_pcrel | DW_EH_PE_sdata4
         if !key.simple {
@@ -2571,7 +2749,14 @@ internal final class AsmSession {
             }
 
         case ".cfi_startproc":
-            cfiBuilder.startProc(in: currentSection, sectionIndex: currentSectionIndex, args: args)
+            if cfiBuilder.hasActiveProcedure {
+                diagnostics.report(.asmCFIError, at: loc, args: ["starting new .cfi frame before finishing the previous one"])
+            } else {
+                cfiBuilder.startProc(in: currentSection, sectionIndex: currentSectionIndex, args: args)
+            }
+        case _ where dir.hasPrefix(".cfi_") && dir != ".cfi_sections" && !cfiBuilder.hasActiveProcedure:
+            // LLVM MC (and GNU `as`) reject CFI outside a `.cfi_startproc`/`.cfi_endproc` region
+            diagnostics.report(.asmCFIError, at: loc, args: ["this directive must appear between .cfi_startproc and .cfi_endproc directives"])
         case ".cfi_endproc":
             cfiBuilder.endProc(in: currentSection)
         case _ where dir.hasPrefix(".cfi_"):
@@ -2595,8 +2780,8 @@ internal final class AsmSession {
         }
     }
 
-    /// Emits `.byte`/`.short`/`.long`/`.quad` operands. Values already constant are encoded now, like GNU `as`
-    /// (so a later `.set` of the same symbol does not change them); the rest are resolved after layout.
+    /// Emits `.byte`/`.short`/`.long`/`.quad` operands. Values already constant are encoded now, as LLVM MC
+    /// inlines an absolute `.set` symbol at its use (so a later `.set` of the same symbol does not change them); the rest are resolved after layout.
     private func emitData(_ args: String, width: Int, loc: AsmLoc) {
         for expr in splitCommaSeparated(args) {
             if let v = AsmExprEvaluator.evaluate(expr, constants: constants)?.constantValue {
@@ -2633,9 +2818,9 @@ internal final class AsmSession {
         currentSection.emitBytes([UInt8](data[Int(skip)..<end]), loc: loc)
     }
 
-    /// `.equ`/`.set`/`=`. A value known now becomes a constant for the statements that follow (like GNU `as`);
+    /// `.equ`/`.set`/`=`. A value known now becomes a constant for the statements that follow (as in LLVM MC);
     /// one that depends on label positions not yet final (a forward reference, `. - msg` across an alignment)
-    /// is resolved after layout. Like GNU `as`/LLVM MC, an assigned constant is a local `SHN_ABS` symbol.
+    /// is resolved after layout. As in LLVM MC, an assigned constant is a local `SHN_ABS` symbol.
     private func assignSymbol(_ rawSym: String, _ rawExpr: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) {
         let sym = rawSym.trimmingCharacters(in: .whitespaces)
         noteSymbol(sym)
@@ -2651,31 +2836,36 @@ internal final class AsmSession {
         }
     }
 
-    /// Evaluates `expr` to a constant using the label offsets of the current section that are already final:
-    /// within a run of fixed-size fragments (no alignment or relaxable branch in between) label differences
-    /// cannot change, which is exactly when GNU `as` resolves them immediately.
+    /// Evaluates `expr` to a constant using label offsets that are already final: within a run of fixed-size
+    /// fragments of one section (no alignment or relaxable branch in between) label differences cannot change,
+    /// which is when LLVM MC (and GNU `as`) fold them at once, whichever section is current.
     private func evaluateWithFixedLayout(_ expr: String) -> Int64? {
         if let v = AsmExprEvaluator.evaluate(expr, constants: constants)?.constantValue { return v }
-        var runs: [[String: Int64]] = [[:]]
+        var runs: [[String: Int64]] = []
         var offset: Int64 = 0
-        for frag in currentSection.fragments {
-            switch frag {
-            case .label(let name):
-                runs[runs.count - 1][name] = offset
-            case .inst(let bytes, _, _):
-                offset += Int64(bytes.count)
-            case .dataExpr(let width, _, _):
-                offset += Int64(width)
-            case .fill(let countExpr, let unitSize, _, _):
-                if let c = AsmExprEvaluator.evaluate(countExpr, constants: constants)?.constantValue {
-                    offset += max(0, c) * Int64(unitSize)
-                } else {
+        for section in sections {
+            // Each section starts a new run
+            runs.append([:])
+            offset = 0
+            for frag in section.fragments {
+                switch frag {
+                case .label(let name):
+                    runs[runs.count - 1][name] = offset
+                case .inst(let bytes, _, _):
+                    offset += Int64(bytes.count)
+                case .dataExpr(let width, _, _):
+                    offset += Int64(width)
+                case .fill(let countExpr, let unitSize, _, _):
+                    if let c = AsmExprEvaluator.evaluate(countExpr, constants: constants)?.constantValue {
+                        offset += max(0, c) * Int64(unitSize)
+                    } else {
+                        runs.append([:])
+                        offset = 0
+                    }
+                case .align, .relaxable:
                     runs.append([:])
                     offset = 0
                 }
-            case .align, .relaxable:
-                runs.append([:])
-                offset = 0
             }
         }
         for labels in runs.reversed() where !labels.isEmpty {
@@ -3198,7 +3388,7 @@ internal final class AsmSession {
         return result
     }
 
-    /// Resolves label-dependent assignments after layout: to a constant (`SHN_ABS` symbol, like GNU `as`), to a
+    /// Resolves label-dependent assignments after layout: to a constant (`SHN_ABS` symbol, as in LLVM MC), to a
     /// label plus offset in a section (an alias defined there), or to an undefined symbol plus addend (references
     /// are redirected to that symbol). Anything else is an invalid expression.
     private func resolveDeferredAssignments(sectionSymbolOffsets: [[String: Int64]], diagnostics: inout DiagnosticBag) {
