@@ -383,13 +383,15 @@ public enum A64Cond: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable, Case
     }
 }
 
-/// Shift kind for shifted register operands (`lsl=0, lsr=1, asr=2, ror=3`).
+/// Shift kind for shifted register operands (`lsl=0, lsr=1, asr=2, ror=3`), plus the "masking shift left"
+/// `msl` of Advanced SIMD modified immediates (not encodable in a shifted-register `shift` field).
 @frozen
 public enum A64ShiftKind: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable {
     case lsl = 0
     case lsr = 1
     case asr = 2
     case ror = 3
+    case msl = 4
 
     public var mnemonic: String {
         switch self {
@@ -397,6 +399,7 @@ public enum A64ShiftKind: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable 
         case .lsr: return "lsr"
         case .asr: return "asr"
         case .ror: return "ror"
+        case .msl: return "msl"
         }
     }
 
@@ -406,6 +409,7 @@ public enum A64ShiftKind: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable 
         case "lsr": return .lsr
         case "asr": return .asr
         case "ror": return .ror
+        case "msl": return .msl
         default:    return nil
         }
     }
@@ -458,55 +462,42 @@ public enum A64ExtendKind: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable
     }
 }
 
-/// Memory barrier option for `dmb`, `dsb`, `isb` (4-bit `CRm` field).
+/// Barrier option: the 4-bit `CRm` field of `dmb`/`dsb`, also the `CRm` immediate of `isb`/`clrex`.
+/// Every value is a valid encoding; the four without a name (`0`, `4`, `8`, `12`) print as `#imm`.
 @frozen
-public enum A64BarrierOption: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable {
-    case oshld = 0b0001
-    case oshst = 0b0010
-    case osh   = 0b0011
-    case nshld = 0b0101
-    case nshst = 0b0110
-    case nsh   = 0b0111
-    case ishld = 0b1001
-    case ishst = 0b1010
-    case ish   = 0b1011
-    case ld    = 0b1101
-    case st    = 0b1110
-    case sy    = 0b1111
+public struct A64BarrierOption: RawRepresentable, Equatable, Hashable, Sendable, BitwiseCopyable {
+    public var rawValue: UInt8
 
-    public var mnemonic: String {
-        switch self {
-        case .oshld: return "oshld"
-        case .oshst: return "oshst"
-        case .osh:   return "osh"
-        case .nshld: return "nshld"
-        case .nshst: return "nshst"
-        case .nsh:   return "nsh"
-        case .ishld: return "ishld"
-        case .ishst: return "ishst"
-        case .ish:   return "ish"
-        case .ld:    return "ld"
-        case .st:    return "st"
-        case .sy:    return "sy"
-        }
+    @inlinable
+    public init(rawValue: UInt8) {
+        self.rawValue = rawValue & 0xF
     }
 
+    public static let oshld = A64BarrierOption(rawValue: 0b0001)
+    public static let oshst = A64BarrierOption(rawValue: 0b0010)
+    public static let osh   = A64BarrierOption(rawValue: 0b0011)
+    public static let nshld = A64BarrierOption(rawValue: 0b0101)
+    public static let nshst = A64BarrierOption(rawValue: 0b0110)
+    public static let nsh   = A64BarrierOption(rawValue: 0b0111)
+    public static let ishld = A64BarrierOption(rawValue: 0b1001)
+    public static let ishst = A64BarrierOption(rawValue: 0b1010)
+    public static let ish   = A64BarrierOption(rawValue: 0b1011)
+    public static let ld    = A64BarrierOption(rawValue: 0b1101)
+    public static let st    = A64BarrierOption(rawValue: 0b1110)
+    public static let sy    = A64BarrierOption(rawValue: 0b1111)
+
+    private static let names: [String] = [
+        "#0", "oshld", "oshst", "osh", "#4", "nshld", "nshst", "nsh",
+        "#8", "ishld", "ishst", "ish", "#12", "ld", "st", "sy",
+    ]
+
+    public var mnemonic: String { Self.names[Int(rawValue)] }
+
+    /// Parses a named option (`ish`, `sy`, ...). `#imm` forms are parsed by the assembler as immediates.
     public static func parse(_ text: Substring) -> A64BarrierOption? {
-        switch text.lowercased() {
-        case "oshld": return .oshld
-        case "oshst": return .oshst
-        case "osh":   return .osh
-        case "nshld": return .nshld
-        case "nshst": return .nshst
-        case "nsh":   return .nsh
-        case "ishld": return .ishld
-        case "ishst": return .ishst
-        case "ish":   return .ish
-        case "ld":    return .ld
-        case "st":    return .st
-        case "sy":    return .sy
-        default:      return nil
-        }
+        let lower = text.lowercased()
+        guard !lower.hasPrefix("#"), let i = names.firstIndex(of: lower) else { return nil }
+        return A64BarrierOption(rawValue: UInt8(i))
     }
 }
 
@@ -564,92 +555,126 @@ public enum A64PStateField: UInt8, Equatable, Hashable, Sendable, BitwiseCopyabl
     }
 }
 
-/// System maintenance instruction category (`tlbi`, `ic`, `dc`).
+/// System maintenance instruction category (`tlbi`, `ic`, `dc`, `at`), all aliases of `SYS`.
 @frozen
 public enum A64SysMaintKind: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable {
     case tlbi = 0
     case ic   = 1
     case dc   = 2
+    case at   = 3
+
+    public var mnemonic: String {
+        switch self {
+        case .tlbi: return "tlbi"
+        case .ic:   return "ic"
+        case .dc:   return "dc"
+        case .at:   return "at"
+        }
+    }
 }
 
-/// System maintenance operation for `tlbi`, `ic`, and `dc`.
+/// System maintenance operation for `tlbi`, `ic`, `dc`, and `at` (the base-architecture operations
+/// plus the EL2 ones Todhchai and Croi use; feature-gated `OS`/range/MTE variants are not included).
 @frozen
 public enum A64SysMaintOp: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable, CaseIterable {
     // TLBI
-    case vmalle1   // op1=0, CRn=8, CRm=7, op2=0, no reg (Rt=31)
-    case vmalle1is // op1=0, CRn=8, CRm=3, op2=0, no reg (Rt=31)
-    case vae1is    // op1=0, CRn=8, CRm=3, op2=1, Rt
-    case aside1is  // op1=0, CRn=8, CRm=3, op2=2, Rt
-    case vaae1is   // op1=0, CRn=8, CRm=3, op2=3, Rt
-    case vale1is   // op1=0, CRn=8, CRm=3, op2=5, Rt
+    case vmalle1
+    case vmalle1is
+    case vae1is
+    case aside1is
+    case vaae1is
+    case vale1is
+    case vaale1is
+    case vae1
+    case aside1
+    case vaae1
+    case vale1
+    case vaale1
+    case ipas2e1is
+    case alle2is
+    case vae2is
+    case alle1is
+    case vmalls12e1is
+    case alle2
+    case vae2
+    case alle1
+    case vmalls12e1
     // IC
-    case ialluis   // op1=0, CRn=7, CRm=1, op2=0, no reg (Rt=31)
-    case iallu     // op1=0, CRn=7, CRm=5, op2=0, no reg (Rt=31)
-    case ivau      // op1=3, CRn=7, CRm=5, op2=1, Rt
+    case ialluis
+    case iallu
+    case ivau
     // DC
-    case zva       // op1=3, CRn=7, CRm=4, op2=1, Rt
-    case ivac      // op1=0, CRn=7, CRm=6, op2=1, Rt
-    case cvac      // op1=3, CRn=7, CRm=10, op2=1, Rt
-    case cvau      // op1=3, CRn=7, CRm=11, op2=1, Rt
-    case civac     // op1=3, CRn=7, CRm=14, op2=1, Rt
+    case zva
+    case ivac
+    case isw
+    case cvac
+    case csw
+    case cvau
+    case civac
+    case cisw
+    // AT
+    case s1e1r
+    case s1e1w
+    case s1e0r
+    case s1e0w
+    case s1e2r
+    case s1e2w
 
-    public var kind: A64SysMaintKind {
+    /// `(kind, op1, CRn, CRm, op2, takesRegister)` for the `SYS` encoding (`0xD5080000` base).
+    private var fields: (kind: A64SysMaintKind, op1: UInt32, crn: UInt32, crm: UInt32, op2: UInt32, takesRegister: Bool) {
         switch self {
-        case .vmalle1, .vmalle1is, .vae1is, .aside1is, .vaae1is, .vale1is:
-            return .tlbi
-        case .ialluis, .iallu, .ivau:
-            return .ic
-        case .zva, .ivac, .cvac, .cvau, .civac:
-            return .dc
+        case .vmalle1:     return (.tlbi, 0,  8,  7, 0, false)
+        case .vmalle1is:   return (.tlbi, 0,  8,  3, 0, false)
+        case .vae1is:      return (.tlbi, 0,  8,  3, 1, true)
+        case .aside1is:    return (.tlbi, 0,  8,  3, 2, true)
+        case .vaae1is:     return (.tlbi, 0,  8,  3, 3, true)
+        case .vale1is:     return (.tlbi, 0,  8,  3, 5, true)
+        case .vaale1is:    return (.tlbi, 0,  8,  3, 7, true)
+        case .vae1:        return (.tlbi, 0,  8,  7, 1, true)
+        case .aside1:      return (.tlbi, 0,  8,  7, 2, true)
+        case .vaae1:       return (.tlbi, 0,  8,  7, 3, true)
+        case .vale1:       return (.tlbi, 0,  8,  7, 5, true)
+        case .vaale1:      return (.tlbi, 0,  8,  7, 7, true)
+        case .ipas2e1is:   return (.tlbi, 4,  8,  0, 1, true)
+        case .alle2is:     return (.tlbi, 4,  8,  3, 0, false)
+        case .vae2is:      return (.tlbi, 4,  8,  3, 1, true)
+        case .alle1is:     return (.tlbi, 4,  8,  3, 4, false)
+        case .vmalls12e1is: return (.tlbi, 4,  8,  3, 6, false)
+        case .alle2:       return (.tlbi, 4,  8,  7, 0, false)
+        case .vae2:        return (.tlbi, 4,  8,  7, 1, true)
+        case .alle1:       return (.tlbi, 4,  8,  7, 4, false)
+        case .vmalls12e1:  return (.tlbi, 4,  8,  7, 6, false)
+        case .ialluis:     return (.ic,  0,  7,  1, 0, false)
+        case .iallu:       return (.ic,  0,  7,  5, 0, false)
+        case .ivau:        return (.ic,  3,  7,  5, 1, true)
+        case .zva:         return (.dc,  3,  7,  4, 1, true)
+        case .ivac:        return (.dc,  0,  7,  6, 1, true)
+        case .isw:         return (.dc,  0,  7,  6, 2, true)
+        case .cvac:        return (.dc,  3,  7, 10, 1, true)
+        case .csw:         return (.dc,  0,  7, 10, 2, true)
+        case .cvau:        return (.dc,  3,  7, 11, 1, true)
+        case .civac:       return (.dc,  3,  7, 14, 1, true)
+        case .cisw:        return (.dc,  0,  7, 14, 2, true)
+        case .s1e1r:       return (.at,  0,  7,  8, 0, true)
+        case .s1e1w:       return (.at,  0,  7,  8, 1, true)
+        case .s1e0r:       return (.at,  0,  7,  8, 2, true)
+        case .s1e0w:       return (.at,  0,  7,  8, 3, true)
+        case .s1e2r:       return (.at,  4,  7,  8, 0, true)
+        case .s1e2w:       return (.at,  4,  7,  8, 1, true)
         }
     }
 
-    public var takesRegister: Bool {
-        switch self {
-        case .vmalle1, .vmalle1is, .ialluis, .iallu:
-            return false
-        default:
-            return true
-        }
-    }
+    public var kind: A64SysMaintKind { fields.kind }
 
-    public var operandName: String {
-        switch self {
-        case .vmalle1:   return "vmalle1"
-        case .vmalle1is: return "vmalle1is"
-        case .vae1is:    return "vae1is"
-        case .aside1is:  return "aside1is"
-        case .vaae1is:   return "vaae1is"
-        case .vale1is:   return "vale1is"
-        case .ialluis:   return "ialluis"
-        case .iallu:     return "iallu"
-        case .ivau:      return "ivau"
-        case .zva:       return "zva"
-        case .ivac:      return "ivac"
-        case .cvac:      return "cvac"
-        case .cvau:      return "cvau"
-        case .civac:     return "civac"
-        }
-    }
+    /// False for the operations with no register operand (`Rt` is encoded as 31).
+    public var takesRegister: Bool { fields.takesRegister }
 
-    /// Returns `(op1, crn, crm, op2)` for the `SYS` instruction encoding (`0xD5080000` base).
+    public var operandName: String { "\(self)" }
+
+    /// Returns `(op1, crn, crm, op2)` for the `SYS` instruction encoding.
     public var sysFields: (op1: UInt32, crn: UInt32, crm: UInt32, op2: UInt32) {
-        switch self {
-        case .vmalle1:   return (0, 8, 7, 0)
-        case .vmalle1is: return (0, 8, 3, 0)
-        case .vae1is:    return (0, 8, 3, 1)
-        case .aside1is:  return (0, 8, 3, 2)
-        case .vaae1is:   return (0, 8, 3, 3)
-        case .vale1is:   return (0, 8, 3, 5)
-        case .ialluis:   return (0, 7, 1, 0)
-        case .iallu:     return (0, 7, 5, 0)
-        case .ivau:      return (3, 7, 5, 1)
-        case .zva:       return (3, 7, 4, 1)
-        case .ivac:      return (0, 7, 6, 1)
-        case .cvac:      return (3, 7, 10, 1)
-        case .cvau:      return (3, 7, 11, 1)
-        case .civac:     return (3, 7, 14, 1)
-        }
+        let f = fields
+        return (f.op1, f.crn, f.crm, f.op2)
     }
 
     public static func from(op1: UInt32, crn: UInt32, crm: UInt32, op2: UInt32) -> A64SysMaintOp? {
@@ -660,6 +685,11 @@ public enum A64SysMaintOp: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable
             }
         }
         return nil
+    }
+
+    public static func parse(kind: A64SysMaintKind, name: Substring) -> A64SysMaintOp? {
+        let lower = name.lowercased()
+        return allCases.first { $0.kind == kind && $0.operandName == lower }
     }
 }
 
@@ -982,9 +1012,83 @@ public enum A64BitmaskImmediate {
     }
 }
 
+// MARK: - 2b. FP and Advanced SIMD Immediates
+
+/// The 8-bit `abcdefgh` floating-point immediate of `fmov` (Arm ARM `VFPExpandImm`): values
+/// `±(16..31)/16 * 2^(-3..4)`, i.e. `±0.125 ... ±31.0`.
+public enum A64FPImmediate {
+    /// The exact value of `imm8` (the same for half, single and double precision).
+    public static func decode(_ imm8: UInt8) -> Double {
+        let sign = UInt64(imm8 >> 7) & 1
+        let b = UInt64(imm8 >> 6) & 1
+        let cd = UInt64(imm8 >> 4) & 0b11
+        let efgh = UInt64(imm8 & 0xF)
+        // Double exponent: NOT(b) : Replicate(b, 8) : c : d.
+        let exponent = ((b ^ 1) << 10) | ((b == 1 ? 0xFF : 0) << 2) | cd
+        return Double(bitPattern: (sign << 63) | (exponent << 52) | (efgh << 48))
+    }
+
+    /// The `imm8` encoding `value` exactly, if there is one.
+    public static func encode(_ value: Double) -> UInt8? {
+        for candidate in 0...255 where decode(UInt8(candidate)) == value {
+            return UInt8(candidate)
+        }
+        return nil
+    }
+
+    /// LLVM's spelling, e.g. `1.00000000` (8 decimals are exact for every encodable value).
+    public static func format(_ imm8: UInt8) -> String {
+        String(format: "%.8f", decode(imm8))
+    }
+}
+
+/// The 64-bit "byte mask" immediate of `movi Dd, #imm` / `movi Vd.2d, #imm`: every byte is `0x00` or `0xFF`,
+/// and bit `i` of `abcdefgh` selects byte `i`.
+public enum A64SIMDByteMask {
+    public static func encode(_ value: UInt64) -> UInt8? {
+        var imm8: UInt8 = 0
+        for i in 0..<8 {
+            switch (value >> (8 * UInt64(i))) & 0xFF {
+            case 0xFF: imm8 |= 1 << UInt8(i)
+            case 0x00: break
+            default:   return nil
+            }
+        }
+        return imm8
+    }
+
+    public static func decode(_ imm8: UInt8) -> UInt64 {
+        var value: UInt64 = 0
+        for i in 0..<8 where (imm8 >> UInt8(i)) & 1 != 0 {
+            value |= 0xFF << (8 * UInt64(i))
+        }
+        return value
+    }
+}
+
+/// PSTATE `hint` aliases that LLVM prints (with `+pauth`/`+bti`) and accepts, keyed by the `CRm:op2` immediate.
+public enum A64HintAlias {
+    public static let names: [Int64: String] = [
+        6: "dgh", 7: "xpaclri", 8: "pacia1716", 10: "pacib1716", 12: "autia1716", 14: "autib1716", 20: "csdb",
+        24: "paciaz", 25: "paciasp", 26: "pacibz", 27: "pacibsp", 28: "autiaz", 29: "autiasp", 30: "autibz", 31: "autibsp",
+        32: "bti", 34: "bti c", 36: "bti j", 38: "bti jc",
+    ]
+
+    public static let byName: [String: Int64] = {
+        var map: [String: Int64] = [:]
+        for (imm, name) in names { map[name] = imm }
+        return map
+    }()
+}
+
 // MARK: - 3. Shared Instruction Descriptor Table & Structured Instruction Model
 
 /// Encoding format classes for the AArch64 table-driven encoder and disassembler.
+///
+/// Field conventions in `A64Instruction` that are not obvious from the names: `scalarWidth` is the FP
+/// register width or the memory access size (LSE: `.b`/`.h`/`.s`=32-bit/`.d`=64-bit); `scalarWidth2` is the
+/// source width of `fcvt`; `imm2` is a second immediate (`nzcv`, `imms`, a source lane, a register-list
+/// length, or the explicit `S` bit of a byte register-offset load); `va` is the fourth FP register (`Ra`).
 @frozen
 public enum A64InstrFormat: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable {
     // Data processing — immediate
@@ -1016,12 +1120,12 @@ public enum A64InstrFormat: UInt8, Equatable, Hashable, Sendable, BitwiseCopyabl
     case exceptionImm16     // svc, hvc, smc, brk, hlt (#imm16)
     case udfImm16           // udf (#imm16)
     case fixedSystem        // eret, nop, yield, wfe, wfi, sev, sevl
-    case hintImm7           // hint (#imm7)
-    case barrier            // dmb, dsb, isb, clrex
+    case hintImm7           // hint (#imm7), printed as its PAC/BTI/CSDB alias where one exists
+    case barrier            // dmb, dsb, isb, clrex (CRm option or #imm4)
     case mrs                // mrs Xt, <sysreg>
     case msrReg             // msr <sysreg>, Xt
     case msrPState          // msr <pstatefield>, #imm4
-    case sysMaint           // tlbi, ic, dc
+    case sysMaint           // tlbi, ic, dc, at
 
     // Loads and stores
     case ldstUnsignedImm12  // ldr, str, ldrb, strb, ldrh, strh, ldrsb, ldrsh, ldrsw (unsigned scaled offset)
@@ -1030,37 +1134,75 @@ public enum A64InstrFormat: UInt8, Equatable, Hashable, Sendable, BitwiseCopyabl
     case ldstUnscaledImm9   // ldur, stur, ldurb, sturb, ldurh, sturh, ldursb, ldursh, ldursw
     case ldstUnprivImm9     // ldtr, sttr, ldtrb, sttrb, ldtrh, sttrh, ldtrsb, ldtrsh, ldtrsw
     case ldstRegOffset      // ldr, str, ... [Xn, Rm, extend #shift]
-    case ldrLiteral         // ldr Wt/Xt, label (imm19 * 4)
-    case ldpStpSigned       // ldp, stp (Wt/Xt/Qt, [Xn, #simm7 * scale])
-    case ldpStpPre          // ldp, stp (Wt/Xt/Qt, [Xn, #simm7 * scale]!)
-    case ldpStpPost         // ldp, stp (Wt/Xt/Qt, [Xn], #simm7 * scale)
-    case atomicLoad         // ldxr, ldaxr, ldar, ldarb, ldarh (Rt, [Xn])
+    case ldrLiteral         // ldr Wt/Xt, ldrsw Xt, label (imm19 * 4)
+    case ldpStpSigned       // ldp, stp (Wt/Xt, [Xn, #simm7 * scale])
+    case ldpStpPre          // ldp, stp (Wt/Xt, [Xn, #simm7 * scale]!)
+    case ldpStpPost         // ldp, stp (Wt/Xt, [Xn], #simm7 * scale)
+    case atomicLoad         // ldxr, ldaxr, ldar (+b/h) (Rt, [Xn])
     case atomicStore        // stlr, stlrb, stlrh (Rt, [Xn])
-    case atomicStoreExcl    // stxr, stlxr (Ws, Rt, [Xn])
+    case atomicStoreExcl    // stxr, stlxr (+b/h) (Ws, Rt, [Xn])
+    case atomicLoadPair     // ldxp, ldaxp (Rt, Rt2, [Xn])
+    case atomicStoreExclPair // stxp, stlxp (Ws, Rt, Rt2, [Xn])
 
-    // Scalar FP
-    case fpMovGprToFp       // fmov s0, w0 / fmov d0, x0
-    case fpMovFpToGpr       // fmov w0, s0 / fmov x0, d0
-    case fpMovReg           // fmov s0, s1 / fmov d0, d1
-    case fpCvtReg           // fcvt d0, s1 / fcvt s0, d1
-    case fpIntToFp          // scvtf s0, w1 / scvtf d0, x1
-    case fpToInt            // fcvtzs w0, s1 / fcvtzs x0, d1
-    case fpBinary           // fadd, fsub, fmul, fdiv (scalar s/d)
-    case fpCmpReg           // fcmp s0, s1 / fcmp d0, d1
-    case fpCmpZero          // fcmp s0, #0.0 / fcmp d0, #0.0
+    // LSE atomics (FEAT_LSE)
+    case lseAtomic          // ld<op>[a][l][b|h], swp[a][l][b|h] (Rs, Rt, [Xn]); st<op> alias when Rt = zr
+    case lseCas             // cas[a][l][b|h] (Rs, Rt, [Xn])
+    case lseCasp            // casp[a][l] (Rs, Rs+1, Rt, Rt+1, [Xn])
+
+    // SIMD/FP loads and stores (b/h/s/d/q)
+    case fpLdstPreImm9      // ldr, str Bt..Qt, [Xn, #simm9]!
+    case fpLdstPostImm9     // ldr, str Bt..Qt, [Xn], #simm9
+    case fpLdstUnscaledImm9 // ldur, stur Bt..Qt, [Xn, #simm9]
+    case fpLdstRegOffset    // ldr, str Bt..Qt, [Xn, Rm, extend #shift]
+    case fpLdrLiteral       // ldr St/Dt/Qt, label
+    case fpLdpStpSigned     // ldp, stp St/Dt/Qt, [Xn, #simm7 * scale]
+    case fpLdpStpPre        // ldp, stp St/Dt/Qt, [Xn, #simm7 * scale]!
+    case fpLdpStpPost       // ldp, stp St/Dt/Qt, [Xn], #simm7 * scale
+
+    // Scalar FP (h/s/d)
+    case fpMovGprToFp       // fmov Hd/Sd/Dd, Wn/Xn
+    case fpMovFpToGpr       // fmov Wd/Xd, Hn/Sn/Dn
+    case fpDp1              // fmov, fabs, fneg, fsqrt, frint[npmzaxi] (Fd, Fn)
+    case fpCvtPrecision     // fcvt (Fd, Fn) between h, s, d
+    case fpIntToFp          // scvtf, ucvtf (Fd, Rn)
+    case fpToInt            // fcvt[npmza][su] (Rd, Fn)
+    case fpFixedToFp        // scvtf, ucvtf (Fd, Rn, #fbits)
+    case fpToFixed          // fcvtzs, fcvtzu (Rd, Fn, #fbits)
+    case fpBinary           // fadd, fsub, fmul, fdiv, fmax, fmin, fmaxnm, fminnm, fnmul (Fd, Fn, Fm)
+    case fpDp3              // fmadd, fmsub, fnmadd, fnmsub (Fd, Fn, Fm, Fa)
+    case fpCmpReg           // fcmp, fcmpe (Fn, Fm)
+    case fpCmpZero          // fcmp, fcmpe (Fn, #0.0)
+    case fpCondCompare      // fccmp, fccmpe (Fn, Fm, #nzcv, cond)
+    case fpCondSelect       // fcsel (Fd, Fn, Fm, cond)
+    case fpImm              // fmov (Fd, #fp8)
 
     // Advanced SIMD (NEON)
-    case simdThreeSameInt   // add, sub, mul, cmeq, cmgt, cmge
-    case simdThreeSameBit   // and, bic, orr, orn, eor (8b/16b)
-    case simdThreeSameFp    // fadd, fsub, fmul, fdiv (2s/4s/2d)
-    case simdPermute        // uzp1, uzp2, zip1, zip2
-    case simdTwoRegMisc     // cnt, rev64
-    case simdShiftImm       // shl, ushr, sshr
-    case simdDupGpr         // dup v0.<T>, w1/x1
-    case simdInsGpr         // ins v0.<ts>[idx], w1/x1
-    case simdUmovSmov       // umov, smov w0/x0, v1.<ts>[idx]
-    case simdLd1St1One      // ld1, st1 {v0.<T>}, [x1]
-    case simdTblOne         // tbl v0.<8b|16b>, {v1.16b}, v2.<8b|16b>
+    case simdThreeSameInt   // add, sub, mul, mla, mls, cm*, s/u max/min/abd, addp, sq/uq add/sub, s/u shl
+    case simdThreeSameBit   // and, bic, orr (mov alias), orn, eor, bsl, bit, bif (8b/16b)
+    case simdThreeSameFp    // fadd, fsub, fmul, fdiv, fmax, fmin, fmaxnm, fminnm, fmla, fmls, fcm*, faddp, fabd
+    case simdPermute        // uzp1, uzp2, zip1, zip2, trn1, trn2
+    case simdTwoRegMisc     // cnt, not (mvn), rbit, rev16/32/64, cls, clz, abs, neg
+    case simdCmpZero        // cmeq, cmge, cmgt, cmle, cmlt (Vd, Vn, #0)
+    case simdTwoRegMiscFp   // fabs, fneg, fsqrt, scvtf, ucvtf, fcvtzs, fcvtzu, frint[npmzaxi]
+    case simdAcrossLanes    // addv, smaxv, sminv, umaxv, uminv (scalar Vd, Vn.<T>)
+    case simdNarrow         // xtn, xtn2 (Vd.<Tb>, Vn.<Ta>)
+    case simdShiftImm       // shl, sli, sshr, ushr, ssra, usra, sri
+    case simdShiftLong      // sshll[2], ushll[2] (Vd.<Ta>, Vn.<Tb>, #shift)
+    case simdShiftNarrow    // shrn[2] (Vd.<Tb>, Vn.<Ta>, #shift)
+    case simdDupElem        // dup Vd.<T>, Vn.<Ts>[idx]
+    case simdDupGpr         // dup Vd.<T>, Wn/Xn
+    case simdDupScalar      // mov (dup) Bd/Hd/Sd/Dd, Vn.<Ts>[idx]
+    case simdInsGpr         // mov (ins) Vd.<Ts>[idx], Wn/Xn
+    case simdInsElem        // mov (ins) Vd.<Ts>[idx], Vn.<Ts>[idx2]
+    case simdUmovSmov       // umov (mov alias for s/d), smov Wd/Xd, Vn.<Ts>[idx]
+    case simdModImm         // movi, mvni, orr, bic, fmov (vector, immediate)
+    case simdLdStMulti      // ld1-4, st1-4 {list}, [Xn]
+    case simdLdStMultiPost  // ld1-4, st1-4 {list}, [Xn], #imm|Xm
+    case simdLd1R           // ld1r {Vt.<T>}, [Xn]
+    case simdLd1RPost       // ld1r {Vt.<T>}, [Xn], #imm|Xm
+    case simdLdStLane       // ld1, st1 {Vt.<Ts>}[idx], [Xn]
+    case simdLdStLanePost   // ld1, st1 {Vt.<Ts>}[idx], [Xn], #imm|Xm
+    case simdTbl            // tbl, tbx Vd.<8b|16b>, {list .16b}, Vm.<8b|16b>
     case simdExt            // ext v0.<8b|16b>, v1.<8b|16b>, v2.<8b|16b>, #imm4
 
     // SVE (croi/kernel/arch/arm64/cpu.S subset)
@@ -1107,8 +1249,8 @@ public enum A64OpcodeId: UInt16, Equatable, Hashable, Sendable, BitwiseCopyable,
     case ldrFpImmB, strFpImmB, ldrFpImmH, strFpImmH, ldrFpImmS, strFpImmS, ldrFpImmD, strFpImmD, ldrFpImmQ, strFpImmQ
 
     // Loads and stores — pre-index & post-index
-    case ldrPre, strPre, ldrbPre, strbPre, ldrhPre, strhPre, ldrsbPre64, ldrshPre64, ldrswPre
-    case ldrPost, strPost, ldrbPost, strbPost, ldrhPost, strhPost, ldrsbPost64, ldrshPost64, ldrswPost
+    case ldrPre, strPre, ldrbPre, strbPre, ldrhPre, strhPre, ldrsbPre64, ldrsbPre32, ldrshPre64, ldrshPre32, ldrswPre
+    case ldrPost, strPost, ldrbPost, strbPost, ldrhPost, strhPost, ldrsbPost64, ldrsbPost32, ldrshPost64, ldrshPost32, ldrswPost
 
     // Loads and stores — unscaled (`ldur`/`stur`)
     case ldur, stur, ldurb, sturb, ldurh, sturh, ldursb64, ldursb32, ldursh64, ldursh32, ldursw
@@ -1117,35 +1259,159 @@ public enum A64OpcodeId: UInt16, Equatable, Hashable, Sendable, BitwiseCopyable,
     case ldtr, sttr, ldtrb, sttrb, ldtrh, sttrh, ldtrsb64, ldtrsb32, ldtrsh64, ldtrsh32, ldtrsw
 
     // Loads and stores — register offset & literal
-    case ldrReg, strReg, ldrbReg, strbReg, ldrhReg, strhReg, ldrsbReg64, ldrshReg64, ldrswReg
-    case ldrLit
+    case ldrReg, strReg, ldrbReg, strbReg, ldrhReg, strhReg, ldrsbReg64, ldrsbReg32, ldrshReg64, ldrshReg32, ldrswReg
+    case ldrLit, ldrswLit
 
     // Loads and stores — pairs (`ldp`/`stp`)
     case ldpSigned, stpSigned, ldpPre, stpPre, ldpPost, stpPost
-    case ldpSignedQ, stpSignedQ, ldpPreQ, stpPreQ, ldpPostQ, stpPostQ
 
     // Atomics / exclusives
     case ldxr, stxr, ldaxr, stlxr, ldar, stlr, ldarb, stlrb, ldarh, stlrh
+    case ldxrb, ldxrh, ldaxrb, ldaxrh, stxrb, stxrh, stlxrb, stlxrh
+    case ldxp, ldaxp, stxp, stlxp
+
+    // LSE atomics
+    case ldadd, ldclr, ldeor, ldset, ldsmax, ldsmin, ldumax, ldumin, swp
+    case cas, casp
+
+    // SIMD/FP loads and stores
+    case ldrFpPre, strFpPre, ldrFpPost, strFpPost, ldurFp, sturFp, ldrFpReg, strFpReg, ldrFpLit
+    case ldpFpSigned, stpFpSigned, ldpFpPre, stpFpPre, ldpFpPost, stpFpPost
 
     // Scalar FP
-    case fmovGprToFp, fmovFpToGpr, fmovReg
-    case fcvtStoD, fcvtDtoS, scvtf, fcvtzs
-    case faddScalar, fsubScalar, fmulScalar, fdivScalar
-    case fcmpReg, fcmpZero
+    case fmovGprToFp, fmovFpToGpr
+    case fmovReg, fabs, fneg, fsqrt, frintn, frintp, frintm, frintz, frinta, frintx, frinti
+    case fcvt
+    case scvtf, ucvtf, fcvtns, fcvtnu, fcvtas, fcvtau, fcvtps, fcvtpu, fcvtms, fcvtmu, fcvtzs, fcvtzu
+    case scvtfFixed, ucvtfFixed, fcvtzsFixed, fcvtzuFixed
+    case fmulScalar, fdivScalar, faddScalar, fsubScalar, fmaxScalar, fminScalar, fmaxnmScalar, fminnmScalar, fnmul
+    case fmadd, fmsub, fnmadd, fnmsub
+    case fcmpReg, fcmpeReg, fcmpZero, fcmpeZero
+    case fccmp, fccmpe, fcsel, fmovImm
 
     // Advanced SIMD (NEON)
-    case simdAdd, simdSub, simdMul, simdCmeq, simdCmgt, simdCmge
-    case simdAnd, simdBic, simdOrr, simdOrn, simdEor
-    case simdFadd, simdFsub, simdFmul, simdFdiv
-    case simdUzp1, simdUzp2, simdZip1, simdZip2
-    case simdCnt, simdRev64
-    case simdShl, simdUshr, simdSshr
-    case simdDupGpr, simdInsGpr, simdUmov, simdSmov
-    case simdLd1One, simdSt1One, simdTblOne, simdExt
+    case simdAdd, simdSub, simdMul, simdMla, simdMls, simdCmeq, simdCmtst, simdCmgt, simdCmge, simdCmhi, simdCmhs
+    case simdSmax, simdSmin, simdUmax, simdUmin, simdSabd, simdUabd, simdAddp
+    case simdSqadd, simdUqadd, simdSqsub, simdUqsub, simdSshl, simdUshl
+    case simdAnd, simdBic, simdOrr, simdOrn, simdEor, simdBsl, simdBit, simdBif
+    case simdFadd, simdFsub, simdFmul, simdFdiv, simdFmax, simdFmin, simdFmaxnm, simdFminnm
+    case simdFmla, simdFmls, simdFcmeq, simdFcmge, simdFcmgt, simdFaddp, simdFabd
+    case simdUzp1, simdUzp2, simdZip1, simdZip2, simdTrn1, simdTrn2
+    case simdCnt, simdNot, simdRbit, simdRev16, simdRev32, simdRev64, simdCls, simdClz, simdAbs, simdNeg
+    case simdCmeqZero, simdCmgeZero, simdCmgtZero, simdCmleZero, simdCmltZero
+    case simdFabs, simdFneg, simdFsqrt, simdScvtf, simdUcvtf, simdFcvtzs, simdFcvtzu
+    case simdFrintn, simdFrintp, simdFrintm, simdFrintz, simdFrinta, simdFrintx, simdFrinti
+    case simdAddv, simdSmaxv, simdSminv, simdUmaxv, simdUminv
+    case simdXtn
+    case simdShl, simdSli, simdSshr, simdUshr, simdSsra, simdUsra, simdSri
+    case simdSshll, simdUshll, simdShrn
+    case simdDupElem, simdDupGpr, simdDupScalar, simdInsGpr, simdInsElem, simdUmov, simdSmov
+    case simdMovi, simdMvni, simdOrrImm, simdBicImm, simdFmovImm
+    case simdLd1, simdSt1, simdLd2, simdSt2, simdLd3, simdSt3, simdLd4, simdSt4
+    case simdLd1Post, simdSt1Post, simdLd2Post, simdSt2Post, simdLd3Post, simdSt3Post, simdLd4Post, simdSt4Post
+    case simdLd1R, simdLd1RPost, simdLd1Lane, simdSt1Lane, simdLd1LanePost, simdSt1LanePost
+    case simdTbl, simdTbx, simdExt
 
     // SVE
     case sveLdrZ, sveStrZ, sveLdrP, sveStrP
     case sveAddvl, sveAddpl, sveRdffr, sveWrffr
+}
+
+/// Bit sets of the scalar widths (`1 << A64ScalarWidth.rawValue`) and vector arrangements
+/// (`1 << A64Arrangement.rawValue`) a descriptor accepts. The encoder rejects anything outside them,
+/// and the exhaustive round-trip test sweeps exactly them.
+public enum A64Variants {
+    public static let b: UInt8 = 1 << 0
+    public static let h: UInt8 = 1 << 1
+    public static let s: UInt8 = 1 << 2
+    public static let d: UInt8 = 1 << 3
+    public static let q: UInt8 = 1 << 4
+    public static let hsd: UInt8 = h | s | d
+    public static let sd: UInt8 = s | d
+    public static let sdq: UInt8 = s | d | q
+    public static let bhsd: UInt8 = b | h | s | d
+    public static let bhsdq: UInt8 = b | h | s | d | q
+
+    public static let b8: UInt16 = 1 << 0
+    public static let b16: UInt16 = 1 << 1
+    public static let h4: UInt16 = 1 << 2
+    public static let h8: UInt16 = 1 << 3
+    public static let s2: UInt16 = 1 << 4
+    public static let s4: UInt16 = 1 << 5
+    public static let d1: UInt16 = 1 << 6
+    public static let d2: UInt16 = 1 << 7
+    public static let bytes: UInt16 = b8 | b16
+    public static let bh: UInt16 = b8 | b16 | h4 | h8
+    public static let bhs: UInt16 = b8 | b16 | h4 | h8 | s2 | s4
+    public static let bhsd2: UInt16 = bhs | d2
+    public static let allArr: UInt16 = bhsd2 | d1
+    public static let fp: UInt16 = s2 | s4 | d2
+    public static let acrossLanes: UInt16 = bh | s4
+}
+
+extension A64ScalarWidth {
+    /// Size of the register or memory access in bytes.
+    @inlinable
+    public var byteCount: Int { 1 << Int(rawValue) }
+
+    /// The scalar FP `ftype` field (bits 23:22): `s`=00, `d`=01, `h`=11.
+    @inlinable
+    public var ftype: UInt32? {
+        switch self {
+        case .s: return 0b00
+        case .d: return 0b01
+        case .h: return 0b11
+        default: return nil
+        }
+    }
+
+    @inlinable
+    public static func fromFtype(_ bits: UInt32) -> A64ScalarWidth? {
+        switch bits & 3 {
+        case 0b00: return .s
+        case 0b01: return .d
+        case 0b11: return .h
+        default:   return nil
+        }
+    }
+}
+
+extension A64Arrangement {
+    /// Width of one element (`.q` for `1q`).
+    @inlinable
+    public var elementWidth: A64ScalarWidth {
+        switch self {
+        case .b8, .b16: return .b
+        case .h4, .h8:  return .h
+        case .s2, .s4:  return .s
+        case .d1, .d2:  return .d
+        case .q1:       return .q
+        }
+    }
+
+    /// The `1 << rawValue` member bit used by `A64InstrDesc.arrangements`.
+    @inlinable
+    public var variantBit: UInt16 { 1 << UInt16(rawValue) }
+
+    public static func from(element: A64ScalarWidth, q: Bool) -> A64Arrangement? {
+        switch element {
+        case .b: return q ? .b16 : .b8
+        case .h: return q ? .h8 : .h4
+        case .s: return q ? .s4 : .s2
+        case .d: return q ? .d2 : .d1
+        case .q: return nil
+        }
+    }
+
+    /// The arrangement whose elements are twice as wide in a full 128-bit register (`8b`/`16b` -> `8h`).
+    public var widened: A64Arrangement? {
+        switch elementWidth {
+        case .b: return .h8
+        case .h: return .s4
+        case .s: return .d2
+        default: return nil
+        }
+    }
 }
 
 /// A single entry in `A64InstructionTable`.
@@ -1158,8 +1424,12 @@ public struct A64InstrDesc: Equatable, Sendable {
     public let opcodeBits: UInt32
     /// Log2 of byte scale for scaled immediate offsets (0=1B, 1=2B, 2=4B, 3=8B, 4=16B; 255=depends on `is64Bit`).
     public let scaleLog2: UInt8
-    /// Optional scalar width for SIMD/FP loads/stores.
+    /// Fixed scalar width for SIMD/FP unsigned-offset loads/stores.
     public let scalarWidth: A64ScalarWidth?
+    /// Accepted scalar widths (`A64Variants.b`...`q` bits) for formats whose width is a variable field.
+    public let widths: UInt8
+    /// Accepted vector arrangements (`A64Variants.b8`...`d2` bits) for Advanced SIMD formats.
+    public let arrangements: UInt16
 
     public init(
         id: A64OpcodeId,
@@ -1168,7 +1438,9 @@ public struct A64InstrDesc: Equatable, Sendable {
         opcodeMask: UInt32,
         opcodeBits: UInt32,
         scaleLog2: UInt8 = 0,
-        scalarWidth: A64ScalarWidth? = nil
+        scalarWidth: A64ScalarWidth? = nil,
+        widths: UInt8 = 0,
+        arrangements: UInt16 = 0
     ) {
         self.id = id
         self.mnemonic = mnemonic
@@ -1177,6 +1449,18 @@ public struct A64InstrDesc: Equatable, Sendable {
         self.opcodeBits = opcodeBits
         self.scaleLog2 = scaleLog2
         self.scalarWidth = scalarWidth
+        self.widths = widths
+        self.arrangements = arrangements
+    }
+
+    @inlinable
+    public func allows(_ width: A64ScalarWidth) -> Bool {
+        (widths >> width.rawValue) & 1 != 0
+    }
+
+    @inlinable
+    public func allows(_ arrangement: A64Arrangement) -> Bool {
+        (arrangements >> UInt16(arrangement.rawValue)) & 1 != 0
     }
 }
 
@@ -1192,9 +1476,11 @@ public struct A64Instruction: Equatable, Hashable, Sendable {
     public var vd: A64VReg
     public var vn: A64VReg
     public var vm: A64VReg
+    public var va: A64VReg
     public var zd: A64ZReg
     public var pd: A64PReg
     public var scalarWidth: A64ScalarWidth
+    public var scalarWidth2: A64ScalarWidth
     public var arrangement: A64Arrangement
     public var cond: A64Cond
     public var shiftKind: A64ShiftKind
@@ -1203,6 +1489,8 @@ public struct A64Instruction: Equatable, Hashable, Sendable {
     public var index: UInt8
     public var imm: Int64
     public var imm2: UInt8
+    public var acquire: Bool
+    public var release: Bool
     public var sysReg: A64SysReg
     public var pstateField: A64PStateField
     public var barrierOption: A64BarrierOption
@@ -1218,9 +1506,11 @@ public struct A64Instruction: Equatable, Hashable, Sendable {
         vd: A64VReg = .v0,
         vn: A64VReg = .v0,
         vm: A64VReg = .v0,
+        va: A64VReg = .v0,
         zd: A64ZReg = A64ZReg(rawValue: 0),
         pd: A64PReg = A64PReg(rawValue: 0),
         scalarWidth: A64ScalarWidth = .d,
+        scalarWidth2: A64ScalarWidth = .d,
         arrangement: A64Arrangement = .b16,
         cond: A64Cond = .eq,
         shiftKind: A64ShiftKind = .lsl,
@@ -1229,6 +1519,8 @@ public struct A64Instruction: Equatable, Hashable, Sendable {
         index: UInt8 = 0,
         imm: Int64 = 0,
         imm2: UInt8 = 0,
+        acquire: Bool = false,
+        release: Bool = false,
         sysReg: A64SysReg = A64SysReg(op0: 3, op1: 3, crn: 13, crm: 0, op2: 2),
         pstateField: A64PStateField = .daifset,
         barrierOption: A64BarrierOption = .sy,
@@ -1243,9 +1535,11 @@ public struct A64Instruction: Equatable, Hashable, Sendable {
         self.vd = vd
         self.vn = vn
         self.vm = vm
+        self.va = va
         self.zd = zd
         self.pd = pd
         self.scalarWidth = scalarWidth
+        self.scalarWidth2 = scalarWidth2
         self.arrangement = arrangement
         self.cond = cond
         self.shiftKind = shiftKind
@@ -1254,6 +1548,8 @@ public struct A64Instruction: Equatable, Hashable, Sendable {
         self.index = index
         self.imm = imm
         self.imm2 = imm2
+        self.acquire = acquire
+        self.release = release
         self.sysReg = sysReg
         self.pstateField = pstateField
         self.barrierOption = barrierOption
@@ -1550,7 +1846,9 @@ public enum A64InstructionTable {
         A64InstrDesc(id: .ldrhPre,    mnemonic: "ldrh",  format: .ldstPreImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x7840_0C00),
         A64InstrDesc(id: .strhPre,    mnemonic: "strh",  format: .ldstPreImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x7800_0C00),
         A64InstrDesc(id: .ldrsbPre64, mnemonic: "ldrsb", format: .ldstPreImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x3880_0C00),
+        A64InstrDesc(id: .ldrsbPre32, mnemonic: "ldrsb", format: .ldstPreImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x38C0_0C00),
         A64InstrDesc(id: .ldrshPre64, mnemonic: "ldrsh", format: .ldstPreImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x7880_0C00),
+        A64InstrDesc(id: .ldrshPre32, mnemonic: "ldrsh", format: .ldstPreImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x78C0_0C00),
         A64InstrDesc(id: .ldrswPre,   mnemonic: "ldrsw", format: .ldstPreImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0xB880_0C00),
 
         // Post-index `[Xn], #simm9`
@@ -1561,7 +1859,9 @@ public enum A64InstructionTable {
         A64InstrDesc(id: .ldrhPost,    mnemonic: "ldrh",  format: .ldstPostImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x7840_0400),
         A64InstrDesc(id: .strhPost,    mnemonic: "strh",  format: .ldstPostImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x7800_0400),
         A64InstrDesc(id: .ldrsbPost64, mnemonic: "ldrsb", format: .ldstPostImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x3880_0400),
+        A64InstrDesc(id: .ldrsbPost32, mnemonic: "ldrsb", format: .ldstPostImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x38C0_0400),
         A64InstrDesc(id: .ldrshPost64, mnemonic: "ldrsh", format: .ldstPostImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x7880_0400),
+        A64InstrDesc(id: .ldrshPost32, mnemonic: "ldrsh", format: .ldstPostImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x78C0_0400),
         A64InstrDesc(id: .ldrswPost,   mnemonic: "ldrsw", format: .ldstPostImm9, opcodeMask: 0xFFE0_0C00, opcodeBits: 0xB880_0400),
 
         // Unscaled (`ldur`/`stur`)
@@ -1598,26 +1898,22 @@ public enum A64InstructionTable {
         A64InstrDesc(id: .ldrhReg,    mnemonic: "ldrh",  format: .ldstRegOffset, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x7860_0800, scaleLog2: 1),
         A64InstrDesc(id: .strhReg,    mnemonic: "strh",  format: .ldstRegOffset, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x7820_0800, scaleLog2: 1),
         A64InstrDesc(id: .ldrsbReg64, mnemonic: "ldrsb", format: .ldstRegOffset, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x38A0_0800, scaleLog2: 0),
+        A64InstrDesc(id: .ldrsbReg32, mnemonic: "ldrsb", format: .ldstRegOffset, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x38E0_0800, scaleLog2: 0),
         A64InstrDesc(id: .ldrshReg64, mnemonic: "ldrsh", format: .ldstRegOffset, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x78A0_0800, scaleLog2: 1),
+        A64InstrDesc(id: .ldrshReg32, mnemonic: "ldrsh", format: .ldstRegOffset, opcodeMask: 0xFFE0_0C00, opcodeBits: 0x78E0_0800, scaleLog2: 1),
         A64InstrDesc(id: .ldrswReg,   mnemonic: "ldrsw", format: .ldstRegOffset, opcodeMask: 0xFFE0_0C00, opcodeBits: 0xB8A0_0800, scaleLog2: 2),
 
         // Literal `ldr Wt/Xt, label`
-        A64InstrDesc(id: .ldrLit, mnemonic: "ldr", format: .ldrLiteral, opcodeMask: 0xBF00_0000, opcodeBits: 0x1800_0000),
+        A64InstrDesc(id: .ldrLit,   mnemonic: "ldr",   format: .ldrLiteral, opcodeMask: 0xBF00_0000, opcodeBits: 0x1800_0000),
+        A64InstrDesc(id: .ldrswLit, mnemonic: "ldrsw", format: .ldrLiteral, opcodeMask: 0xFF00_0000, opcodeBits: 0x9800_0000),
 
-        // Load/store pairs (`ldp`/`stp` for 32-bit `w`, 64-bit `x`, and 128-bit `q`)
+        // Load/store pairs (`ldp`/`stp` for 32-bit `w` and 64-bit `x`)
         A64InstrDesc(id: .ldpSigned,  mnemonic: "ldp", format: .ldpStpSigned, opcodeMask: 0x7FC0_0000, opcodeBits: 0x2940_0000, scaleLog2: 255),
         A64InstrDesc(id: .stpSigned,  mnemonic: "stp", format: .ldpStpSigned, opcodeMask: 0x7FC0_0000, opcodeBits: 0x2900_0000, scaleLog2: 255),
         A64InstrDesc(id: .ldpPre,     mnemonic: "ldp", format: .ldpStpPre,    opcodeMask: 0x7FC0_0000, opcodeBits: 0x29C0_0000, scaleLog2: 255),
         A64InstrDesc(id: .stpPre,     mnemonic: "stp", format: .ldpStpPre,    opcodeMask: 0x7FC0_0000, opcodeBits: 0x2980_0000, scaleLog2: 255),
         A64InstrDesc(id: .ldpPost,    mnemonic: "ldp", format: .ldpStpPost,   opcodeMask: 0x7FC0_0000, opcodeBits: 0x28C0_0000, scaleLog2: 255),
         A64InstrDesc(id: .stpPost,    mnemonic: "stp", format: .ldpStpPost,   opcodeMask: 0x7FC0_0000, opcodeBits: 0x2880_0000, scaleLog2: 255),
-
-        A64InstrDesc(id: .ldpSignedQ, mnemonic: "ldp", format: .ldpStpSigned, opcodeMask: 0xFFC0_0000, opcodeBits: 0xAD40_0000, scaleLog2: 4, scalarWidth: .q),
-        A64InstrDesc(id: .stpSignedQ, mnemonic: "stp", format: .ldpStpSigned, opcodeMask: 0xFFC0_0000, opcodeBits: 0xAD00_0000, scaleLog2: 4, scalarWidth: .q),
-        A64InstrDesc(id: .ldpPreQ,    mnemonic: "ldp", format: .ldpStpPre,    opcodeMask: 0xFFC0_0000, opcodeBits: 0xADC0_0000, scaleLog2: 4, scalarWidth: .q),
-        A64InstrDesc(id: .stpPreQ,    mnemonic: "stp", format: .ldpStpPre,    opcodeMask: 0xFFC0_0000, opcodeBits: 0xAD80_0000, scaleLog2: 4, scalarWidth: .q),
-        A64InstrDesc(id: .ldpPostQ,   mnemonic: "ldp", format: .ldpStpPost,   opcodeMask: 0xFFC0_0000, opcodeBits: 0xACC0_0000, scaleLog2: 4, scalarWidth: .q),
-        A64InstrDesc(id: .stpPostQ,   mnemonic: "stp", format: .ldpStpPost,   opcodeMask: 0xFFC0_0000, opcodeBits: 0xAC80_0000, scaleLog2: 4, scalarWidth: .q),
 
         // Atomics & exclusives
         A64InstrDesc(id: .ldxr,  mnemonic: "ldxr",  format: .atomicLoad,      opcodeMask: 0xBFFF_FC00, opcodeBits: 0x885F_7C00),
@@ -1630,62 +1926,264 @@ public enum A64InstructionTable {
         A64InstrDesc(id: .stlrb, mnemonic: "stlrb", format: .atomicStore,     opcodeMask: 0xFFFF_FC00, opcodeBits: 0x089F_FC00),
         A64InstrDesc(id: .ldarh, mnemonic: "ldarh", format: .atomicLoad,      opcodeMask: 0xFFFF_FC00, opcodeBits: 0x48DF_FC00),
         A64InstrDesc(id: .stlrh, mnemonic: "stlrh", format: .atomicStore,     opcodeMask: 0xFFFF_FC00, opcodeBits: 0x489F_FC00),
+        A64InstrDesc(id: .ldxrb,  mnemonic: "ldxrb",  format: .atomicLoad,      opcodeMask: 0xFFFF_FC00, opcodeBits: 0x085F_7C00),
+        A64InstrDesc(id: .ldxrh,  mnemonic: "ldxrh",  format: .atomicLoad,      opcodeMask: 0xFFFF_FC00, opcodeBits: 0x485F_7C00),
+        A64InstrDesc(id: .ldaxrb, mnemonic: "ldaxrb", format: .atomicLoad,      opcodeMask: 0xFFFF_FC00, opcodeBits: 0x085F_FC00),
+        A64InstrDesc(id: .ldaxrh, mnemonic: "ldaxrh", format: .atomicLoad,      opcodeMask: 0xFFFF_FC00, opcodeBits: 0x485F_FC00),
+        A64InstrDesc(id: .stxrb,  mnemonic: "stxrb",  format: .atomicStoreExcl, opcodeMask: 0xFFE0_FC00, opcodeBits: 0x0800_7C00),
+        A64InstrDesc(id: .stxrh,  mnemonic: "stxrh",  format: .atomicStoreExcl, opcodeMask: 0xFFE0_FC00, opcodeBits: 0x4800_7C00),
+        A64InstrDesc(id: .stlxrb, mnemonic: "stlxrb", format: .atomicStoreExcl, opcodeMask: 0xFFE0_FC00, opcodeBits: 0x0800_FC00),
+        A64InstrDesc(id: .stlxrh, mnemonic: "stlxrh", format: .atomicStoreExcl, opcodeMask: 0xFFE0_FC00, opcodeBits: 0x4800_FC00),
+        A64InstrDesc(id: .ldxp,   mnemonic: "ldxp",   format: .atomicLoadPair,      opcodeMask: 0xBFFF_8000, opcodeBits: 0x887F_0000),
+        A64InstrDesc(id: .ldaxp,  mnemonic: "ldaxp",  format: .atomicLoadPair,      opcodeMask: 0xBFFF_8000, opcodeBits: 0x887F_8000),
+        A64InstrDesc(id: .stxp,   mnemonic: "stxp",   format: .atomicStoreExclPair, opcodeMask: 0xBFE0_8000, opcodeBits: 0x8820_0000),
+        A64InstrDesc(id: .stlxp,  mnemonic: "stlxp",  format: .atomicStoreExclPair, opcodeMask: 0xBFE0_8000, opcodeBits: 0x8820_8000),
 
-        // --- 5. Scalar FP ---
-        A64InstrDesc(id: .fmovGprToFp, mnemonic: "fmov",   format: .fpMovGprToFp, opcodeMask: 0x7FBF_FC00, opcodeBits: 0x1E27_0000),
-        A64InstrDesc(id: .fmovFpToGpr, mnemonic: "fmov",   format: .fpMovFpToGpr, opcodeMask: 0x7FBF_FC00, opcodeBits: 0x1E26_0000),
-        A64InstrDesc(id: .fmovReg,     mnemonic: "fmov",   format: .fpMovReg,     opcodeMask: 0xFFBF_FC00, opcodeBits: 0x1E20_4000),
-        A64InstrDesc(id: .fcvtStoD,    mnemonic: "fcvt",   format: .fpCvtReg,     opcodeMask: 0xFFFF_FC00, opcodeBits: 0x1E22_C000),
-        A64InstrDesc(id: .fcvtDtoS,    mnemonic: "fcvt",   format: .fpCvtReg,     opcodeMask: 0xFFFF_FC00, opcodeBits: 0x1E62_4000),
-        A64InstrDesc(id: .scvtf,       mnemonic: "scvtf",  format: .fpIntToFp,    opcodeMask: 0x7FBF_FC00, opcodeBits: 0x1E22_0000),
-        A64InstrDesc(id: .fcvtzs,      mnemonic: "fcvtzs", format: .fpToInt,      opcodeMask: 0x7FBF_FC00, opcodeBits: 0x1E38_0000),
-        A64InstrDesc(id: .fmulScalar,  mnemonic: "fmul",   format: .fpBinary,     opcodeMask: 0xFFa0_FC00, opcodeBits: 0x1E20_0800),
-        A64InstrDesc(id: .fdivScalar,  mnemonic: "fdiv",   format: .fpBinary,     opcodeMask: 0xFFa0_FC00, opcodeBits: 0x1E20_1800),
-        A64InstrDesc(id: .faddScalar,  mnemonic: "fadd",   format: .fpBinary,     opcodeMask: 0xFFa0_FC00, opcodeBits: 0x1E20_2800),
-        A64InstrDesc(id: .fsubScalar,  mnemonic: "fsub",   format: .fpBinary,     opcodeMask: 0xFFa0_FC00, opcodeBits: 0x1E20_3800),
-        A64InstrDesc(id: .fcmpZero,    mnemonic: "fcmp",   format: .fpCmpZero,    opcodeMask: 0xFFBF_FC1F, opcodeBits: 0x1E20_2008),
-        A64InstrDesc(id: .fcmpReg,     mnemonic: "fcmp",   format: .fpCmpReg,     opcodeMask: 0xFFa0_FC1F, opcodeBits: 0x1E20_2000),
+        // LSE atomics: `scalarWidth` is the access size (b/h/s=32-bit/d=64-bit); acquire = A/L bit, release = R/o0 bit.
+        A64InstrDesc(id: .ldadd,  mnemonic: "ldadd",  format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_0000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .ldclr,  mnemonic: "ldclr",  format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_1000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .ldeor,  mnemonic: "ldeor",  format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_2000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .ldset,  mnemonic: "ldset",  format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_3000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .ldsmax, mnemonic: "ldsmax", format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_4000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .ldsmin, mnemonic: "ldsmin", format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_5000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .ldumax, mnemonic: "ldumax", format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_6000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .ldumin, mnemonic: "ldumin", format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_7000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .swp,    mnemonic: "swp",    format: .lseAtomic, opcodeMask: 0x3F20_FC00, opcodeBits: 0x3820_8000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .cas,    mnemonic: "cas",    format: .lseCas,    opcodeMask: 0x3FA0_7C00, opcodeBits: 0x08A0_7C00, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .casp,   mnemonic: "casp",   format: .lseCasp,   opcodeMask: 0xBFA0_7C00, opcodeBits: 0x0820_7C00, widths: A64Variants.sd),
+
+        // SIMD/FP loads and stores with a variable register width (`size` bits 31:30 and `opc<1>` bit 23).
+        A64InstrDesc(id: .ldrFpPre,  mnemonic: "ldr",  format: .fpLdstPreImm9,      opcodeMask: 0x3F60_0C00, opcodeBits: 0x3C40_0C00, widths: A64Variants.bhsdq),
+        A64InstrDesc(id: .strFpPre,  mnemonic: "str",  format: .fpLdstPreImm9,      opcodeMask: 0x3F60_0C00, opcodeBits: 0x3C00_0C00, widths: A64Variants.bhsdq),
+        A64InstrDesc(id: .ldrFpPost, mnemonic: "ldr",  format: .fpLdstPostImm9,     opcodeMask: 0x3F60_0C00, opcodeBits: 0x3C40_0400, widths: A64Variants.bhsdq),
+        A64InstrDesc(id: .strFpPost, mnemonic: "str",  format: .fpLdstPostImm9,     opcodeMask: 0x3F60_0C00, opcodeBits: 0x3C00_0400, widths: A64Variants.bhsdq),
+        A64InstrDesc(id: .ldurFp,    mnemonic: "ldur", format: .fpLdstUnscaledImm9, opcodeMask: 0x3F60_0C00, opcodeBits: 0x3C40_0000, widths: A64Variants.bhsdq),
+        A64InstrDesc(id: .sturFp,    mnemonic: "stur", format: .fpLdstUnscaledImm9, opcodeMask: 0x3F60_0C00, opcodeBits: 0x3C00_0000, widths: A64Variants.bhsdq),
+        A64InstrDesc(id: .ldrFpReg,  mnemonic: "ldr",  format: .fpLdstRegOffset,    opcodeMask: 0x3F60_0C00, opcodeBits: 0x3C60_0800, widths: A64Variants.bhsdq),
+        A64InstrDesc(id: .strFpReg,  mnemonic: "str",  format: .fpLdstRegOffset,    opcodeMask: 0x3F60_0C00, opcodeBits: 0x3C20_0800, widths: A64Variants.bhsdq),
+        A64InstrDesc(id: .ldrFpLit,  mnemonic: "ldr",  format: .fpLdrLiteral,       opcodeMask: 0x3F00_0000, opcodeBits: 0x1C00_0000, widths: A64Variants.sdq),
+        A64InstrDesc(id: .ldpFpSigned, mnemonic: "ldp", format: .fpLdpStpSigned, opcodeMask: 0x3FC0_0000, opcodeBits: 0x2D40_0000, widths: A64Variants.sdq),
+        A64InstrDesc(id: .stpFpSigned, mnemonic: "stp", format: .fpLdpStpSigned, opcodeMask: 0x3FC0_0000, opcodeBits: 0x2D00_0000, widths: A64Variants.sdq),
+        A64InstrDesc(id: .ldpFpPre,    mnemonic: "ldp", format: .fpLdpStpPre,    opcodeMask: 0x3FC0_0000, opcodeBits: 0x2DC0_0000, widths: A64Variants.sdq),
+        A64InstrDesc(id: .stpFpPre,    mnemonic: "stp", format: .fpLdpStpPre,    opcodeMask: 0x3FC0_0000, opcodeBits: 0x2D80_0000, widths: A64Variants.sdq),
+        A64InstrDesc(id: .ldpFpPost,   mnemonic: "ldp", format: .fpLdpStpPost,   opcodeMask: 0x3FC0_0000, opcodeBits: 0x2CC0_0000, widths: A64Variants.sdq),
+        A64InstrDesc(id: .stpFpPost,   mnemonic: "stp", format: .fpLdpStpPost,   opcodeMask: 0x3FC0_0000, opcodeBits: 0x2C80_0000, widths: A64Variants.sdq),
+
+        // --- 5. Scalar FP (h/s/d via `ftype`, bits 23:22) ---
+        A64InstrDesc(id: .fmovGprToFp, mnemonic: "fmov", format: .fpMovGprToFp, opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E27_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fmovFpToGpr, mnemonic: "fmov", format: .fpMovFpToGpr, opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E26_0000, widths: A64Variants.hsd),
+
+        A64InstrDesc(id: .fmovReg, mnemonic: "fmov",   format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E20_4000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fabs,    mnemonic: "fabs",   format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E20_C000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fneg,    mnemonic: "fneg",   format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E21_4000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fsqrt,   mnemonic: "fsqrt",  format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E21_C000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .frintn,  mnemonic: "frintn", format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E24_4000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .frintp,  mnemonic: "frintp", format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E24_C000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .frintm,  mnemonic: "frintm", format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E25_4000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .frintz,  mnemonic: "frintz", format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E25_C000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .frinta,  mnemonic: "frinta", format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E26_4000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .frintx,  mnemonic: "frintx", format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E27_4000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .frinti,  mnemonic: "frinti", format: .fpDp1, opcodeMask: 0xFF3F_FC00, opcodeBits: 0x1E27_C000, widths: A64Variants.hsd),
+        // `fcvt`: source width in `ftype`, destination width in `opc` (bits 16:15).
+        A64InstrDesc(id: .fcvt,    mnemonic: "fcvt",   format: .fpCvtPrecision, opcodeMask: 0xFF3E_7C00, opcodeBits: 0x1E22_4000, widths: A64Variants.hsd),
+
+        A64InstrDesc(id: .scvtf,  mnemonic: "scvtf",  format: .fpIntToFp, opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E22_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .ucvtf,  mnemonic: "ucvtf",  format: .fpIntToFp, opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E23_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtns, mnemonic: "fcvtns", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E20_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtnu, mnemonic: "fcvtnu", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E21_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtas, mnemonic: "fcvtas", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E24_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtau, mnemonic: "fcvtau", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E25_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtps, mnemonic: "fcvtps", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E28_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtpu, mnemonic: "fcvtpu", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E29_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtms, mnemonic: "fcvtms", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E30_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtmu, mnemonic: "fcvtmu", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E31_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtzs, mnemonic: "fcvtzs", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E38_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtzu, mnemonic: "fcvtzu", format: .fpToInt,   opcodeMask: 0x7F3F_FC00, opcodeBits: 0x1E39_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .scvtfFixed,  mnemonic: "scvtf",  format: .fpFixedToFp, opcodeMask: 0x7F3F_0000, opcodeBits: 0x1E02_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .ucvtfFixed,  mnemonic: "ucvtf",  format: .fpFixedToFp, opcodeMask: 0x7F3F_0000, opcodeBits: 0x1E03_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtzsFixed, mnemonic: "fcvtzs", format: .fpToFixed,   opcodeMask: 0x7F3F_0000, opcodeBits: 0x1E18_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcvtzuFixed, mnemonic: "fcvtzu", format: .fpToFixed,   opcodeMask: 0x7F3F_0000, opcodeBits: 0x1E19_0000, widths: A64Variants.hsd),
+
+        A64InstrDesc(id: .fmulScalar,   mnemonic: "fmul",   format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_0800, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fdivScalar,   mnemonic: "fdiv",   format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_1800, widths: A64Variants.hsd),
+        A64InstrDesc(id: .faddScalar,   mnemonic: "fadd",   format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_2800, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fsubScalar,   mnemonic: "fsub",   format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_3800, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fmaxScalar,   mnemonic: "fmax",   format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_4800, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fminScalar,   mnemonic: "fmin",   format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_5800, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fmaxnmScalar, mnemonic: "fmaxnm", format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_6800, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fminnmScalar, mnemonic: "fminnm", format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_7800, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fnmul,        mnemonic: "fnmul",  format: .fpBinary, opcodeMask: 0xFF20_FC00, opcodeBits: 0x1E20_8800, widths: A64Variants.hsd),
+
+        A64InstrDesc(id: .fmadd,  mnemonic: "fmadd",  format: .fpDp3, opcodeMask: 0xFF20_8000, opcodeBits: 0x1F00_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fmsub,  mnemonic: "fmsub",  format: .fpDp3, opcodeMask: 0xFF20_8000, opcodeBits: 0x1F00_8000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fnmadd, mnemonic: "fnmadd", format: .fpDp3, opcodeMask: 0xFF20_8000, opcodeBits: 0x1F20_0000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fnmsub, mnemonic: "fnmsub", format: .fpDp3, opcodeMask: 0xFF20_8000, opcodeBits: 0x1F20_8000, widths: A64Variants.hsd),
+
+        A64InstrDesc(id: .fcmpZero,  mnemonic: "fcmp",  format: .fpCmpZero, opcodeMask: 0xFF3F_FC1F, opcodeBits: 0x1E20_2008, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcmpeZero, mnemonic: "fcmpe", format: .fpCmpZero, opcodeMask: 0xFF3F_FC1F, opcodeBits: 0x1E20_2018, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcmpReg,   mnemonic: "fcmp",  format: .fpCmpReg,  opcodeMask: 0xFF20_FC1F, opcodeBits: 0x1E20_2000, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcmpeReg,  mnemonic: "fcmpe", format: .fpCmpReg,  opcodeMask: 0xFF20_FC1F, opcodeBits: 0x1E20_2010, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fccmp,     mnemonic: "fccmp",  format: .fpCondCompare, opcodeMask: 0xFF20_0C10, opcodeBits: 0x1E20_0400, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fccmpe,    mnemonic: "fccmpe", format: .fpCondCompare, opcodeMask: 0xFF20_0C10, opcodeBits: 0x1E20_0410, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fcsel,     mnemonic: "fcsel",  format: .fpCondSelect,  opcodeMask: 0xFF20_0C00, opcodeBits: 0x1E20_0C00, widths: A64Variants.hsd),
+        A64InstrDesc(id: .fmovImm,   mnemonic: "fmov",   format: .fpImm,         opcodeMask: 0xFF20_1FE0, opcodeBits: 0x1E20_1000, widths: A64Variants.hsd),
 
         // --- 6. Advanced SIMD (NEON) ---
-        A64InstrDesc(id: .simdAdd,  mnemonic: "add",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_8400),
-        A64InstrDesc(id: .simdSub,  mnemonic: "sub",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_8400),
-        A64InstrDesc(id: .simdMul,  mnemonic: "mul",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_9C00),
-        A64InstrDesc(id: .simdCmeq, mnemonic: "cmeq", format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_8C00),
-        A64InstrDesc(id: .simdCmgt, mnemonic: "cmgt", format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_3400),
-        A64InstrDesc(id: .simdCmge, mnemonic: "cmge", format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_3C00),
+        // Three registers of the same type (`size` bits 23:22 select the element width).
+        A64InstrDesc(id: .simdAdd,   mnemonic: "add",   format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_8400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSub,   mnemonic: "sub",   format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_8400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdMul,   mnemonic: "mul",   format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_9C00, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdMla,   mnemonic: "mla",   format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_9400, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdMls,   mnemonic: "mls",   format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_9400, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdCmeq,  mnemonic: "cmeq",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_8C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmtst, mnemonic: "cmtst", format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_8C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmgt,  mnemonic: "cmgt",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_3400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmge,  mnemonic: "cmge",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_3C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmhi,  mnemonic: "cmhi",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_3400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmhs,  mnemonic: "cmhs",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_3C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSmax,  mnemonic: "smax",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_6400, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdSmin,  mnemonic: "smin",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_6C00, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdUmax,  mnemonic: "umax",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_6400, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdUmin,  mnemonic: "umin",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_6C00, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdSabd,  mnemonic: "sabd",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_7400, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdUabd,  mnemonic: "uabd",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_7400, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdAddp,  mnemonic: "addp",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_BC00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSqadd, mnemonic: "sqadd", format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_0C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdUqadd, mnemonic: "uqadd", format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_0C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSqsub, mnemonic: "sqsub", format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_2C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdUqsub, mnemonic: "uqsub", format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_2C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSshl,  mnemonic: "sshl",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E20_4400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdUshl,  mnemonic: "ushl",  format: .simdThreeSameInt, opcodeMask: 0xBF20_FC00, opcodeBits: 0x2E20_4400, arrangements: A64Variants.bhsd2),
 
-        A64InstrDesc(id: .simdAnd, mnemonic: "and", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E20_1C00),
-        A64InstrDesc(id: .simdBic, mnemonic: "bic", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E60_1C00),
-        A64InstrDesc(id: .simdOrr, mnemonic: "orr", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0EA0_1C00),
-        A64InstrDesc(id: .simdOrn, mnemonic: "orn", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0EE0_1C00),
-        A64InstrDesc(id: .simdEor, mnemonic: "eor", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x2E20_1C00),
+        A64InstrDesc(id: .simdAnd, mnemonic: "and", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E20_1C00, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdBic, mnemonic: "bic", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E60_1C00, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdOrr, mnemonic: "orr", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0EA0_1C00, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdOrn, mnemonic: "orn", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0EE0_1C00, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdEor, mnemonic: "eor", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x2E20_1C00, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdBsl, mnemonic: "bsl", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x2E60_1C00, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdBit, mnemonic: "bit", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x2EA0_1C00, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdBif, mnemonic: "bif", format: .simdThreeSameBit, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x2EE0_1C00, arrangements: A64Variants.bytes),
 
-        A64InstrDesc(id: .simdFadd, mnemonic: "fadd", format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0E20_D400),
-        A64InstrDesc(id: .simdFsub, mnemonic: "fsub", format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0EA0_D400),
-        A64InstrDesc(id: .simdFmul, mnemonic: "fmul", format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x2E20_DC00),
-        A64InstrDesc(id: .simdFdiv, mnemonic: "fdiv", format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x2E20_FC00),
+        A64InstrDesc(id: .simdFmaxnm, mnemonic: "fmaxnm", format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0E20_C400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFmla,   mnemonic: "fmla",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0E20_CC00, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFadd,   mnemonic: "fadd",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0E20_D400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFcmeq,  mnemonic: "fcmeq",  format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0E20_E400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFmax,   mnemonic: "fmax",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0E20_F400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFminnm, mnemonic: "fminnm", format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0EA0_C400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFmls,   mnemonic: "fmls",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0EA0_CC00, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFsub,   mnemonic: "fsub",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0EA0_D400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFmin,   mnemonic: "fmin",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x0EA0_F400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFaddp,  mnemonic: "faddp",  format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x2E20_D400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFmul,   mnemonic: "fmul",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x2E20_DC00, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFcmge,  mnemonic: "fcmge",  format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x2E20_E400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFdiv,   mnemonic: "fdiv",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x2E20_FC00, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFabd,   mnemonic: "fabd",   format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x2EA0_D400, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFcmgt,  mnemonic: "fcmgt",  format: .simdThreeSameFp, opcodeMask: 0xBFA0_FC00, opcodeBits: 0x2EA0_E400, arrangements: A64Variants.fp),
 
-        A64InstrDesc(id: .simdUzp1, mnemonic: "uzp1", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_1800),
-        A64InstrDesc(id: .simdUzp2, mnemonic: "uzp2", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_5800),
-        A64InstrDesc(id: .simdZip1, mnemonic: "zip1", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_3800),
-        A64InstrDesc(id: .simdZip2, mnemonic: "zip2", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_7800),
+        A64InstrDesc(id: .simdUzp1, mnemonic: "uzp1", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_1800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdTrn1, mnemonic: "trn1", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_2800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdZip1, mnemonic: "zip1", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_3800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdUzp2, mnemonic: "uzp2", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_5800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdTrn2, mnemonic: "trn2", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_6800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdZip2, mnemonic: "zip2", format: .simdPermute, opcodeMask: 0xBF20_FC00, opcodeBits: 0x0E00_7800, arrangements: A64Variants.bhsd2),
 
-        A64InstrDesc(id: .simdCnt,   mnemonic: "cnt",   format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_5800),
-        A64InstrDesc(id: .simdRev64, mnemonic: "rev64", format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_0800),
+        // Two-register miscellaneous. `not` and `rbit` fix `size` (00 / 01), so their masks include it.
+        A64InstrDesc(id: .simdRev64, mnemonic: "rev64", format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_0800, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdRev16, mnemonic: "rev16", format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_1800, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdRev32, mnemonic: "rev32", format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x2E20_0800, arrangements: A64Variants.bh),
+        A64InstrDesc(id: .simdCls,   mnemonic: "cls",   format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_4800, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdClz,   mnemonic: "clz",   format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x2E20_4800, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdCnt,   mnemonic: "cnt",   format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_5800, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdNot,   mnemonic: "not",   format: .simdTwoRegMisc, opcodeMask: 0xBFFF_FC00, opcodeBits: 0x2E20_5800, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdRbit,  mnemonic: "rbit",  format: .simdTwoRegMisc, opcodeMask: 0xBFFF_FC00, opcodeBits: 0x2E60_5800, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdAbs,   mnemonic: "abs",   format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_B800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdNeg,   mnemonic: "neg",   format: .simdTwoRegMisc, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x2E20_B800, arrangements: A64Variants.bhsd2),
 
-        A64InstrDesc(id: .simdShl,  mnemonic: "shl",  format: .simdShiftImm, opcodeMask: 0xBF80_FC00, opcodeBits: 0x0F00_5400),
-        A64InstrDesc(id: .simdSshr, mnemonic: "sshr", format: .simdShiftImm, opcodeMask: 0xBF80_FC00, opcodeBits: 0x0F00_0400),
-        A64InstrDesc(id: .simdUshr, mnemonic: "ushr", format: .simdShiftImm, opcodeMask: 0xBF80_FC00, opcodeBits: 0x2F00_0400),
+        A64InstrDesc(id: .simdCmgtZero, mnemonic: "cmgt", format: .simdCmpZero, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_8800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmeqZero, mnemonic: "cmeq", format: .simdCmpZero, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_9800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmltZero, mnemonic: "cmlt", format: .simdCmpZero, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E20_A800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmgeZero, mnemonic: "cmge", format: .simdCmpZero, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x2E20_8800, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdCmleZero, mnemonic: "cmle", format: .simdCmpZero, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x2E20_9800, arrangements: A64Variants.bhsd2),
 
-        A64InstrDesc(id: .simdDupGpr, mnemonic: "dup",  format: .simdDupGpr,   opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E00_0C00),
-        A64InstrDesc(id: .simdInsGpr, mnemonic: "ins",  format: .simdInsGpr,   opcodeMask: 0xFFE0_FC00, opcodeBits: 0x4E00_1C00),
-        A64InstrDesc(id: .simdUmov,   mnemonic: "umov", format: .simdUmovSmov, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E00_3C00),
-        A64InstrDesc(id: .simdSmov,   mnemonic: "smov", format: .simdUmovSmov, opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E00_2C00),
+        A64InstrDesc(id: .simdFabs,   mnemonic: "fabs",   format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x0EA0_F800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFneg,   mnemonic: "fneg",   format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x2EA0_F800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFsqrt,  mnemonic: "fsqrt",  format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x2EA1_F800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdScvtf,  mnemonic: "scvtf",  format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x0E21_D800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdUcvtf,  mnemonic: "ucvtf",  format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x2E21_D800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFcvtzs, mnemonic: "fcvtzs", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x0EA1_B800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFcvtzu, mnemonic: "fcvtzu", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x2EA1_B800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFrintn, mnemonic: "frintn", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x0E21_8800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFrintm, mnemonic: "frintm", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x0E21_9800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFrintp, mnemonic: "frintp", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x0EA1_8800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFrintz, mnemonic: "frintz", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x0EA1_9800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFrinta, mnemonic: "frinta", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x2E21_8800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFrintx, mnemonic: "frintx", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x2E21_9800, arrangements: A64Variants.fp),
+        A64InstrDesc(id: .simdFrinti, mnemonic: "frinti", format: .simdTwoRegMiscFp, opcodeMask: 0xBFBF_FC00, opcodeBits: 0x2EA1_9800, arrangements: A64Variants.fp),
 
-        A64InstrDesc(id: .simdLd1One, mnemonic: "ld1", format: .simdLd1St1One, opcodeMask: 0xBFFF_F000, opcodeBits: 0x0C40_7000),
-        A64InstrDesc(id: .simdSt1One, mnemonic: "st1", format: .simdLd1St1One, opcodeMask: 0xBFFF_F000, opcodeBits: 0x0C00_7000),
-        A64InstrDesc(id: .simdTblOne, mnemonic: "tbl", format: .simdTblOne,    opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E00_0000),
-        A64InstrDesc(id: .simdExt,    mnemonic: "ext", format: .simdExt,       opcodeMask: 0xBFE0_8400, opcodeBits: 0x2E00_0000),
+        A64InstrDesc(id: .simdAddv,  mnemonic: "addv",  format: .simdAcrossLanes, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E31_B800, arrangements: A64Variants.acrossLanes),
+        A64InstrDesc(id: .simdSmaxv, mnemonic: "smaxv", format: .simdAcrossLanes, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E30_A800, arrangements: A64Variants.acrossLanes),
+        A64InstrDesc(id: .simdSminv, mnemonic: "sminv", format: .simdAcrossLanes, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E31_A800, arrangements: A64Variants.acrossLanes),
+        A64InstrDesc(id: .simdUmaxv, mnemonic: "umaxv", format: .simdAcrossLanes, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x2E30_A800, arrangements: A64Variants.acrossLanes),
+        A64InstrDesc(id: .simdUminv, mnemonic: "uminv", format: .simdAcrossLanes, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x2E31_A800, arrangements: A64Variants.acrossLanes),
+
+        // `xtn`/`shrn` arrangements are the narrow destination; `sshll`/`ushll` the narrow source.
+        A64InstrDesc(id: .simdXtn, mnemonic: "xtn", format: .simdNarrow, opcodeMask: 0xBF3F_FC00, opcodeBits: 0x0E21_2800, arrangements: A64Variants.bhs),
+
+        // Shift by immediate (`immh:immb`, bits 22:16; `immh` = 0 is the modified-immediate class).
+        A64InstrDesc(id: .simdSshr,  mnemonic: "sshr",  format: .simdShiftImm,    opcodeMask: 0xBF80_FC00, opcodeBits: 0x0F00_0400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdUshr,  mnemonic: "ushr",  format: .simdShiftImm,    opcodeMask: 0xBF80_FC00, opcodeBits: 0x2F00_0400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSsra,  mnemonic: "ssra",  format: .simdShiftImm,    opcodeMask: 0xBF80_FC00, opcodeBits: 0x0F00_1400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdUsra,  mnemonic: "usra",  format: .simdShiftImm,    opcodeMask: 0xBF80_FC00, opcodeBits: 0x2F00_1400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSri,   mnemonic: "sri",   format: .simdShiftImm,    opcodeMask: 0xBF80_FC00, opcodeBits: 0x2F00_4400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdShl,   mnemonic: "shl",   format: .simdShiftImm,    opcodeMask: 0xBF80_FC00, opcodeBits: 0x0F00_5400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSli,   mnemonic: "sli",   format: .simdShiftImm,    opcodeMask: 0xBF80_FC00, opcodeBits: 0x2F00_5400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdShrn,  mnemonic: "shrn",  format: .simdShiftNarrow, opcodeMask: 0xBF80_FC00, opcodeBits: 0x0F00_8400, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdSshll, mnemonic: "sshll", format: .simdShiftLong,   opcodeMask: 0xBF80_FC00, opcodeBits: 0x0F00_A400, arrangements: A64Variants.bhs),
+        A64InstrDesc(id: .simdUshll, mnemonic: "ushll", format: .simdShiftLong,   opcodeMask: 0xBF80_FC00, opcodeBits: 0x2F00_A400, arrangements: A64Variants.bhs),
+
+        // Copy (`imm5` bits 20:16 encode the element size and lane).
+        A64InstrDesc(id: .simdDupElem,   mnemonic: "dup",  format: .simdDupElem,   opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E00_0400, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdDupGpr,    mnemonic: "dup",  format: .simdDupGpr,    opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E00_0C00, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdDupScalar, mnemonic: "mov",  format: .simdDupScalar, opcodeMask: 0xFFE0_FC00, opcodeBits: 0x5E00_0400, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .simdInsGpr,    mnemonic: "mov",  format: .simdInsGpr,    opcodeMask: 0xFFE0_FC00, opcodeBits: 0x4E00_1C00, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .simdInsElem,   mnemonic: "mov",  format: .simdInsElem,   opcodeMask: 0xFFE0_8400, opcodeBits: 0x6E00_0400, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .simdUmov,      mnemonic: "umov", format: .simdUmovSmov,  opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E00_3C00, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .simdSmov,      mnemonic: "smov", format: .simdUmovSmov,  opcodeMask: 0xBFE0_FC00, opcodeBits: 0x0E00_2C00, widths: A64Variants.b | A64Variants.h | A64Variants.s),
+
+        // Modified immediate: one mask for the class; `op:cmode` (bits 29, 15:12) select the descriptor.
+        A64InstrDesc(id: .simdMovi,    mnemonic: "movi", format: .simdModImm, opcodeMask: 0x9FF8_0C00, opcodeBits: 0x0F00_0400, arrangements: A64Variants.allArr),
+        A64InstrDesc(id: .simdMvni,    mnemonic: "mvni", format: .simdModImm, opcodeMask: 0x9FF8_0C00, opcodeBits: 0x0F00_0400, arrangements: A64Variants.h4 | A64Variants.h8 | A64Variants.s2 | A64Variants.s4),
+        A64InstrDesc(id: .simdOrrImm,  mnemonic: "orr",  format: .simdModImm, opcodeMask: 0x9FF8_0C00, opcodeBits: 0x0F00_0400, arrangements: A64Variants.h4 | A64Variants.h8 | A64Variants.s2 | A64Variants.s4),
+        A64InstrDesc(id: .simdBicImm,  mnemonic: "bic",  format: .simdModImm, opcodeMask: 0x9FF8_0C00, opcodeBits: 0x0F00_0400, arrangements: A64Variants.h4 | A64Variants.h8 | A64Variants.s2 | A64Variants.s4),
+        A64InstrDesc(id: .simdFmovImm, mnemonic: "fmov", format: .simdModImm, opcodeMask: 0x9FF8_0C00, opcodeBits: 0x0F00_0400, arrangements: A64Variants.fp),
+
+        // Structure loads/stores. `ld1`/`st1` take 1-4 registers (the opcode encodes the count).
+        A64InstrDesc(id: .simdLd1, mnemonic: "ld1", format: .simdLdStMulti, opcodeMask: 0xBFFF_0000, opcodeBits: 0x0C40_0000, arrangements: A64Variants.allArr),
+        A64InstrDesc(id: .simdSt1, mnemonic: "st1", format: .simdLdStMulti, opcodeMask: 0xBFFF_0000, opcodeBits: 0x0C00_0000, arrangements: A64Variants.allArr),
+        A64InstrDesc(id: .simdLd2, mnemonic: "ld2", format: .simdLdStMulti, opcodeMask: 0xBFFF_F000, opcodeBits: 0x0C40_8000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSt2, mnemonic: "st2", format: .simdLdStMulti, opcodeMask: 0xBFFF_F000, opcodeBits: 0x0C00_8000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdLd3, mnemonic: "ld3", format: .simdLdStMulti, opcodeMask: 0xBFFF_F000, opcodeBits: 0x0C40_4000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSt3, mnemonic: "st3", format: .simdLdStMulti, opcodeMask: 0xBFFF_F000, opcodeBits: 0x0C00_4000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdLd4, mnemonic: "ld4", format: .simdLdStMulti, opcodeMask: 0xBFFF_F000, opcodeBits: 0x0C40_0000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSt4, mnemonic: "st4", format: .simdLdStMulti, opcodeMask: 0xBFFF_F000, opcodeBits: 0x0C00_0000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdLd1Post, mnemonic: "ld1", format: .simdLdStMultiPost, opcodeMask: 0xBFE0_0000, opcodeBits: 0x0CC0_0000, arrangements: A64Variants.allArr),
+        A64InstrDesc(id: .simdSt1Post, mnemonic: "st1", format: .simdLdStMultiPost, opcodeMask: 0xBFE0_0000, opcodeBits: 0x0C80_0000, arrangements: A64Variants.allArr),
+        A64InstrDesc(id: .simdLd2Post, mnemonic: "ld2", format: .simdLdStMultiPost, opcodeMask: 0xBFE0_F000, opcodeBits: 0x0CC0_8000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSt2Post, mnemonic: "st2", format: .simdLdStMultiPost, opcodeMask: 0xBFE0_F000, opcodeBits: 0x0C80_8000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdLd3Post, mnemonic: "ld3", format: .simdLdStMultiPost, opcodeMask: 0xBFE0_F000, opcodeBits: 0x0CC0_4000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSt3Post, mnemonic: "st3", format: .simdLdStMultiPost, opcodeMask: 0xBFE0_F000, opcodeBits: 0x0C80_4000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdLd4Post, mnemonic: "ld4", format: .simdLdStMultiPost, opcodeMask: 0xBFE0_F000, opcodeBits: 0x0CC0_0000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdSt4Post, mnemonic: "st4", format: .simdLdStMultiPost, opcodeMask: 0xBFE0_F000, opcodeBits: 0x0C80_0000, arrangements: A64Variants.bhsd2),
+        A64InstrDesc(id: .simdLd1R,     mnemonic: "ld1r", format: .simdLd1R,     opcodeMask: 0xBFFF_F000, opcodeBits: 0x0D40_C000, arrangements: A64Variants.allArr),
+        A64InstrDesc(id: .simdLd1RPost, mnemonic: "ld1r", format: .simdLd1RPost, opcodeMask: 0xBFE0_F000, opcodeBits: 0x0DC0_C000, arrangements: A64Variants.allArr),
+        A64InstrDesc(id: .simdLd1Lane,     mnemonic: "ld1", format: .simdLdStLane,     opcodeMask: 0xBFFF_2000, opcodeBits: 0x0D40_0000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .simdSt1Lane,     mnemonic: "st1", format: .simdLdStLane,     opcodeMask: 0xBFFF_2000, opcodeBits: 0x0D00_0000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .simdLd1LanePost, mnemonic: "ld1", format: .simdLdStLanePost, opcodeMask: 0xBFE0_2000, opcodeBits: 0x0DC0_0000, widths: A64Variants.bhsd),
+        A64InstrDesc(id: .simdSt1LanePost, mnemonic: "st1", format: .simdLdStLanePost, opcodeMask: 0xBFE0_2000, opcodeBits: 0x0D80_0000, widths: A64Variants.bhsd),
+
+        A64InstrDesc(id: .simdTbl, mnemonic: "tbl", format: .simdTbl, opcodeMask: 0xBFE0_9C00, opcodeBits: 0x0E00_0000, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdTbx, mnemonic: "tbx", format: .simdTbl, opcodeMask: 0xBFE0_9C00, opcodeBits: 0x0E00_1000, arrangements: A64Variants.bytes),
+        A64InstrDesc(id: .simdExt, mnemonic: "ext", format: .simdExt, opcodeMask: 0xBFE0_8400, opcodeBits: 0x2E00_0000, arrangements: A64Variants.bytes),
 
         // --- 7. SVE (`croi/kernel/arch/arm64/cpu.S`) ---
         A64InstrDesc(id: .sveLdrZ,  mnemonic: "ldr",   format: .sveLdrStrZ, opcodeMask: 0xFFC0_E000, opcodeBits: 0x8580_4000),
@@ -1717,7 +2215,6 @@ public enum A64InstructionTable {
 // MARK: - 4. AArch64 Table-Driven Encoder (`A64Encoder`)
 
 public enum A64Encoder {
-    /// Encodes a structured `A64Instruction` into a 32-bit machine word using `A64InstructionTable`.
     /// True if a byte displacement is word-aligned and fits a signed `bits`-wide word-offset field.
     @inline(__always)
     static func pcRelInRange(_ byteDisp: Int64, bits: Int) -> Bool {
@@ -1725,6 +2222,40 @@ public enum A64Encoder {
         return (byteDisp & 3) == 0 && byteDisp >= -limit && byteDisp < limit
     }
 
+    /// Bit 30 (`size<0>`) for a GPR load/store whose register width is a variable field of `desc`
+    /// (`ldr`, `str`, `ldxr`, ...); zero when the descriptor fixes the size (`ldrb`, `ldrsw`, ...).
+    @inline(__always)
+    static func variableSizeBit30(_ desc: A64InstrDesc, is64Bit: Bool) -> UInt32 {
+        (desc.opcodeMask & (1 << 30)) == 0 && is64Bit ? (1 << 30) : 0
+    }
+
+    /// `imm5` (bits 20:16) of the Advanced SIMD copy class: the element size marker plus the lane index.
+    @inline(__always)
+    static func copyImm5(_ width: A64ScalarWidth, index: UInt8) -> UInt32? {
+        guard width != .q else { return nil }
+        let log2 = UInt32(width.rawValue)
+        guard Int(index) < (16 >> log2) else { return nil }
+        return (UInt32(index) << (log2 + 1)) | (1 << log2)
+    }
+
+    /// `size` (bits 31:30) and `opc<1>` (bit 23) of a SIMD/FP load/store for register width `w`.
+    @inline(__always)
+    static func fpLdstSizeBits(_ w: A64ScalarWidth) -> UInt32 {
+        w == .q ? (1 << 23) : (UInt32(w.rawValue) << 30)
+    }
+
+    /// `opc` (bits 31:30) of a SIMD/FP literal load or register pair: `s`=00, `d`=01, `q`=10.
+    @inline(__always)
+    static func fpPairOpc(_ w: A64ScalarWidth) -> UInt32? {
+        switch w {
+        case .s: return 0
+        case .d: return 1
+        case .q: return 2
+        default: return nil
+        }
+    }
+
+    /// Encodes a structured `A64Instruction` into a 32-bit machine word using `A64InstructionTable`.
     public static func encode(_ instr: A64Instruction) -> UInt32? {
         let desc = A64InstructionTable.descriptor(for: instr.opcode)
         let sf: UInt32 = instr.is64Bit ? (1 << 31) : 0
@@ -1735,6 +2266,7 @@ public enum A64Encoder {
         let vd = UInt32(instr.vd.rawValue)
         let vn = UInt32(instr.vn.rawValue)
         let vm = UInt32(instr.vm.rawValue)
+        let va = UInt32(instr.va.rawValue)
 
         switch desc.format {
         case .addSubImm:
@@ -1777,7 +2309,8 @@ public enum A64Encoder {
             return sf | desc.opcodeBits | n | (rm << 16) | (lsb << 10) | (rn << 5) | rd
 
         case .addSubShifted:
-            if instr.shiftKind == .ror { return nil }
+            if instr.shiftKind == .ror || instr.shiftKind == .msl { return nil }
+            guard instr.amount < (instr.is64Bit ? 64 : 32) else { return nil }
             let shift = UInt32(instr.shiftKind.rawValue) & 0x3
             let amt = UInt32(instr.amount) & 0x3F
             return sf | desc.opcodeBits | (shift << 22) | (rm << 16) | (amt << 10) | (rn << 5) | rd
@@ -1789,6 +2322,7 @@ public enum A64Encoder {
             return sf | desc.opcodeBits | (rm << 16) | (opt << 13) | (imm3 << 10) | (rn << 5) | rd
 
         case .logicalShifted:
+            guard instr.shiftKind != .msl, instr.amount < (instr.is64Bit ? 64 : 32) else { return nil }
             let shift = UInt32(instr.shiftKind.rawValue) & 0x3
             let amt = UInt32(instr.amount) & 0x3F
             return sf | desc.opcodeBits | (shift << 22) | (rm << 16) | (amt << 10) | (rn << 5) | rd
@@ -1909,13 +2443,7 @@ public enum A64Encoder {
         case .ldstPreImm9, .ldstPostImm9, .ldstUnscaledImm9, .ldstUnprivImm9:
             guard instr.imm >= -256 && instr.imm <= 255 else { return nil }
             let imm9 = UInt32(bitPattern: Int32(truncatingIfNeeded: instr.imm)) & 0x1FF
-            let sizeBit30: UInt32
-            switch instr.opcode {
-            case .ldrPre, .strPre, .ldrPost, .strPost, .ldur, .stur, .ldtr, .sttr:
-                sizeBit30 = instr.is64Bit ? (1 << 30) : 0
-            default:
-                sizeBit30 = 0
-            }
+            let sizeBit30 = variableSizeBit30(desc, is64Bit: instr.is64Bit)
             return desc.opcodeBits | sizeBit30 | (imm9 << 12) | (rn << 5) | rd
 
         case .ldstRegOffset:
@@ -1928,173 +2456,279 @@ public enum A64Encoder {
                 sizeBit30 = 0
                 naturalShift = desc.scaleLog2
             }
+            // `option<1>` must be set: only `uxtw`, `lsl`/`uxtx`, `sxtw`, `sxtx` index registers exist.
+            guard instr.extendKind.rawValue & 0b010 != 0 else { return nil }
+            guard instr.amount == 0 || instr.amount == naturalShift else { return nil }
             let opt = UInt32(instr.extendKind.rawValue) & 0x7
-            let sBit: UInt32 = (instr.amount != 0 && instr.amount == naturalShift) ? (1 << 12) : 0
+            // Byte accesses have no shift, so `S` (an explicit `#0`) is carried in `imm2`.
+            let sBit: UInt32 = (naturalShift == 0 ? instr.imm2 != 0 : instr.amount == naturalShift) ? (1 << 12) : 0
             return desc.opcodeBits | sizeBit30 | (rm << 16) | (opt << 13) | sBit | (rn << 5) | rd
 
         case .ldrLiteral:
             guard pcRelInRange(instr.imm, bits: 19) else { return nil }
-            let sizeBit30: UInt32 = instr.is64Bit ? (1 << 30) : 0
+            let sizeBit30 = variableSizeBit30(desc, is64Bit: instr.is64Bit)
             let words = instr.imm >> 2
             let imm19 = UInt32(bitPattern: Int32(truncatingIfNeeded: words)) & 0x7_FFFF
             return desc.opcodeBits | sizeBit30 | (imm19 << 5) | rd
 
         case .ldpStpSigned, .ldpStpPre, .ldpStpPost:
-            let isQuad = (desc.scalarWidth == .q)
-            let shift: Int64 = isQuad ? 4 : (instr.is64Bit ? 3 : 2)
+            let shift: Int64 = instr.is64Bit ? 3 : 2
             let scaled = instr.imm >> shift
             guard (scaled << shift) == instr.imm && scaled >= -64 && scaled <= 63 else { return nil }
             let imm7 = UInt32(bitPattern: Int32(truncatingIfNeeded: scaled)) & 0x7F
-            if isQuad {
-                return desc.opcodeBits | (imm7 << 15) | (vn << 10) | (rn << 5) | vd
-            } else {
-                let sfBit: UInt32 = instr.is64Bit ? (1 << 31) : 0
-                return sfBit | desc.opcodeBits | (imm7 << 15) | (rm << 10) | (rn << 5) | rd
-            }
+            let sfBit: UInt32 = instr.is64Bit ? (1 << 31) : 0
+            return sfBit | desc.opcodeBits | (imm7 << 15) | (rm << 10) | (rn << 5) | rd
 
         case .atomicLoad, .atomicStore:
-            let sizeBit30: UInt32
-            switch instr.opcode {
-            case .ldarb, .stlrb, .ldarh, .stlrh:
-                sizeBit30 = 0
-            default:
-                sizeBit30 = instr.is64Bit ? (1 << 30) : 0
-            }
-            return desc.opcodeBits | sizeBit30 | (rn << 5) | rd
+            return desc.opcodeBits | variableSizeBit30(desc, is64Bit: instr.is64Bit) | (rn << 5) | rd
 
         case .atomicStoreExcl:
-            let sizeBit30: UInt32 = instr.is64Bit ? (1 << 30) : 0
             // `rm` holds the status register `Ws`, `rd` holds the data register `Rt`, `rn` holds `[Xn]`
-            return desc.opcodeBits | sizeBit30 | (rm << 16) | (rn << 5) | rd
+            return desc.opcodeBits | variableSizeBit30(desc, is64Bit: instr.is64Bit) | (rm << 16) | (rn << 5) | rd
 
-        case .fpMovGprToFp:
-            let ftype: UInt32 = (instr.scalarWidth == .d) ? (1 << 22) : 0
-            let sfBit: UInt32 = (instr.scalarWidth == .d) ? (1 << 31) : 0
-            return sfBit | desc.opcodeBits | ftype | (rn << 5) | vd
+        case .atomicLoadPair:
+            // `ra` holds `Rt2` (bits 14:10).
+            return desc.opcodeBits | variableSizeBit30(desc, is64Bit: instr.is64Bit) | (ra << 10) | (rn << 5) | rd
 
-        case .fpMovFpToGpr:
-            let ftype: UInt32 = (instr.scalarWidth == .d) ? (1 << 22) : 0
-            let sfBit: UInt32 = (instr.scalarWidth == .d) ? (1 << 31) : 0
-            return sfBit | desc.opcodeBits | ftype | (vn << 5) | rd
+        case .atomicStoreExclPair:
+            return desc.opcodeBits | variableSizeBit30(desc, is64Bit: instr.is64Bit) | (rm << 16) | (ra << 10) | (rn << 5) | rd
 
-        case .fpMovReg:
-            let ftype: UInt32 = (instr.scalarWidth == .d) ? (1 << 22) : 0
-            return desc.opcodeBits | ftype | (vn << 5) | vd
+        case .lseAtomic:
+            guard desc.allows(instr.scalarWidth) else { return nil }
+            let size = UInt32(instr.scalarWidth.rawValue) << 30
+            let a: UInt32 = instr.acquire ? (1 << 23) : 0
+            let r: UInt32 = instr.release ? (1 << 22) : 0
+            return size | desc.opcodeBits | a | r | (rm << 16) | (rn << 5) | rd
 
-        case .fpCvtReg:
-            return desc.opcodeBits | (vn << 5) | vd
+        case .lseCas:
+            guard desc.allows(instr.scalarWidth) else { return nil }
+            let size = UInt32(instr.scalarWidth.rawValue) << 30
+            let l: UInt32 = instr.acquire ? (1 << 22) : 0
+            let o0: UInt32 = instr.release ? (1 << 15) : 0
+            return size | desc.opcodeBits | l | (rm << 16) | o0 | (rn << 5) | rd
+
+        case .lseCasp:
+            // `Rs`/`Rt` name the first register of an even-numbered consecutive pair.
+            guard rm & 1 == 0, rd & 1 == 0 else { return nil }
+            let l: UInt32 = instr.acquire ? (1 << 22) : 0
+            let o0: UInt32 = instr.release ? (1 << 15) : 0
+            return (instr.is64Bit ? 1 << 30 : 0) | desc.opcodeBits | l | (rm << 16) | o0 | (rn << 5) | rd
+
+        case .fpLdstPreImm9, .fpLdstPostImm9, .fpLdstUnscaledImm9:
+            guard desc.allows(instr.scalarWidth), instr.imm >= -256 && instr.imm <= 255 else { return nil }
+            let imm9 = UInt32(bitPattern: Int32(truncatingIfNeeded: instr.imm)) & 0x1FF
+            return fpLdstSizeBits(instr.scalarWidth) | desc.opcodeBits | (imm9 << 12) | (rn << 5) | vd
+
+        case .fpLdstRegOffset:
+            guard desc.allows(instr.scalarWidth), instr.extendKind.rawValue & 0b010 != 0 else { return nil }
+            let naturalShift = instr.scalarWidth.rawValue
+            guard instr.amount == 0 || instr.amount == naturalShift else { return nil }
+            let opt = UInt32(instr.extendKind.rawValue) & 0x7
+            let sBit: UInt32 = (naturalShift == 0 ? instr.imm2 != 0 : instr.amount == naturalShift) ? (1 << 12) : 0
+            return fpLdstSizeBits(instr.scalarWidth) | desc.opcodeBits | (rm << 16) | (opt << 13) | sBit | (rn << 5) | vd
+
+        case .fpLdrLiteral:
+            guard desc.allows(instr.scalarWidth), let opc = fpPairOpc(instr.scalarWidth), pcRelInRange(instr.imm, bits: 19) else { return nil }
+            let imm19 = UInt32(bitPattern: Int32(truncatingIfNeeded: instr.imm >> 2)) & 0x7_FFFF
+            return (opc << 30) | desc.opcodeBits | (imm19 << 5) | vd
+
+        case .fpLdpStpSigned, .fpLdpStpPre, .fpLdpStpPost:
+            // `vn` holds `Rt2` (bits 14:10).
+            guard desc.allows(instr.scalarWidth), let opc = fpPairOpc(instr.scalarWidth) else { return nil }
+            let shift = Int64(instr.scalarWidth.rawValue)
+            let scaled = instr.imm >> shift
+            guard (scaled << shift) == instr.imm && scaled >= -64 && scaled <= 63 else { return nil }
+            let imm7 = UInt32(bitPattern: Int32(truncatingIfNeeded: scaled)) & 0x7F
+            return (opc << 30) | desc.opcodeBits | (imm7 << 15) | (vn << 10) | (rn << 5) | vd
+
+        case .fpMovGprToFp, .fpMovFpToGpr:
+            // `fmov` general: (32-bit, s), (64-bit, d), and either GPR width with `h`.
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            guard instr.scalarWidth == .h || instr.is64Bit == (instr.scalarWidth == .d) else { return nil }
+            let regs = desc.format == .fpMovGprToFp ? (rn << 5) | vd : (vn << 5) | rd
+            return sf | desc.opcodeBits | (ft << 22) | regs
+
+        case .fpDp1:
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            return desc.opcodeBits | (ft << 22) | (vn << 5) | vd
+
+        case .fpCvtPrecision:
+            // `scalarWidth` is the destination, `scalarWidth2` the source.
+            guard desc.allows(instr.scalarWidth), desc.allows(instr.scalarWidth2), instr.scalarWidth != instr.scalarWidth2,
+                  let dst = instr.scalarWidth.ftype, let src = instr.scalarWidth2.ftype else { return nil }
+            return desc.opcodeBits | (src << 22) | (dst << 15) | (vn << 5) | vd
 
         case .fpIntToFp:
-            let ftype: UInt32 = (instr.scalarWidth == .d) ? (1 << 22) : 0
-            return sf | desc.opcodeBits | ftype | (rn << 5) | vd
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            return sf | desc.opcodeBits | (ft << 22) | (rn << 5) | vd
 
         case .fpToInt:
-            let ftype: UInt32 = (instr.scalarWidth == .d) ? (1 << 22) : 0
-            return sf | desc.opcodeBits | ftype | (vn << 5) | rd
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            return sf | desc.opcodeBits | (ft << 22) | (vn << 5) | rd
+
+        case .fpFixedToFp, .fpToFixed:
+            // `imm` is the number of fraction bits; the field holds `64 - fbits`.
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype,
+                  instr.imm >= 1 && instr.imm <= (instr.is64Bit ? 64 : 32) else { return nil }
+            let scale = UInt32(64 - instr.imm)
+            let regs = desc.format == .fpFixedToFp ? (rn << 5) | vd : (vn << 5) | rd
+            return sf | desc.opcodeBits | (ft << 22) | (scale << 10) | regs
 
         case .fpBinary:
-            let ftype: UInt32 = (instr.scalarWidth == .d) ? (1 << 22) : 0
-            return desc.opcodeBits | ftype | (vm << 16) | (vn << 5) | vd
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            return desc.opcodeBits | (ft << 22) | (vm << 16) | (vn << 5) | vd
+
+        case .fpDp3:
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            return desc.opcodeBits | (ft << 22) | (vm << 16) | (va << 10) | (vn << 5) | vd
 
         case .fpCmpReg:
-            let ftype: UInt32 = (instr.scalarWidth == .d) ? (1 << 22) : 0
-            return desc.opcodeBits | ftype | (vm << 16) | (vn << 5)
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            return desc.opcodeBits | (ft << 22) | (vm << 16) | (vn << 5)
 
         case .fpCmpZero:
-            let ftype: UInt32 = (instr.scalarWidth == .d) ? (1 << 22) : 0
-            return desc.opcodeBits | ftype | (vn << 5)
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            return desc.opcodeBits | (ft << 22) | (vn << 5)
+
+        case .fpCondCompare:
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            let c = UInt32(instr.cond.rawValue) & 0xF
+            return desc.opcodeBits | (ft << 22) | (vm << 16) | (c << 12) | (vn << 5) | (UInt32(instr.imm2) & 0xF)
+
+        case .fpCondSelect:
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype else { return nil }
+            let c = UInt32(instr.cond.rawValue) & 0xF
+            return desc.opcodeBits | (ft << 22) | (vm << 16) | (c << 12) | (vn << 5) | vd
+
+        case .fpImm:
+            guard desc.allows(instr.scalarWidth), let ft = instr.scalarWidth.ftype, instr.imm >= 0 && instr.imm <= 0xFF else { return nil }
+            return desc.opcodeBits | (ft << 22) | (UInt32(instr.imm) << 13) | vd
 
         case .simdThreeSameInt, .simdPermute:
+            guard desc.allows(instr.arrangement) else { return nil }
             let q = instr.arrangement.qBit << 30
             let size = instr.arrangement.sizeBits << 22
             return q | size | desc.opcodeBits | (vm << 16) | (vn << 5) | vd
 
-        case .simdThreeSameBit:
+        case .simdThreeSameBit, .simdTbl:
+            guard desc.allows(instr.arrangement) else { return nil }
             let q = instr.arrangement.qBit << 30
+            if desc.format == .simdTbl {
+                // `imm2` is the table register count (1-4); `vn` the first table register.
+                guard instr.imm2 >= 1 && instr.imm2 <= 4 else { return nil }
+                return q | desc.opcodeBits | (vm << 16) | (UInt32(instr.imm2 - 1) << 13) | (vn << 5) | vd
+            }
             return q | desc.opcodeBits | (vm << 16) | (vn << 5) | vd
 
-        case .simdThreeSameFp:
+        case .simdThreeSameFp, .simdTwoRegMiscFp:
+            guard desc.allows(instr.arrangement) else { return nil }
             let q = instr.arrangement.qBit << 30
             let sz: UInt32 = (instr.arrangement == .d2) ? (1 << 22) : 0
-            return q | sz | desc.opcodeBits | (vm << 16) | (vn << 5) | vd
+            let regs = desc.format == .simdThreeSameFp ? (vm << 16) | (vn << 5) | vd : (vn << 5) | vd
+            return q | sz | desc.opcodeBits | regs
 
-        case .simdTwoRegMisc:
+        case .simdTwoRegMisc, .simdCmpZero, .simdAcrossLanes, .simdNarrow:
+            // `simdNarrow` takes the destination arrangement; its `size` is the narrow element size.
+            guard desc.allows(instr.arrangement) else { return nil }
             let q = instr.arrangement.qBit << 30
             let size = instr.arrangement.sizeBits << 22
             return q | size | desc.opcodeBits | (vn << 5) | vd
 
-        case .simdShiftImm:
+        case .simdShiftImm, .simdShiftLong, .simdShiftNarrow:
+            // `simdShiftLong` takes the source arrangement, `simdShiftNarrow` the destination one.
+            guard desc.allows(instr.arrangement) else { return nil }
             let q = instr.arrangement.qBit << 30
-            let esize: UInt32
-            switch instr.arrangement {
-            case .b8, .b16: esize = 8
-            case .h4, .h8:  esize = 16
-            case .s2, .s4:  esize = 32
-            case .d1, .d2, .q1: esize = 64
-            }
+            let esize = UInt32(8 << instr.arrangement.elementWidth.rawValue)
             let shift = UInt32(instr.amount)
-            guard shift < esize else { return nil }
             let immhImmb: UInt32
-            if instr.opcode == .simdShl {
+            switch desc.id {
+            case .simdShl, .simdSli, .simdSshll, .simdUshll:
+                guard shift < esize else { return nil }
                 immhImmb = esize + shift
-            } else {
-                guard shift >= 1 else { return nil }
+            default:
+                guard shift >= 1 && shift <= esize else { return nil }
                 immhImmb = (2 * esize) - shift
             }
             return q | desc.opcodeBits | ((immhImmb & 0x7F) << 16) | (vn << 5) | vd
 
+        case .simdDupElem:
+            guard desc.allows(instr.arrangement), let imm5 = copyImm5(instr.arrangement.elementWidth, index: instr.index) else { return nil }
+            return instr.arrangement.qBit << 30 | desc.opcodeBits | (imm5 << 16) | (vn << 5) | vd
+
         case .simdDupGpr:
-            let q = instr.arrangement.qBit << 30
-            let imm5: UInt32
-            switch instr.arrangement {
-            case .b8, .b16: imm5 = 0b00001
-            case .h4, .h8:  imm5 = 0b00010
-            case .s2, .s4:  imm5 = 0b00100
-            case .d1, .d2, .q1: imm5 = 0b01000
-            }
-            return q | desc.opcodeBits | (imm5 << 16) | (rn << 5) | vd
+            guard desc.allows(instr.arrangement), let imm5 = copyImm5(instr.arrangement.elementWidth, index: 0) else { return nil }
+            return instr.arrangement.qBit << 30 | desc.opcodeBits | (imm5 << 16) | (rn << 5) | vd
+
+        case .simdDupScalar:
+            guard desc.allows(instr.scalarWidth), let imm5 = copyImm5(instr.scalarWidth, index: instr.index) else { return nil }
+            return desc.opcodeBits | (imm5 << 16) | (vn << 5) | vd
 
         case .simdInsGpr:
-            let idx = UInt32(instr.index)
-            let imm5: UInt32
-            switch instr.scalarWidth {
-            case .b: imm5 = ((idx & 0xF) << 1) | 0b00001
-            case .h: imm5 = ((idx & 0x7) << 2) | 0b00010
-            case .s: imm5 = ((idx & 0x3) << 3) | 0b00100
-            case .d, .q: imm5 = ((idx & 0x1) << 4) | 0b01000
-            }
+            guard desc.allows(instr.scalarWidth), let imm5 = copyImm5(instr.scalarWidth, index: instr.index) else { return nil }
             return desc.opcodeBits | (imm5 << 16) | (rn << 5) | vd
 
+        case .simdInsElem:
+            // `index` is the destination lane, `imm2` the source lane.
+            guard desc.allows(instr.scalarWidth), let imm5 = copyImm5(instr.scalarWidth, index: instr.index),
+                  copyImm5(instr.scalarWidth, index: instr.imm2) != nil else { return nil }
+            let imm4 = UInt32(instr.imm2) << UInt32(instr.scalarWidth.rawValue)
+            return desc.opcodeBits | (imm5 << 16) | (imm4 << 11) | (vn << 5) | vd
+
         case .simdUmovSmov:
-            let idx = UInt32(instr.index)
-            let imm5: UInt32
-            let q: UInt32
-            switch instr.scalarWidth {
-            case .b:
-                imm5 = ((idx & 0xF) << 1) | 0b00001
-                q = (instr.opcode == .simdSmov && instr.is64Bit) ? (1 << 30) : 0
-            case .h:
-                imm5 = ((idx & 0x7) << 2) | 0b00010
-                q = (instr.opcode == .simdSmov && instr.is64Bit) ? (1 << 30) : 0
-            case .s:
-                imm5 = ((idx & 0x3) << 3) | 0b00100
-                q = (instr.opcode == .simdSmov && instr.is64Bit) ? (1 << 30) : 0
-            case .d, .q:
-                imm5 = ((idx & 0x1) << 4) | 0b01000
-                q = 1 << 30
+            // `umov`: W from b/h/s, X from d. `smov`: W from b/h, X from b/h/s. `Q` is the destination width.
+            guard desc.allows(instr.scalarWidth), let imm5 = copyImm5(instr.scalarWidth, index: instr.index) else { return nil }
+            let valid = desc.id == .simdUmov ? instr.is64Bit == (instr.scalarWidth == .d) : (instr.is64Bit || instr.scalarWidth != .s)
+            guard valid else { return nil }
+            return (instr.is64Bit ? 1 << 30 : 0) | desc.opcodeBits | (imm5 << 16) | (vn << 5) | rd
+
+        case .simdModImm:
+            guard let (op, cmode, imm8) = simdModImmFields(instr, desc) else { return nil }
+            return instr.arrangement.qBit << 30 | (op << 29) | desc.opcodeBits | ((imm8 >> 5) << 16) | (cmode << 12) | ((imm8 & 0x1F) << 5) | vd
+
+        case .simdLdStMulti, .simdLdStMultiPost:
+            // `imm2` is the register count; `ld1`/`st1` encode it in the opcode, `ldN`/`stN` fix it at N.
+            guard desc.allows(instr.arrangement) else { return nil }
+            let count = Int(instr.imm2)
+            var opcode: UInt32 = 0
+            switch desc.id {
+            case .simdLd1, .simdSt1, .simdLd1Post, .simdSt1Post:
+                let opcodes: [UInt32] = [0b0111, 0b1010, 0b0110, 0b0010]
+                guard count >= 1 && count <= 4 else { return nil }
+                opcode = opcodes[count - 1] << 12
+            case .simdLd2, .simdSt2, .simdLd2Post, .simdSt2Post: guard count == 2 else { return nil }
+            case .simdLd3, .simdSt3, .simdLd3Post, .simdSt3Post: guard count == 3 else { return nil }
+            default: guard count == 4 else { return nil }
             }
-            return q | desc.opcodeBits | (imm5 << 16) | (vn << 5) | rd
+            let q = instr.arrangement.qBit
+            let base = q << 30 | desc.opcodeBits | opcode | (instr.arrangement.sizeBits << 10) | (rn << 5) | vd
+            guard desc.format == .simdLdStMultiPost else { return base }
+            guard let m = postIndexRm(instr, bytes: Int64(count) * (q == 1 ? 16 : 8)) else { return nil }
+            return base | (m << 16)
 
-        case .simdLd1St1One:
-            let q = instr.arrangement.qBit << 30
-            let size = instr.arrangement.sizeBits << 10
-            return q | desc.opcodeBits | size | (rn << 5) | vd
+        case .simdLd1R, .simdLd1RPost:
+            guard desc.allows(instr.arrangement) else { return nil }
+            let base = instr.arrangement.qBit << 30 | desc.opcodeBits | (instr.arrangement.sizeBits << 10) | (rn << 5) | vd
+            guard desc.format == .simdLd1RPost else { return base }
+            guard let m = postIndexRm(instr, bytes: Int64(instr.arrangement.elementWidth.byteCount)) else { return nil }
+            return base | (m << 16)
 
-        case .simdTblOne:
-            let q = instr.arrangement.qBit << 30
-            return q | desc.opcodeBits | (vm << 16) | (vn << 5) | vd
+        case .simdLdStLane, .simdLdStLanePost:
+            guard desc.allows(instr.scalarWidth), copyImm5(instr.scalarWidth, index: instr.index) != nil else { return nil }
+            let idx = UInt32(instr.index)
+            let opcode: UInt32, s: UInt32, size: UInt32, q: UInt32
+            switch instr.scalarWidth {
+            case .b: (opcode, q, s, size) = (0b000, idx >> 3, (idx >> 2) & 1, idx & 3)
+            case .h: (opcode, q, s, size) = (0b010, idx >> 2, (idx >> 1) & 1, (idx & 1) << 1)
+            case .s: (opcode, q, s, size) = (0b100, idx >> 1, idx & 1, 0b00)
+            default: (opcode, q, s, size) = (0b100, idx, 0, 0b01)
+            }
+            let base = q << 30 | desc.opcodeBits | (opcode << 13) | (s << 12) | (size << 10) | (rn << 5) | vd
+            guard desc.format == .simdLdStLanePost else { return base }
+            guard let m = postIndexRm(instr, bytes: Int64(instr.scalarWidth.byteCount)) else { return nil }
+            return base | (m << 16)
 
         case .simdExt:
+            guard desc.allows(instr.arrangement), instr.amount < (instr.arrangement.qBit == 1 ? 16 : 8) else { return nil }
             let q = instr.arrangement.qBit << 30
             let imm4 = UInt32(instr.amount) & 0xF
             return q | desc.opcodeBits | (vm << 16) | (imm4 << 11) | (vn << 5) | vd
@@ -2127,6 +2761,51 @@ public enum A64Encoder {
         case .sveWrffr:
             let pn = UInt32(instr.pd.rawValue) & 0xF
             return desc.opcodeBits | (pn << 5)
+        }
+    }
+
+    /// The `Rm` field of a post-indexed structure load/store: `rm` for a register offset, or 31 (the
+    /// immediate form) when `rm` is 31 and `imm` equals the bytes transferred, the only legal immediate.
+    static func postIndexRm(_ instr: A64Instruction, bytes: Int64) -> UInt32? {
+        if instr.rm.rawValue != 31 { return UInt32(instr.rm.rawValue) }
+        return instr.imm == bytes ? 31 : nil
+    }
+
+    /// `(op, cmode, abcdefgh)` of an Advanced SIMD modified immediate. `imm` is the 8-bit immediate, except
+    /// for the 64-bit `movi` byte mask (the expanded value) and `fmov` (the FP8 encoding).
+    static func simdModImmFields(_ instr: A64Instruction, _ desc: A64InstrDesc) -> (op: UInt32, cmode: UInt32, imm8: UInt32)? {
+        let arr = instr.arrangement
+        guard desc.allows(arr) else { return nil }
+        let imm8: UInt32? = (0...255).contains(instr.imm) ? UInt32(instr.imm) : nil
+        let amount = UInt32(instr.amount)
+        switch desc.id {
+        case .simdFmovImm:
+            guard let imm8 else { return nil }
+            return (arr == .d2 ? 1 : 0, 0b1111, imm8)
+        case .simdMovi where arr.elementWidth == .d:
+            guard amount == 0, let mask = A64SIMDByteMask.encode(UInt64(bitPattern: instr.imm)) else { return nil }
+            return (1, 0b1110, UInt32(mask))
+        case .simdMovi where arr.elementWidth == .b:
+            guard amount == 0, instr.shiftKind == .lsl, let imm8 else { return nil }
+            return (0, 0b1110, imm8)
+        default:
+            break
+        }
+        guard let imm8 else { return nil }
+        let op: UInt32 = (desc.id == .simdMvni || desc.id == .simdBicImm) ? 1 : 0
+        let orrBic: UInt32 = (desc.id == .simdOrrImm || desc.id == .simdBicImm) ? 1 : 0
+        switch (arr.elementWidth, instr.shiftKind) {
+        case (.h, .lsl):
+            guard amount == 0 || amount == 8 else { return nil }
+            return (op, 0b1000 | (amount / 8) << 1 | orrBic, imm8)
+        case (.s, .lsl):
+            guard amount % 8 == 0 && amount <= 24 else { return nil }
+            return (op, (amount / 8) << 1 | orrBic, imm8)
+        case (.s, .msl):
+            guard orrBic == 0, amount == 8 || amount == 16 else { return nil }
+            return (op, 0b1100 | (amount == 16 ? 1 : 0), imm8)
+        default:
+            return nil
         }
     }
 
@@ -2171,6 +2850,14 @@ public enum A64Disassembler {
             }
         }
         return nil
+    }
+
+    /// Register width of a GPR load/store: bit 30 when the descriptor leaves the size variable; otherwise
+    /// sign-extending loads (`opc<1>` = 1) target X when `opc<0>` = 0, and everything else targets W.
+    @inline(__always)
+    private static func gprLoadIs64(word: UInt32, desc: A64InstrDesc) -> Bool {
+        if (desc.opcodeMask & (1 << 30)) == 0 { return (word >> 30) & 1 != 0 }
+        return (word >> 23) & 1 != 0 && (word >> 22) & 1 == 0
     }
 
     private static func decode(word: UInt32, desc: A64InstrDesc) -> A64Instruction? {
@@ -2322,7 +3009,7 @@ public enum A64Disassembler {
 
         case .barrier:
             let crm = UInt8((word >> 8) & 0xF)
-            let opt = A64BarrierOption(rawValue: crm) ?? .sy
+            let opt = A64BarrierOption(rawValue: crm)
             return A64Instruction(opcode: desc.id, is64Bit: true, barrierOption: opt)
 
         case .mrs, .msrReg:
@@ -2353,56 +3040,21 @@ public enum A64Disassembler {
                 let offset = imm12 << Int64(desc.scaleLog2)
                 return A64Instruction(opcode: desc.id, is64Bit: true, rn: rn, vd: vd, scalarWidth: sw, imm: offset)
             }
-            let size30 = ((word >> 30) & 1) != 0
-            let is64Reg: Bool
-            let shift: UInt8
-            if desc.scaleLog2 == 255 {
-                is64Reg = size30
-                shift = size30 ? 3 : 2
-            } else {
-                switch desc.id {
-                case .ldrsbImm64, .ldrshImm64, .ldrswImm: is64Reg = true
-                default: is64Reg = false
-                }
-                shift = desc.scaleLog2
-            }
+            let is64Reg = gprLoadIs64(word: word, desc: desc)
+            let shift: UInt8 = desc.scaleLog2 == 255 ? (is64Reg ? 3 : 2) : desc.scaleLog2
             return A64Instruction(opcode: desc.id, is64Bit: is64Reg, rd: rd, rn: rn, imm: imm12 << Int64(shift))
 
         case .ldstPreImm9, .ldstPostImm9, .ldstUnscaledImm9, .ldstUnprivImm9:
             let raw9 = (word >> 12) & 0x1FF
             let simm9 = signExtend(raw9, bits: 9)
-            let size30 = ((word >> 30) & 1) != 0
-            let is64Reg: Bool
-            switch desc.id {
-            case .ldrPre, .strPre, .ldrPost, .strPost, .ldur, .stur, .ldtr, .sttr:
-                is64Reg = size30
-            case .ldrsbPre64, .ldrshPre64, .ldrswPre,
-                 .ldrsbPost64, .ldrshPost64, .ldrswPost,
-                 .ldursb64, .ldursh64, .ldursw,
-                 .ldtrsb64, .ldtrsh64, .ldtrsw:
-                is64Reg = true
-            default:
-                is64Reg = false
-            }
-            return A64Instruction(opcode: desc.id, is64Bit: is64Reg, rd: rd, rn: rn, imm: simm9)
+            return A64Instruction(opcode: desc.id, is64Bit: gprLoadIs64(word: word, desc: desc), rd: rd, rn: rn, imm: simm9)
 
         case .ldstRegOffset:
-            let size30 = ((word >> 30) & 1) != 0
             let optRaw = UInt8((word >> 13) & 0x7)
-            guard let ext = A64ExtendKind(rawValue: optRaw) else { return nil }
+            guard optRaw & 0b010 != 0, let ext = A64ExtendKind(rawValue: optRaw) else { return nil }
             let sBit = ((word >> 12) & 1) != 0
-            let is64Reg: Bool
-            let naturalShift: UInt8
-            if desc.scaleLog2 == 255 {
-                is64Reg = size30
-                naturalShift = size30 ? 3 : 2
-            } else {
-                switch desc.id {
-                case .ldrsbReg64, .ldrshReg64, .ldrswReg: is64Reg = true
-                default: is64Reg = false
-                }
-                naturalShift = desc.scaleLog2
-            }
+            let is64Reg = gprLoadIs64(word: word, desc: desc)
+            let naturalShift: UInt8 = desc.scaleLog2 == 255 ? (is64Reg ? 3 : 2) : desc.scaleLog2
             return A64Instruction(
                 opcode: desc.id,
                 is64Bit: is64Reg,
@@ -2410,203 +3062,238 @@ public enum A64Disassembler {
                 rn: rn,
                 rm: rm,
                 extendKind: ext,
-                amount: sBit ? naturalShift : 0
+                amount: sBit ? naturalShift : 0,
+                imm2: sBit && naturalShift == 0 ? 1 : 0
             )
 
         case .ldrLiteral:
-            let size30 = ((word >> 30) & 1) != 0
             let raw19 = (word >> 5) & 0x7_FFFF
             let offset = signExtend(raw19, bits: 19) << 2
-            return A64Instruction(opcode: desc.id, is64Bit: size30, rd: rd, imm: offset)
+            let is64Reg = desc.id == .ldrswLit || (word >> 30) & 1 != 0
+            return A64Instruction(opcode: desc.id, is64Bit: is64Reg, rd: rd, imm: offset)
 
         case .ldpStpSigned, .ldpStpPre, .ldpStpPost:
+            // `ldp`/`ldpsw` with `opc` = 11 does not exist; `opc` = 01 is `ldpsw`/`stgp` (not in the table).
+            guard (word >> 30) & 1 == 0 else { return nil }
             let raw7 = (word >> 15) & 0x7F
             let simm7 = signExtend(raw7, bits: 7)
-            if desc.scalarWidth == .q {
-                let rt2 = A64VReg(rawValue: UInt8((word >> 10) & 0x1F))
-                return A64Instruction(opcode: desc.id, is64Bit: true, rn: rn, vd: vd, vn: rt2, scalarWidth: .q, imm: simm7 << 4)
-            } else {
-                let rt2 = A64GPR(rawValue: UInt8((word >> 10) & 0x1F))
-                let shift: Int64 = is64 ? 3 : 2
-                return A64Instruction(opcode: desc.id, is64Bit: is64, rd: rd, rn: rn, rm: rt2, imm: simm7 << shift)
-            }
+            let rt2 = A64GPR(rawValue: UInt8((word >> 10) & 0x1F))
+            let shift: Int64 = is64 ? 3 : 2
+            return A64Instruction(opcode: desc.id, is64Bit: is64, rd: rd, rn: rn, rm: rt2, imm: simm7 << shift)
 
         case .atomicLoad, .atomicStore:
-            let size30 = ((word >> 30) & 1) != 0
-            let is64Reg: Bool
-            switch desc.id {
-            case .ldarb, .stlrb, .ldarh, .stlrh: is64Reg = false
-            default: is64Reg = size30
-            }
+            // Fixed-size (`b`/`h`) exclusives and acquire/release forms always use W registers.
+            let is64Reg = (desc.opcodeMask & (1 << 30)) == 0 && (word >> 30) & 1 != 0
             return A64Instruction(opcode: desc.id, is64Bit: is64Reg, rd: rd, rn: rn)
 
         case .atomicStoreExcl:
-            let size30 = ((word >> 30) & 1) != 0
-            return A64Instruction(opcode: desc.id, is64Bit: size30, rd: rd, rn: rn, rm: rm)
+            let is64Reg = (desc.opcodeMask & (1 << 30)) == 0 && (word >> 30) & 1 != 0
+            return A64Instruction(opcode: desc.id, is64Bit: is64Reg, rd: rd, rn: rn, rm: rm)
 
-        case .fpMovGprToFp:
-            let ftype = (word >> 22) & 0x3
-            let sw: A64ScalarWidth = (ftype == 1) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, rn: rn, vd: vd, scalarWidth: sw)
+        case .atomicLoadPair:
+            return A64Instruction(opcode: desc.id, is64Bit: (word >> 30) & 1 != 0, rd: rd, rn: rn, ra: ra)
 
-        case .fpMovFpToGpr:
-            let ftype = (word >> 22) & 0x3
-            let sw: A64ScalarWidth = (ftype == 1) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, rd: rd, vn: vn, scalarWidth: sw)
+        case .atomicStoreExclPair:
+            return A64Instruction(opcode: desc.id, is64Bit: (word >> 30) & 1 != 0, rd: rd, rn: rn, rm: rm, ra: ra)
 
-        case .fpMovReg:
-            let ftype = (word >> 22) & 0x3
-            let sw: A64ScalarWidth = (ftype == 1) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, vd: vd, vn: vn, scalarWidth: sw)
+        case .lseAtomic:
+            let size = A64ScalarWidth(rawValue: UInt8(word >> 30))!
+            return A64Instruction(opcode: desc.id, is64Bit: size == .d, rd: rd, rn: rn, rm: rm, scalarWidth: size,
+                                  acquire: (word >> 23) & 1 != 0, release: (word >> 22) & 1 != 0)
 
-        case .fpCvtReg:
-            let sw: A64ScalarWidth = (desc.id == .fcvtStoD) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, vd: vd, vn: vn, scalarWidth: sw)
+        case .lseCas:
+            let size = A64ScalarWidth(rawValue: UInt8(word >> 30))!
+            return A64Instruction(opcode: desc.id, is64Bit: size == .d, rd: rd, rn: rn, rm: rm, scalarWidth: size,
+                                  acquire: (word >> 22) & 1 != 0, release: (word >> 15) & 1 != 0)
 
-        case .fpIntToFp:
-            let ftype = (word >> 22) & 0x3
-            let sw: A64ScalarWidth = (ftype == 1) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: is64, rn: rn, vd: vd, scalarWidth: sw)
+        case .lseCasp:
+            guard rm.rawValue & 1 == 0, rd.rawValue & 1 == 0 else { return nil }
+            let is64Reg = (word >> 30) & 1 != 0
+            return A64Instruction(opcode: desc.id, is64Bit: is64Reg, rd: rd, rn: rn, rm: rm, scalarWidth: is64Reg ? .d : .s,
+                                  acquire: (word >> 22) & 1 != 0, release: (word >> 15) & 1 != 0)
 
-        case .fpToInt:
-            let ftype = (word >> 22) & 0x3
-            let sw: A64ScalarWidth = (ftype == 1) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: is64, rd: rd, vn: vn, scalarWidth: sw)
+        case .fpLdstPreImm9, .fpLdstPostImm9, .fpLdstUnscaledImm9:
+            guard let w = fpLdstWidth(word) else { return nil }
+            let simm9 = signExtend((word >> 12) & 0x1FF, bits: 9)
+            return A64Instruction(opcode: desc.id, rn: rn, vd: vd, scalarWidth: w, imm: simm9)
 
-        case .fpBinary:
-            let ftype = (word >> 22) & 0x3
-            let sw: A64ScalarWidth = (ftype == 1) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, vd: vd, vn: vn, vm: vm, scalarWidth: sw)
+        case .fpLdstRegOffset:
+            guard let w = fpLdstWidth(word) else { return nil }
+            let optRaw = UInt8((word >> 13) & 0x7)
+            guard optRaw & 0b010 != 0, let ext = A64ExtendKind(rawValue: optRaw) else { return nil }
+            let sBit = (word >> 12) & 1 != 0
+            return A64Instruction(opcode: desc.id, rn: rn, rm: rm, vd: vd, scalarWidth: w, extendKind: ext,
+                                  amount: sBit ? w.rawValue : 0, imm2: sBit && w == .b ? 1 : 0)
 
-        case .fpCmpReg:
-            let ftype = (word >> 22) & 0x3
-            let sw: A64ScalarWidth = (ftype == 1) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, vn: vn, vm: vm, scalarWidth: sw)
+        case .fpLdrLiteral:
+            guard let w = fpPairWidth(word) else { return nil }
+            let offset = signExtend((word >> 5) & 0x7_FFFF, bits: 19) << 2
+            return A64Instruction(opcode: desc.id, vd: vd, scalarWidth: w, imm: offset)
 
-        case .fpCmpZero:
-            let ftype = (word >> 22) & 0x3
-            let sw: A64ScalarWidth = (ftype == 1) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, vn: vn, scalarWidth: sw)
+        case .fpLdpStpSigned, .fpLdpStpPre, .fpLdpStpPost:
+            guard let w = fpPairWidth(word) else { return nil }
+            let simm7 = signExtend((word >> 15) & 0x7F, bits: 7)
+            let rt2 = A64VReg(rawValue: UInt8((word >> 10) & 0x1F))
+            return A64Instruction(opcode: desc.id, rn: rn, vd: vd, vn: rt2, scalarWidth: w, imm: simm7 << Int64(w.rawValue))
 
-        case .simdThreeSameInt, .simdPermute:
+        case .fpMovGprToFp, .fpMovFpToGpr:
+            guard let w = A64ScalarWidth.fromFtype(word >> 22), w == .h || is64 == (w == .d) else { return nil }
+            return A64Instruction(opcode: desc.id, is64Bit: is64, rd: rd, rn: rn, vd: vd, vn: vn, scalarWidth: w)
+
+        case .fpDp1:
+            guard let w = A64ScalarWidth.fromFtype(word >> 22) else { return nil }
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, scalarWidth: w)
+
+        case .fpCvtPrecision:
+            guard let src = A64ScalarWidth.fromFtype(word >> 22), let dst = A64ScalarWidth.fromFtype(word >> 15), src != dst else { return nil }
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, scalarWidth: dst, scalarWidth2: src)
+
+        case .fpIntToFp, .fpToInt:
+            guard let w = A64ScalarWidth.fromFtype(word >> 22) else { return nil }
+            return A64Instruction(opcode: desc.id, is64Bit: is64, rd: rd, rn: rn, vd: vd, vn: vn, scalarWidth: w)
+
+        case .fpFixedToFp, .fpToFixed:
+            guard let w = A64ScalarWidth.fromFtype(word >> 22) else { return nil }
+            let fbits = 64 - Int64((word >> 10) & 0x3F)
+            guard is64 || fbits <= 32 else { return nil }
+            return A64Instruction(opcode: desc.id, is64Bit: is64, rd: rd, rn: rn, vd: vd, vn: vn, scalarWidth: w, imm: fbits)
+
+        case .fpBinary, .fpCmpReg, .fpCmpZero:
+            guard let w = A64ScalarWidth.fromFtype(word >> 22) else { return nil }
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, scalarWidth: w)
+
+        case .fpDp3:
+            guard let w = A64ScalarWidth.fromFtype(word >> 22) else { return nil }
+            let va = A64VReg(rawValue: UInt8((word >> 10) & 0x1F))
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, va: va, scalarWidth: w)
+
+        case .fpCondCompare, .fpCondSelect:
+            guard let w = A64ScalarWidth.fromFtype(word >> 22) else { return nil }
+            let cond = A64Cond(rawValue: UInt8((word >> 12) & 0xF))!
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, scalarWidth: w, cond: cond, imm2: UInt8(word & 0xF))
+
+        case .fpImm:
+            guard let w = A64ScalarWidth.fromFtype(word >> 22) else { return nil }
+            return A64Instruction(opcode: desc.id, vd: vd, scalarWidth: w, imm: Int64((word >> 13) & 0xFF))
+
+        case .simdThreeSameInt, .simdPermute, .simdTwoRegMisc, .simdCmpZero, .simdAcrossLanes, .simdNarrow:
             let q = (word >> 30) & 1
-            let size = (word >> 22) & 0x3
-            let arr = A64Arrangement.from(qBit: q, sizeBits: size)
+            // Byte-only operations with a fixed `size` field (`not`, `rbit`) take their arrangement from `Q` alone.
+            let arr = desc.arrangements == A64Variants.bytes ? (q == 1 ? A64Arrangement.b16 : .b8)
+                                                             : A64Arrangement.from(qBit: q, sizeBits: (word >> 22) & 0x3)
+            guard desc.allows(arr) else { return nil }
             return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: arr)
 
         case .simdThreeSameBit:
-            let q = (word >> 30) & 1
-            let arr: A64Arrangement = (q == 1) ? .b16 : .b8
+            let arr: A64Arrangement = (word >> 30) & 1 == 1 ? .b16 : .b8
             return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: arr)
 
-        case .simdThreeSameFp:
+        case .simdThreeSameFp, .simdTwoRegMiscFp:
             let q = (word >> 30) & 1
             let sz = (word >> 22) & 1
+            guard !(sz == 1 && q == 0) else { return nil }
             let arr: A64Arrangement = (sz == 1) ? .d2 : ((q == 1) ? .s4 : .s2)
             return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: arr)
 
-        case .simdTwoRegMisc:
-            let q = (word >> 30) & 1
-            let size = (word >> 22) & 0x3
-            let arr = A64Arrangement.from(qBit: q, sizeBits: size)
-            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, arrangement: arr)
-
-        case .simdShiftImm:
-            let q = (word >> 30) & 1
+        case .simdShiftImm, .simdShiftLong, .simdShiftNarrow:
             let immh = (word >> 19) & 0xF
-            let immb = (word >> 16) & 0x7
-            let immhImmb = (immh << 3) | immb
-            if immh == 0 { return nil }
-            let sizeBits: UInt32
-            let esize: UInt32
-            if (immh & 0b1000) != 0 {
-                sizeBits = 3; esize = 64
-            } else if (immh & 0b0100) != 0 {
-                sizeBits = 2; esize = 32
-            } else if (immh & 0b0010) != 0 {
-                sizeBits = 1; esize = 16
-            } else {
-                sizeBits = 0; esize = 8
+            guard immh != 0 else { return nil }
+            let sizeBits = UInt32(31 - immh.leadingZeroBitCount)
+            let esize = UInt32(8) << sizeBits
+            let arr = A64Arrangement.from(qBit: (word >> 30) & 1, sizeBits: sizeBits)
+            guard desc.allows(arr) else { return nil }
+            let immhImmb = (word >> 16) & 0x7F
+            let shift: UInt32
+            switch desc.id {
+            case .simdShl, .simdSli, .simdSshll, .simdUshll: shift = immhImmb - esize
+            default: shift = (2 * esize) - immhImmb
             }
-            let arr = A64Arrangement.from(qBit: q, sizeBits: sizeBits)
-            let shift: UInt8
-            if desc.id == .simdShl {
-                shift = UInt8(immhImmb - esize)
-            } else {
-                shift = UInt8((2 * esize) - immhImmb)
-            }
-            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, arrangement: arr, amount: shift)
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, arrangement: arr, amount: UInt8(shift))
 
-        case .simdDupGpr:
-            let q = (word >> 30) & 1
-            let imm5 = (word >> 16) & 0x1F
-            let sizeBits: UInt32
-            if (imm5 & 0b00001) != 0 {
-                sizeBits = 0
-            } else if (imm5 & 0b00010) != 0 {
-                sizeBits = 1
-            } else if (imm5 & 0b00100) != 0 {
-                sizeBits = 2
-            } else if (imm5 & 0b01000) != 0 {
-                sizeBits = 3
-            } else {
-                return nil
-            }
-            let arr = A64Arrangement.from(qBit: q, sizeBits: sizeBits)
-            return A64Instruction(opcode: desc.id, is64Bit: sizeBits == 3, rn: rn, vd: vd, arrangement: arr)
+        case .simdDupElem, .simdDupGpr:
+            guard let (w, idx) = copyElement(word) else { return nil }
+            guard let arr = A64Arrangement.from(element: w, q: (word >> 30) & 1 != 0), desc.allows(arr) else { return nil }
+            return A64Instruction(opcode: desc.id, is64Bit: w == .d, rn: rn, vd: vd, vn: vn, arrangement: arr,
+                                  index: desc.format == .simdDupElem ? idx : 0)
 
-        case .simdInsGpr:
-            let imm5 = (word >> 16) & 0x1F
-            let sw: A64ScalarWidth
-            let idx: UInt8
-            if (imm5 & 0b00001) != 0 {
-                sw = .b; idx = UInt8((imm5 >> 1) & 0xF)
-            } else if (imm5 & 0b00010) != 0 {
-                sw = .h; idx = UInt8((imm5 >> 2) & 0x7)
-            } else if (imm5 & 0b00100) != 0 {
-                sw = .s; idx = UInt8((imm5 >> 3) & 0x3)
-            } else if (imm5 & 0b01000) != 0 {
-                sw = .d; idx = UInt8((imm5 >> 4) & 0x1)
-            } else {
-                return nil
-            }
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, rn: rn, vd: vd, scalarWidth: sw, index: idx)
+        case .simdDupScalar, .simdInsGpr:
+            guard let (w, idx) = copyElement(word) else { return nil }
+            return A64Instruction(opcode: desc.id, is64Bit: w == .d, rn: rn, vd: vd, vn: vn, scalarWidth: w, index: idx)
+
+        case .simdInsElem:
+            guard let (w, idx) = copyElement(word) else { return nil }
+            let imm4 = (word >> 11) & 0xF
+            let lowMask: UInt32 = (1 << UInt32(w.rawValue)) - 1
+            guard imm4 & lowMask == 0 else { return nil }
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, scalarWidth: w, index: idx, imm2: UInt8(imm4 >> UInt32(w.rawValue)))
 
         case .simdUmovSmov:
-            let q = ((word >> 30) & 1) != 0
-            let imm5 = (word >> 16) & 0x1F
-            let sw: A64ScalarWidth
-            let idx: UInt8
-            if (imm5 & 0b00001) != 0 {
-                sw = .b; idx = UInt8((imm5 >> 1) & 0xF)
-            } else if (imm5 & 0b00010) != 0 {
-                sw = .h; idx = UInt8((imm5 >> 2) & 0x7)
-            } else if (imm5 & 0b00100) != 0 {
-                sw = .s; idx = UInt8((imm5 >> 3) & 0x3)
-            } else if (imm5 & 0b01000) != 0 {
-                sw = .d; idx = UInt8((imm5 >> 4) & 0x1)
-            } else {
-                return nil
+            guard let (w, idx) = copyElement(word) else { return nil }
+            let q = (word >> 30) & 1 != 0
+            let valid = desc.id == .simdUmov ? q == (w == .d) : (w != .d && (q || w != .s))
+            guard valid else { return nil }
+            return A64Instruction(opcode: desc.id, is64Bit: q, rd: rd, vn: vn, scalarWidth: w, index: idx)
+
+        case .simdModImm:
+            return decodeModImm(word: word, desc: desc)
+
+        case .simdLdStMulti, .simdLdStMultiPost:
+            let q = (word >> 30) & 1
+            let arr = A64Arrangement.from(qBit: q, sizeBits: (word >> 10) & 0x3)
+            guard desc.allows(arr) else { return nil }
+            let count: UInt8
+            switch desc.id {
+            case .simdLd1, .simdSt1, .simdLd1Post, .simdSt1Post:
+                switch (word >> 12) & 0xF {
+                case 0b0111: count = 1
+                case 0b1010: count = 2
+                case 0b0110: count = 3
+                case 0b0010: count = 4
+                default: return nil
+                }
+            case .simdLd2, .simdSt2, .simdLd2Post, .simdSt2Post: count = 2
+            case .simdLd3, .simdSt3, .simdLd3Post, .simdSt3Post: count = 3
+            default: count = 4
             }
-            let is64Dst = (desc.id == .simdSmov) ? q : (sw == .d)
-            return A64Instruction(opcode: desc.id, is64Bit: is64Dst, rd: rd, vn: vn, scalarWidth: sw, index: idx)
+            let bytes = Int64(count) * (q == 1 ? 16 : 8)
+            let isPost = desc.format == .simdLdStMultiPost
+            return A64Instruction(opcode: desc.id, rn: rn, rm: isPost ? rm : .xzr, vd: vd, arrangement: arr,
+                                  imm: isPost && rm.rawValue == 31 ? bytes : 0, imm2: count)
 
-        case .simdLd1St1One:
-            let q = (word >> 30) & 1
-            let size = (word >> 10) & 0x3
-            let arr = A64Arrangement.from(qBit: q, sizeBits: size)
-            return A64Instruction(opcode: desc.id, rn: rn, vd: vd, arrangement: arr)
+        case .simdLd1R, .simdLd1RPost:
+            let arr = A64Arrangement.from(qBit: (word >> 30) & 1, sizeBits: (word >> 10) & 0x3)
+            let isPost = desc.format == .simdLd1RPost
+            return A64Instruction(opcode: desc.id, rn: rn, rm: isPost ? rm : .xzr, vd: vd, arrangement: arr,
+                                  imm: isPost && rm.rawValue == 31 ? Int64(arr.elementWidth.byteCount) : 0)
 
-        case .simdTblOne:
+        case .simdLdStLane, .simdLdStLanePost:
             let q = (word >> 30) & 1
-            let arr: A64Arrangement = (q == 1) ? .b16 : .b8
-            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: arr)
+            let s = (word >> 12) & 1
+            let size = (word >> 10) & 3
+            let w: A64ScalarWidth
+            let idx: UInt32
+            switch (word >> 13) & 0b111 {
+            case 0b000: (w, idx) = (.b, q << 3 | s << 2 | size)
+            case 0b010:
+                guard size & 1 == 0 else { return nil }
+                (w, idx) = (.h, q << 2 | s << 1 | size >> 1)
+            case 0b100 where size == 0b00: (w, idx) = (.s, q << 1 | s)
+            case 0b100 where size == 0b01 && s == 0: (w, idx) = (.d, q)
+            default: return nil
+            }
+            let isPost = desc.format == .simdLdStLanePost
+            return A64Instruction(opcode: desc.id, rn: rn, rm: isPost ? rm : .xzr, vd: vd, scalarWidth: w, index: UInt8(idx),
+                                  imm: isPost && rm.rawValue == 31 ? Int64(w.byteCount) : 0)
+
+        case .simdTbl:
+            let arr: A64Arrangement = (word >> 30) & 1 == 1 ? .b16 : .b8
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: arr, imm2: UInt8((word >> 13) & 3) + 1)
 
         case .simdExt:
             let q = (word >> 30) & 1
-            let arr: A64Arrangement = (q == 1) ? .b16 : .b8
             let imm4 = UInt8((word >> 11) & 0xF)
-            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: arr, amount: imm4)
+            guard q == 1 || imm4 < 8 else { return nil }
+            return A64Instruction(opcode: desc.id, vd: vd, vn: vn, vm: vm, arrangement: q == 1 ? .b16 : .b8, amount: imm4)
 
         case .sveLdrStrZ:
             let imm9h = (word >> 16) & 0x3F
@@ -2640,7 +3327,8 @@ public enum A64Disassembler {
         }
     }
 
-    /// Formats a structured `A64Instruction` into canonical GNU/Unified AArch64 assembly syntax.
+    /// Formats a structured `A64Instruction` as LLVM MC prints it (`llvm-objdump`/`llvm-mc --disassemble`),
+    /// including its preferred aliases (`mov`, `cmp`, `lsl`, `cset`, `stadd`, ...).
     public static func format(_ instr: A64Instruction) -> String {
         let desc = A64InstructionTable.descriptor(for: instr.opcode)
         let is64 = instr.is64Bit
@@ -2659,9 +3347,11 @@ public enum A64Disassembler {
             return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64, r31IsSP: rdUseSP)), \(instr.rn.format(is64Bit: is64, r31IsSP: true)), #\(instr.imm)\(shiftSuffix)"
 
         case .movWide:
+            if instr.opcode != .movk, let value = movAliasValue(instr) {
+                return "mov \(instr.rd.format(is64Bit: is64)), #\(value)"
+            }
             let shiftSuffix = (instr.amount != 0) ? ", lsl #\(instr.amount)" : ""
-            let hex = String(instr.imm, radix: 16)
-            return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64)), #0x\(hex)\(shiftSuffix)"
+            return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64)), #\(instr.imm)\(shiftSuffix)"
 
         case .pcRel:
             return "\(desc.mnemonic) \(instr.rd.format(is64Bit: true)), #\(instr.imm)"
@@ -2673,6 +3363,11 @@ public enum A64Disassembler {
             if instr.opcode == .andsImm && instr.rd.rawValue == 31 {
                 return "tst \(instr.rn.format(is64Bit: is64)), #0x\(hex)"
             }
+            // `orr Rd, zr, #imm` is `mov` unless `movz`/`movn` can materialize the value (they take precedence).
+            if instr.opcode == .orrImm && instr.rn.rawValue == 31 && !isMovWideValue(displayVal, is64Bit: is64) {
+                let signed = is64 ? Int64(bitPattern: displayVal) : Int64(Int32(truncatingIfNeeded: displayVal))
+                return "mov \(instr.rd.format(is64Bit: is64, r31IsSP: true)), #\(signed)"
+            }
             let rdUseSP = (instr.opcode != .andsImm)
             return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64, r31IsSP: rdUseSP)), \(instr.rn.format(is64Bit: is64)), #0x\(hex)"
 
@@ -2682,27 +3377,33 @@ public enum A64Disassembler {
             let imms = Int64(instr.imm2)
             let rdStr = instr.rd.format(is64Bit: is64)
             let rnStr = instr.rn.format(is64Bit: is64)
+            // Fields outside the register width have no alias (and are reserved); print the raw form.
+            guard immr < width && imms < width else {
+                return "\(desc.mnemonic) \(rdStr), \(rnStr), #\(immr), #\(imms)"
+            }
+            let insertLsb = (width - immr) % width
             if instr.opcode == .ubfm {
                 if !is64 && immr == 0 && imms == 7 { return "uxtb \(rdStr), \(rnStr)" }
                 if !is64 && immr == 0 && imms == 15 { return "uxth \(rdStr), \(rnStr)" }
                 if imms == width - 1 { return "lsr \(rdStr), \(rnStr), #\(immr)" }
                 if imms + 1 == immr { return "lsl \(rdStr), \(rnStr), #\(width - immr)" }
                 if imms >= immr { return "ubfx \(rdStr), \(rnStr), #\(immr), #\(imms - immr + 1)" }
+                return "ubfiz \(rdStr), \(rnStr), #\(insertLsb), #\(imms + 1)"
             } else if instr.opcode == .sbfm {
                 if immr == 0 && imms == 7 { return "sxtb \(rdStr), \(instr.rn.format(is64Bit: false))" }
                 if immr == 0 && imms == 15 { return "sxth \(rdStr), \(instr.rn.format(is64Bit: false))" }
                 if is64 && immr == 0 && imms == 31 { return "sxtw \(rdStr), \(instr.rn.format(is64Bit: false))" }
                 if imms == width - 1 { return "asr \(rdStr), \(rnStr), #\(immr)" }
                 if imms >= immr { return "sbfx \(rdStr), \(rnStr), #\(immr), #\(imms - immr + 1)" }
-            } else if instr.opcode == .bfm {
-                if imms >= immr {
-                    return "bfxil \(rdStr), \(rnStr), #\(immr), #\(imms - immr + 1)"
-                } else {
-                    let lsb = (width - immr) % width
-                    return "bfi \(rdStr), \(rnStr), #\(lsb), #\(imms + 1)"
-                }
+                return "sbfiz \(rdStr), \(rnStr), #\(insertLsb), #\(imms + 1)"
             }
-            return "\(desc.mnemonic) \(rdStr), \(rnStr), #\(immr), #\(imms)"
+            if imms >= immr {
+                return "bfxil \(rdStr), \(rnStr), #\(immr), #\(imms - immr + 1)"
+            }
+            if instr.rn.rawValue == 31 {
+                return "bfc \(rdStr), #\(insertLsb), #\(imms + 1)"
+            }
+            return "bfi \(rdStr), \(rnStr), #\(insertLsb), #\(imms + 1)"
 
         case .extract:
             let rdStr = instr.rd.format(is64Bit: is64)
@@ -2735,7 +3436,18 @@ public enum A64Disassembler {
             let rmIs64 = is64 && instr.extendKind.uses64BitRegister
             let rmStr = instr.rm.format(is64Bit: rmIs64)
             let amtSuffix = (instr.amount != 0) ? " #\(instr.amount)" : ""
-            return "\(desc.mnemonic) \(rdStr), \(rnStr), \(rmStr), \(instr.extendKind.mnemonic)\(amtSuffix)"
+            // With SP as an operand, the register-width extend (`uxtx`/`uxtw`) is written `lsl` (or omitted).
+            let spInvolved = instr.rn.rawValue == 31 || (rdUseSP && instr.rd.rawValue == 31)
+            let extStr: String
+            if spInvolved && instr.extendKind == (is64 ? .uxtx : .uxtw) {
+                extStr = instr.amount != 0 ? ", lsl #\(instr.amount)" : ""
+            } else {
+                extStr = ", \(instr.extendKind.mnemonic)\(amtSuffix)"
+            }
+            if (instr.opcode == .subsExtended || instr.opcode == .addsExtended) && instr.rd.rawValue == 31 {
+                return "\(instr.opcode == .subsExtended ? "cmp" : "cmn") \(rnStr), \(rmStr)\(extStr)"
+            }
+            return "\(desc.mnemonic) \(rdStr), \(rnStr), \(rmStr)\(extStr)"
 
         case .logicalShifted:
             let shiftSuffix = (instr.shiftKind != .lsl || instr.amount != 0) ? ", \(instr.shiftKind.mnemonic) #\(instr.amount)" : ""
@@ -2763,8 +3475,8 @@ public enum A64Disassembler {
             let rdStr = instr.rd.format(is64Bit: is64)
             let rnStr = instr.rn.format(is64Bit: is64)
             let rmStr = instr.rm.format(is64Bit: is64)
-            if instr.opcode == .madd && instr.ra.rawValue == 31 {
-                return "mul \(rdStr), \(rnStr), \(rmStr)"
+            if instr.ra.rawValue == 31 {
+                return "\(instr.opcode == .madd ? "mul" : "mneg") \(rdStr), \(rnStr), \(rmStr)"
             }
             return "\(desc.mnemonic) \(rdStr), \(rnStr), \(rmStr), \(instr.ra.format(is64Bit: is64))"
 
@@ -2780,6 +3492,10 @@ public enum A64Disassembler {
             }
             if instr.opcode == .csinv && instr.rn.rawValue == 31 && instr.rm.rawValue == 31 && instr.cond != .al && instr.cond != .nv {
                 return "csetm \(rdStr), \(instr.cond.inverted.mnemonic)"
+            }
+            if instr.opcode != .csel && instr.rn == instr.rm && instr.rn.rawValue != 31 && instr.cond != .al && instr.cond != .nv {
+                let alias = instr.opcode == .csinc ? "cinc" : (instr.opcode == .csinv ? "cinv" : "cneg")
+                return "\(alias) \(rdStr), \(rnStr), \(instr.cond.inverted.mnemonic)"
             }
             return "\(desc.mnemonic) \(rdStr), \(rnStr), \(rmStr), \(instr.cond.mnemonic)"
 
@@ -2808,16 +3524,28 @@ public enum A64Disassembler {
             }
             return "\(desc.mnemonic) \(instr.rn.format(is64Bit: true))"
 
-        case .exceptionImm16, .udfImm16, .hintImm7:
-            return "\(desc.mnemonic) #\(instr.imm)"
+        case .hintImm7:
+            if let alias = A64HintAlias.names[instr.imm] { return alias }
+            return "hint #\(instr.imm)"
+
+        case .exceptionImm16:
+            return "\(desc.mnemonic) #\(instr.imm == 0 ? "0" : "0x" + String(instr.imm, radix: 16))"
+
+        case .udfImm16:
+            return "udf #\(instr.imm)"
 
         case .fixedSystem:
             return desc.mnemonic
 
         case .barrier:
+            let crm = instr.barrierOption.rawValue
             switch instr.opcode {
             case .clrex, .isb:
-                return desc.mnemonic
+                return crm == 15 ? desc.mnemonic : "\(desc.mnemonic) #\(crm)"
+            case .dsb where crm == 0:
+                return "ssbb"
+            case .dsb where crm == 4:
+                return "pssbb"
             default:
                 return "\(desc.mnemonic) \(instr.barrierOption.mnemonic)"
             }
@@ -2833,12 +3561,7 @@ public enum A64Disassembler {
 
         case .sysMaint:
             let op = instr.sysMaintOp
-            let mnem: String
-            switch op.kind {
-            case .tlbi: mnem = "tlbi"
-            case .ic:   mnem = "ic"
-            case .dc:   mnem = "dc"
-            }
+            let mnem = op.kind.mnemonic
             if op.takesRegister {
                 return "\(mnem) \(op.operandName), \(instr.rd.format(is64Bit: true))"
             } else {
@@ -2869,38 +3592,15 @@ public enum A64Disassembler {
         case .ldstRegOffset:
             let baseStr = instr.rn.format(is64Bit: true, r31IsSP: true)
             let rmStr = instr.rm.format(is64Bit: instr.extendKind.uses64BitRegister)
-            let extSuffix: String
-            if instr.extendKind == .uxtx {
-                extSuffix = (instr.amount != 0) ? ", lsl #\(instr.amount)" : ""
-            } else {
-                let amtStr = (instr.amount != 0) ? " #\(instr.amount)" : ""
-                extSuffix = ", \(instr.extendKind.mnemonic)\(amtStr)"
-            }
+            let extSuffix = registerOffsetSuffix(instr)
             return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64)), [\(baseStr), \(rmStr)\(extSuffix)]"
 
         case .ldrLiteral:
-            return "ldr \(instr.rd.format(is64Bit: is64)), #\(instr.imm)"
+            return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64)), #\(instr.imm)"
 
         case .ldpStpSigned, .ldpStpPre, .ldpStpPost:
-            let baseStr = instr.rn.format(is64Bit: true, r31IsSP: true)
-            let r1: String
-            let r2: String
-            if desc.scalarWidth == .q {
-                r1 = instr.vd.formatScalar(.q)
-                r2 = instr.vn.formatScalar(.q)
-            } else {
-                r1 = instr.rd.format(is64Bit: is64)
-                r2 = instr.rm.format(is64Bit: is64)
-            }
-            switch desc.format {
-            case .ldpStpSigned:
-                let offStr = (instr.imm != 0) ? ", #\(instr.imm)" : ""
-                return "\(desc.mnemonic) \(r1), \(r2), [\(baseStr)\(offStr)]"
-            case .ldpStpPre:
-                return "\(desc.mnemonic) \(r1), \(r2), [\(baseStr), #\(instr.imm)]!"
-            default:
-                return "\(desc.mnemonic) \(r1), \(r2), [\(baseStr)], #\(instr.imm)"
-            }
+            let regs = "\(instr.rd.format(is64Bit: is64)), \(instr.rm.format(is64Bit: is64))"
+            return "\(desc.mnemonic) \(regs), \(memOperand(instr, format: desc.format))"
 
         case .atomicLoad, .atomicStore:
             return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64)), [\(instr.rn.format(is64Bit: true, r31IsSP: true))]"
@@ -2908,85 +3608,199 @@ public enum A64Disassembler {
         case .atomicStoreExcl:
             return "\(desc.mnemonic) \(instr.rm.format(is64Bit: false)), \(instr.rd.format(is64Bit: is64)), [\(instr.rn.format(is64Bit: true, r31IsSP: true))]"
 
+        case .atomicLoadPair:
+            return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64)), \(instr.ra.format(is64Bit: is64)), [\(instr.rn.format(is64Bit: true, r31IsSP: true))]"
+
+        case .atomicStoreExclPair:
+            return "\(desc.mnemonic) \(instr.rm.format(is64Bit: false)), \(instr.rd.format(is64Bit: is64)), \(instr.ra.format(is64Bit: is64)), [\(instr.rn.format(is64Bit: true, r31IsSP: true))]"
+
+        case .lseAtomic, .lseCas:
+            let w = instr.scalarWidth
+            let sizeSuffix = w == .b ? "b" : (w == .h ? "h" : "")
+            let rs = instr.rm.format(is64Bit: w == .d)
+            let mem = "[\(instr.rn.format(is64Bit: true, r31IsSP: true))]"
+            // `ld<op>[l]` discarding its result (Rt = zr, no acquire) is the store alias `st<op>[l]`.
+            if desc.format == .lseAtomic && instr.opcode != .swp && instr.rd.rawValue == 31 && !instr.acquire {
+                return "st\(desc.mnemonic.dropFirst(2))\(instr.release ? "l" : "")\(sizeSuffix) \(rs), \(mem)"
+            }
+            let order = (instr.acquire ? "a" : "") + (instr.release ? "l" : "")
+            return "\(desc.mnemonic)\(order)\(sizeSuffix) \(rs), \(instr.rd.format(is64Bit: w == .d)), \(mem)"
+
+        case .lseCasp:
+            let is64Reg = instr.is64Bit
+            let order = (instr.acquire ? "a" : "") + (instr.release ? "l" : "")
+            let rs1 = A64GPR(rawValue: instr.rm.rawValue + 1), rt1 = A64GPR(rawValue: instr.rd.rawValue + 1)
+            let regs = [instr.rm, rs1, instr.rd, rt1].map { $0.format(is64Bit: is64Reg) }.joined(separator: ", ")
+            return "casp\(order) \(regs), [\(instr.rn.format(is64Bit: true, r31IsSP: true))]"
+
+        case .fpLdstPreImm9, .fpLdstPostImm9, .fpLdstUnscaledImm9:
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(instr.scalarWidth)), \(memOperand(instr, format: desc.format))"
+
+        case .fpLdstRegOffset:
+            let baseStr = instr.rn.format(is64Bit: true, r31IsSP: true)
+            let rmStr = instr.rm.format(is64Bit: instr.extendKind.uses64BitRegister)
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(instr.scalarWidth)), [\(baseStr), \(rmStr)\(registerOffsetSuffix(instr))]"
+
+        case .fpLdrLiteral:
+            return "ldr \(instr.vd.formatScalar(instr.scalarWidth)), #\(instr.imm)"
+
+        case .fpLdpStpSigned, .fpLdpStpPre, .fpLdpStpPost:
+            let w = instr.scalarWidth
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(w)), \(instr.vn.formatScalar(w)), \(memOperand(instr, format: desc.format))"
+
         case .fpMovGprToFp:
-            let sw = instr.scalarWidth
-            return "fmov \(instr.vd.formatScalar(sw)), \(instr.rn.format(is64Bit: sw == .d))"
+            return "fmov \(instr.vd.formatScalar(instr.scalarWidth)), \(instr.rn.format(is64Bit: is64))"
 
         case .fpMovFpToGpr:
-            let sw = instr.scalarWidth
-            return "fmov \(instr.rd.format(is64Bit: sw == .d)), \(instr.vn.formatScalar(sw))"
+            return "fmov \(instr.rd.format(is64Bit: is64)), \(instr.vn.formatScalar(instr.scalarWidth))"
 
-        case .fpMovReg:
-            let sw = instr.scalarWidth
-            return "fmov \(instr.vd.formatScalar(sw)), \(instr.vn.formatScalar(sw))"
+        case .fpDp1:
+            let w = instr.scalarWidth
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(w)), \(instr.vn.formatScalar(w))"
 
-        case .fpCvtReg:
-            if instr.opcode == .fcvtStoD {
-                return "fcvt \(instr.vd.formatScalar(.d)), \(instr.vn.formatScalar(.s))"
-            } else {
-                return "fcvt \(instr.vd.formatScalar(.s)), \(instr.vn.formatScalar(.d))"
-            }
+        case .fpCvtPrecision:
+            return "fcvt \(instr.vd.formatScalar(instr.scalarWidth)), \(instr.vn.formatScalar(instr.scalarWidth2))"
 
         case .fpIntToFp:
-            return "scvtf \(instr.vd.formatScalar(instr.scalarWidth)), \(instr.rn.format(is64Bit: is64))"
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(instr.scalarWidth)), \(instr.rn.format(is64Bit: is64))"
 
         case .fpToInt:
-            return "fcvtzs \(instr.rd.format(is64Bit: is64)), \(instr.vn.formatScalar(instr.scalarWidth))"
+            return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64)), \(instr.vn.formatScalar(instr.scalarWidth))"
+
+        case .fpFixedToFp:
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(instr.scalarWidth)), \(instr.rn.format(is64Bit: is64)), #\(instr.imm)"
+
+        case .fpToFixed:
+            return "\(desc.mnemonic) \(instr.rd.format(is64Bit: is64)), \(instr.vn.formatScalar(instr.scalarWidth)), #\(instr.imm)"
 
         case .fpBinary:
-            let sw = instr.scalarWidth
-            return "\(desc.mnemonic) \(instr.vd.formatScalar(sw)), \(instr.vn.formatScalar(sw)), \(instr.vm.formatScalar(sw))"
+            let w = instr.scalarWidth
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(w)), \(instr.vn.formatScalar(w)), \(instr.vm.formatScalar(w))"
+
+        case .fpDp3:
+            let w = instr.scalarWidth
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(w)), \(instr.vn.formatScalar(w)), \(instr.vm.formatScalar(w)), \(instr.va.formatScalar(w))"
 
         case .fpCmpReg:
-            let sw = instr.scalarWidth
-            return "fcmp \(instr.vn.formatScalar(sw)), \(instr.vm.formatScalar(sw))"
+            let w = instr.scalarWidth
+            return "\(desc.mnemonic) \(instr.vn.formatScalar(w)), \(instr.vm.formatScalar(w))"
 
         case .fpCmpZero:
-            let sw = instr.scalarWidth
-            return "fcmp \(instr.vn.formatScalar(sw)), #0.0"
+            return "\(desc.mnemonic) \(instr.vn.formatScalar(instr.scalarWidth)), #0.0"
+
+        case .fpCondCompare:
+            let w = instr.scalarWidth
+            return "\(desc.mnemonic) \(instr.vn.formatScalar(w)), \(instr.vm.formatScalar(w)), #\(instr.imm2), \(instr.cond.mnemonic)"
+
+        case .fpCondSelect:
+            let w = instr.scalarWidth
+            return "fcsel \(instr.vd.formatScalar(w)), \(instr.vn.formatScalar(w)), \(instr.vm.formatScalar(w)), \(instr.cond.mnemonic)"
+
+        case .fpImm:
+            return "fmov \(instr.vd.formatScalar(instr.scalarWidth)), #\(A64FPImmediate.format(UInt8(truncatingIfNeeded: instr.imm)))"
 
         case .simdThreeSameInt, .simdThreeSameBit, .simdThreeSameFp, .simdPermute:
             let arr = instr.arrangement
+            if instr.opcode == .simdOrr && instr.vn == instr.vm {
+                return "mov \(instr.vd.formatVector(arr)), \(instr.vn.formatVector(arr))"
+            }
             return "\(desc.mnemonic) \(instr.vd.formatVector(arr)), \(instr.vn.formatVector(arr)), \(instr.vm.formatVector(arr))"
 
-        case .simdTwoRegMisc:
+        case .simdTwoRegMisc, .simdTwoRegMiscFp:
             let arr = instr.arrangement
-            return "\(desc.mnemonic) \(instr.vd.formatVector(arr)), \(instr.vn.formatVector(arr))"
+            let mnem = instr.opcode == .simdNot ? "mvn" : desc.mnemonic
+            return "\(mnem) \(instr.vd.formatVector(arr)), \(instr.vn.formatVector(arr))"
+
+        case .simdCmpZero:
+            let arr = instr.arrangement
+            return "\(desc.mnemonic) \(instr.vd.formatVector(arr)), \(instr.vn.formatVector(arr)), #0"
+
+        case .simdAcrossLanes:
+            return "\(desc.mnemonic) \(instr.vd.formatScalar(instr.arrangement.elementWidth)), \(instr.vn.formatVector(instr.arrangement))"
+
+        case .simdNarrow, .simdShiftNarrow:
+            let arr = instr.arrangement
+            let wide = arr.widened ?? arr
+            let shift = desc.format == .simdShiftNarrow ? ", #\(instr.amount)" : ""
+            return "\(desc.mnemonic)\(arr.qBit == 1 ? "2" : "") \(instr.vd.formatVector(arr)), \(instr.vn.formatVector(wide))\(shift)"
+
+        case .simdShiftLong:
+            let arr = instr.arrangement
+            let wide = arr.widened ?? arr
+            return "\(desc.mnemonic)\(arr.qBit == 1 ? "2" : "") \(instr.vd.formatVector(wide)), \(instr.vn.formatVector(arr)), #\(instr.amount)"
 
         case .simdShiftImm:
             let arr = instr.arrangement
             return "\(desc.mnemonic) \(instr.vd.formatVector(arr)), \(instr.vn.formatVector(arr)), #\(instr.amount)"
 
+        case .simdDupElem:
+            let arr = instr.arrangement
+            return "dup \(instr.vd.formatVector(arr)), \(element(instr.vn, arr.elementWidth, instr.index))"
+
         case .simdDupGpr:
             let arr = instr.arrangement
-            let use64 = (arr == .d1 || arr == .d2)
-            return "dup \(instr.vd.formatVector(arr)), \(instr.rn.format(is64Bit: use64))"
+            return "dup \(instr.vd.formatVector(arr)), \(instr.rn.format(is64Bit: arr.elementWidth == .d))"
+
+        case .simdDupScalar:
+            let w = instr.scalarWidth
+            return "mov \(instr.vd.formatScalar(w)), \(element(instr.vn, w, instr.index))"
 
         case .simdInsGpr:
-            let sw = instr.scalarWidth
-            return "ins v\(instr.vd.rawValue).\(sw.prefix)[\(instr.index)], \(instr.rn.format(is64Bit: sw == .d))"
+            let w = instr.scalarWidth
+            return "mov \(element(instr.vd, w, instr.index)), \(instr.rn.format(is64Bit: w == .d))"
+
+        case .simdInsElem:
+            let w = instr.scalarWidth
+            return "mov \(element(instr.vd, w, instr.index)), \(element(instr.vn, w, instr.imm2))"
 
         case .simdUmovSmov:
-            let sw = instr.scalarWidth
-            let use64 = (instr.opcode == .simdSmov) ? is64 : (sw == .d)
-            return "\(desc.mnemonic) \(instr.rd.format(is64Bit: use64)), v\(instr.vn.rawValue).\(sw.prefix)[\(instr.index)]"
+            let w = instr.scalarWidth
+            // `umov` from a 32/64-bit lane is printed as `mov`.
+            let mnem = instr.opcode == .simdUmov && (w == .s || w == .d) ? "mov" : desc.mnemonic
+            return "\(mnem) \(instr.rd.format(is64Bit: is64)), \(element(instr.vn, w, instr.index))"
 
-        case .simdLd1St1One:
-            return "\(desc.mnemonic) {\(instr.vd.formatVector(instr.arrangement))}, [\(instr.rn.format(is64Bit: true, r31IsSP: true))]"
-
-        case .simdTblOne:
+        case .simdModImm:
             let arr = instr.arrangement
-            return "tbl \(instr.vd.formatVector(arr)), {\(instr.vn.formatVector(.b16))}, \(instr.vm.formatVector(arr))"
+            let dest = arr == .d1 ? instr.vd.formatScalar(.d) : instr.vd.formatVector(arr)
+            if instr.opcode == .simdFmovImm {
+                return "fmov \(dest), #\(A64FPImmediate.format(UInt8(truncatingIfNeeded: instr.imm)))"
+            }
+            if arr.elementWidth == .d {
+                // LLVM prints the byte mask with C's `%#016llx`: zero-padded to 16 characters, and zero without `0x`.
+                let value = UInt64(bitPattern: instr.imm)
+                let digits = String(value, radix: 16)
+                let mask = value == 0 ? String(repeating: "0", count: 16)
+                                      : "0x" + String(repeating: "0", count: max(0, 14 - digits.count)) + digits
+                return "movi \(dest), #\(mask)"
+            }
+            let shift = (instr.amount != 0 || instr.shiftKind == .msl) ? ", \(instr.shiftKind.mnemonic) #\(instr.amount)" : ""
+            return "\(desc.mnemonic) \(dest), #\(instr.imm)\(shift)"
+
+        case .simdLdStMulti, .simdLdStMultiPost:
+            let list = registerList(instr.vd, count: Int(instr.imm2), arrangement: instr.arrangement)
+            return "\(desc.mnemonic) \(list), \(structureMemOperand(instr, isPost: desc.format == .simdLdStMultiPost))"
+
+        case .simdLd1R, .simdLd1RPost:
+            let list = registerList(instr.vd, count: 1, arrangement: instr.arrangement)
+            return "ld1r \(list), \(structureMemOperand(instr, isPost: desc.format == .simdLd1RPost))"
+
+        case .simdLdStLane, .simdLdStLanePost:
+            let lane = "{ v\(instr.vd.rawValue).\(instr.scalarWidth.prefix) }[\(instr.index)]"
+            return "\(desc.mnemonic) \(lane), \(structureMemOperand(instr, isPost: desc.format == .simdLdStLanePost))"
+
+        case .simdTbl:
+            let arr = instr.arrangement
+            let list = registerList(instr.vn, count: Int(instr.imm2), arrangement: .b16)
+            return "\(desc.mnemonic) \(instr.vd.formatVector(arr)), \(list), \(instr.vm.formatVector(arr))"
 
         case .simdExt:
             let arr = instr.arrangement
             return "ext \(instr.vd.formatVector(arr)), \(instr.vn.formatVector(arr)), \(instr.vm.formatVector(arr)), #\(instr.amount)"
 
-        case .sveLdrStrZ:
-            return "\(desc.mnemonic) \(instr.zd.formatted), [\(instr.rn.format(is64Bit: true, r31IsSP: true)), #\(instr.imm), mul vl]"
-
-        case .sveLdrStrP:
-            return "\(desc.mnemonic) \(instr.pd.formatted), [\(instr.rn.format(is64Bit: true, r31IsSP: true)), #\(instr.imm), mul vl]"
+        case .sveLdrStrZ, .sveLdrStrP:
+            let reg = desc.format == .sveLdrStrZ ? instr.zd.formatted : instr.pd.formatted
+            let base = instr.rn.format(is64Bit: true, r31IsSP: true)
+            return "\(desc.mnemonic) \(reg), [\(base)\(instr.imm != 0 ? ", #\(instr.imm), mul vl" : "")]"
 
         case .sveAddVlPl:
             return "\(desc.mnemonic) \(instr.rd.format(is64Bit: true, r31IsSP: true)), \(instr.rn.format(is64Bit: true, r31IsSP: true)), #\(instr.imm)"
@@ -2996,6 +3810,153 @@ public enum A64Disassembler {
         }
     }
 
+    // MARK: Formatting and decoding helpers
+
+    /// The value `movz`/`movn` writes when it is printed as `mov Rd, #value` (Arm's preferred disassembly,
+    /// as LLVM implements it), or nil when the raw `movz`/`movn` form is preferred.
+    static func movAliasValue(_ instr: A64Instruction) -> Int64? {
+        let is64 = instr.is64Bit
+        let imm16 = UInt64(instr.imm & 0xFFFF)
+        let shift = UInt64(instr.amount)
+        // A zero immediate is `mov` only without a shift (`movz x0, #0, lsl #16` keeps its form).
+        if imm16 == 0 && shift != 0 { return nil }
+        let mask: UInt64 = is64 ? .max : 0xFFFF_FFFF
+        var value = (imm16 << shift) & mask
+        if instr.opcode == .movn {
+            value = ~value & mask
+            // `movz` takes precedence, so a value it can produce stays `movn` to keep this encoding.
+            if isMovzValue(value, is64Bit: is64) { return nil }
+        }
+        return is64 ? Int64(bitPattern: value) : Int64(Int32(truncatingIfNeeded: value))
+    }
+
+    /// True if `movz` can produce `value` (one 16-bit chunk at a 16-bit-aligned shift).
+    static func isMovzValue(_ value: UInt64, is64Bit: Bool) -> Bool {
+        for shift in stride(from: UInt64(0), to: is64Bit ? 64 : 32, by: 16) where value & ~(UInt64(0xFFFF) << shift) == 0 {
+            return true
+        }
+        return false
+    }
+
+    /// True if `movz` or `movn` can produce `value`, which then takes precedence over `orr Rd, zr, #imm`.
+    static func isMovWideValue(_ value: UInt64, is64Bit: Bool) -> Bool {
+        let mask: UInt64 = is64Bit ? .max : 0xFFFF_FFFF
+        return isMovzValue(value & mask, is64Bit: is64Bit) || isMovzValue(~value & mask, is64Bit: is64Bit)
+    }
+
+    /// `, <extend> {#amount}` of a register-offset load/store; `uxtx` is written `lsl`. The amount is shown
+    /// when `S` is set, including a byte access's explicit `#0` (carried in `imm2`).
+    static func registerOffsetSuffix(_ instr: A64Instruction) -> String {
+        let shown = instr.amount != 0 || instr.imm2 != 0
+        if instr.extendKind == .uxtx {
+            return shown ? ", lsl #\(instr.amount)" : ""
+        }
+        return ", \(instr.extendKind.mnemonic)" + (shown ? " #\(instr.amount)" : "")
+    }
+
+    /// `[Xn{, #imm}]`, `[Xn, #imm]!`, or `[Xn], #imm` for an immediate-offset load/store format.
+    static func memOperand(_ instr: A64Instruction, format: A64InstrFormat) -> String {
+        let base = instr.rn.format(is64Bit: true, r31IsSP: true)
+        switch format {
+        case .ldpStpPre, .fpLdpStpPre, .fpLdstPreImm9:
+            return "[\(base), #\(instr.imm)]!"
+        case .ldpStpPost, .fpLdpStpPost, .fpLdstPostImm9:
+            return "[\(base)], #\(instr.imm)"
+        default:
+            return instr.imm != 0 ? "[\(base), #\(instr.imm)]" : "[\(base)]"
+        }
+    }
+
+    /// `[Xn]`, or for post-indexed structure accesses `[Xn], #imm` / `[Xn], Xm`.
+    static func structureMemOperand(_ instr: A64Instruction, isPost: Bool) -> String {
+        let base = "[\(instr.rn.format(is64Bit: true, r31IsSP: true))]"
+        guard isPost else { return base }
+        return instr.rm.rawValue == 31 ? "\(base), #\(instr.imm)" : "\(base), \(instr.rm.format(is64Bit: true))"
+    }
+
+    static func element(_ reg: A64VReg, _ width: A64ScalarWidth, _ index: UInt8) -> String {
+        "v\(reg.rawValue).\(width.prefix)[\(index)]"
+    }
+
+    /// `{ v0.16b, v1.16b }`: `count` consecutive registers (wrapping from `v31` to `v0`).
+    static func registerList(_ first: A64VReg, count: Int, arrangement: A64Arrangement) -> String {
+        let regs = (0..<count).map { A64VReg(rawValue: (first.rawValue &+ UInt8($0)) & 31).formatVector(arrangement) }
+        return "{ \(regs.joined(separator: ", ")) }"
+    }
+
+    /// Register width of a SIMD/FP load/store from `size` (bits 31:30) and `opc<1>` (bit 23).
+    static func fpLdstWidth(_ word: UInt32) -> A64ScalarWidth? {
+        let size = UInt8(word >> 30)
+        if (word >> 23) & 1 == 1 { return size == 0 ? .q : nil }
+        return A64ScalarWidth(rawValue: size)
+    }
+
+    /// Register width of a SIMD/FP literal load or register pair from `opc` (bits 31:30).
+    static func fpPairWidth(_ word: UInt32) -> A64ScalarWidth? {
+        switch word >> 30 {
+        case 0:  return .s
+        case 1:  return .d
+        case 2:  return .q
+        default: return nil
+        }
+    }
+
+    /// Element width and lane from the `imm5` field (bits 20:16) of the Advanced SIMD copy class.
+    static func copyElement(_ word: UInt32) -> (A64ScalarWidth, UInt8)? {
+        let imm5 = (word >> 16) & 0x1F
+        guard imm5 & 0xF != 0 else { return nil }
+        let log2 = UInt32(imm5.trailingZeroBitCount)
+        return (A64ScalarWidth(rawValue: UInt8(log2))!, UInt8(imm5 >> (log2 + 1)))
+    }
+
+    /// Decodes the Advanced SIMD modified-immediate class for one of its five descriptors, or nil if
+    /// `op:cmode` belongs to another one.
+    static func decodeModImm(word: UInt32, desc: A64InstrDesc) -> A64Instruction? {
+        let q = (word >> 30) & 1 == 1
+        let op = (word >> 29) & 1
+        let cmode = (word >> 12) & 0xF
+        let imm8 = ((word >> 16) & 0x7) << 5 | ((word >> 5) & 0x1F)
+        var inst = A64Instruction(opcode: desc.id, vd: A64VReg(rawValue: UInt8(word & 0x1F)), imm: Int64(imm8))
+        let isOrrBic = cmode & 1 == 1 && cmode < 0b1100
+        switch desc.id {
+        case .simdFmovImm:
+            guard cmode == 0b1111, op == 0 || q else { return nil }
+            inst.arrangement = op == 1 ? .d2 : (q ? .s4 : .s2)
+            return inst
+        case .simdMovi:
+            if cmode == 0b1110 {
+                if op == 1 {
+                    inst.arrangement = q ? .d2 : .d1
+                    inst.imm = Int64(bitPattern: A64SIMDByteMask.decode(UInt8(imm8)))
+                } else {
+                    inst.arrangement = q ? .b16 : .b8
+                }
+                return inst
+            }
+            guard op == 0, !isOrrBic, cmode != 0b1111 else { return nil }
+        case .simdMvni:
+            guard op == 1, !isOrrBic, cmode < 0b1110 else { return nil }
+        case .simdOrrImm:
+            guard op == 0, isOrrBic else { return nil }
+        case .simdBicImm:
+            guard op == 1, isOrrBic else { return nil }
+        default:
+            return nil
+        }
+        if cmode & 0b1000 == 0 {
+            inst.arrangement = q ? .s4 : .s2
+            inst.amount = UInt8((cmode >> 1) & 3) * 8
+        } else if cmode & 0b0100 == 0 {
+            inst.arrangement = q ? .h8 : .h4
+            inst.amount = UInt8((cmode >> 1) & 1) * 8
+        } else {
+            inst.arrangement = q ? .s4 : .s2
+            inst.shiftKind = .msl
+            inst.amount = cmode & 1 == 1 ? 16 : 8
+        }
+        return inst
+    }
+
     /// Disassembles a 32-bit machine word directly into canonical assembly text.
     public static func disassemble(_ word: UInt32) -> String? {
         guard let decoded = decode(word) else { return nil }
@@ -3003,11 +3964,14 @@ public enum A64Disassembler {
     }
 }
 
-// MARK: - 6. Exhaustive Table Verification (`A64InstructionTable.verifyRoundTrip`)
+// MARK: - 6. Table Verification (`A64InstructionTable.verifyRoundTrip`)
 
 extension A64InstructionTable {
-    /// Constructs a representative `A64Instruction` for a given `A64InstrDesc`.
+    /// Constructs a representative `A64Instruction` for a given `A64InstrDesc`. (The exhaustive operand
+    /// sweep over every descriptor lives in `M2AArch64ExhaustiveTests`.)
     public static func sampleInstruction(for desc: A64InstrDesc) -> A64Instruction {
+        let width: A64ScalarWidth = desc.allows(.d) ? .d : (desc.allows(.s) ? .s : .b)
+        let arr: A64Arrangement = desc.allows(.s4) ? .s4 : (desc.allows(.b16) ? .b16 : .d2)
         switch desc.format {
         case .addSubImm:
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, amount: 0, imm: 42)
@@ -3027,14 +3991,12 @@ extension A64InstructionTable {
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .sp, rm: .x1, extendKind: .uxtw, amount: 2)
         case .logicalShifted:
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, rm: .x2, shiftKind: .lsr, amount: 4)
-        case .dp2Source:
+        case .dp2Source, .mulHigh:
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, rm: .x2)
         case .dp1Source:
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1)
         case .dp3Source:
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, rm: .x2, ra: .x3)
-        case .mulHigh:
-            return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, rm: .x2)
         case .condSelect:
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, rm: .x2, cond: .eq)
         case .condCompareReg:
@@ -3051,12 +4013,10 @@ extension A64InstructionTable {
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, amount: 37, imm: 64)
         case .branchReg:
             return A64Instruction(opcode: desc.id, is64Bit: true, rn: desc.id == .ret ? .lr : .x1)
-        case .exceptionImm16, .udfImm16:
-            return A64Instruction(opcode: desc.id, is64Bit: true, imm: 7)
+        case .exceptionImm16, .udfImm16, .hintImm7:
+            return A64Instruction(opcode: desc.id, is64Bit: true, imm: 9)
         case .fixedSystem:
             return A64Instruction(opcode: desc.id, is64Bit: true)
-        case .hintImm7:
-            return A64Instruction(opcode: desc.id, is64Bit: true, imm: 7)
         case .barrier:
             return A64Instruction(opcode: desc.id, is64Bit: true, barrierOption: .sy)
         case .mrs, .msrReg:
@@ -3071,97 +4031,81 @@ extension A64InstructionTable {
                 let off = Int64(1) << Int64(desc.scaleLog2)
                 return A64Instruction(opcode: desc.id, is64Bit: true, rn: .x1, vd: .v0, scalarWidth: sw, imm: off)
             }
-            let is64: Bool
-            let shift: UInt8
-            if desc.scaleLog2 == 255 {
-                is64 = true; shift = 3
-            } else {
-                switch desc.id {
-                case .ldrsbImm64, .ldrshImm64, .ldrswImm: is64 = true
-                default: is64 = false
-                }
-                shift = desc.scaleLog2
-            }
+            let is64 = sampleIs64(desc)
+            let shift: UInt8 = desc.scaleLog2 == 255 ? 3 : desc.scaleLog2
             return A64Instruction(opcode: desc.id, is64Bit: is64, rd: .x0, rn: .x1, imm: Int64(2) << Int64(shift))
         case .ldstPreImm9, .ldstPostImm9, .ldstUnscaledImm9, .ldstUnprivImm9:
-            let is64: Bool
-            switch desc.id {
-            case .ldrPre, .strPre, .ldrPost, .strPost, .ldur, .stur, .ldtr, .sttr,
-                 .ldrsbPre64, .ldrshPre64, .ldrswPre,
-                 .ldrsbPost64, .ldrshPost64, .ldrswPost,
-                 .ldursb64, .ldursh64, .ldursw,
-                 .ldtrsb64, .ldtrsh64, .ldtrsw:
-                is64 = true
-            default:
-                is64 = false
-            }
-            return A64Instruction(opcode: desc.id, is64Bit: is64, rd: .x0, rn: .x1, imm: -8)
+            return A64Instruction(opcode: desc.id, is64Bit: sampleIs64(desc), rd: .x0, rn: .x1, imm: -8)
         case .ldstRegOffset:
-            let is64: Bool
-            let naturalShift: UInt8
-            if desc.scaleLog2 == 255 {
-                is64 = true; naturalShift = 3
-            } else {
-                switch desc.id {
-                case .ldrsbReg64, .ldrshReg64, .ldrswReg: is64 = true
-                default: is64 = false
-                }
-                naturalShift = desc.scaleLog2
-            }
-            return A64Instruction(opcode: desc.id, is64Bit: is64, rd: .x0, rn: .x1, rm: .x2, extendKind: .uxtx, amount: naturalShift)
+            let naturalShift: UInt8 = desc.scaleLog2 == 255 ? 3 : desc.scaleLog2
+            return A64Instruction(opcode: desc.id, is64Bit: sampleIs64(desc), rd: .x0, rn: .x1, rm: .x2, extendKind: .uxtx, amount: naturalShift)
         case .ldrLiteral:
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, imm: 64)
         case .ldpStpSigned, .ldpStpPre, .ldpStpPost:
-            if desc.scalarWidth == .q {
-                return A64Instruction(opcode: desc.id, is64Bit: true, rn: .sp, vd: .v0, vn: .v1, scalarWidth: .q, imm: 32)
-            }
             return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .sp, rm: .x1, imm: 16)
-        case .atomicLoad, .atomicStore:
-            let is64: Bool
-            switch desc.id {
-            case .ldarb, .stlrb, .ldarh, .stlrh: is64 = false
-            default: is64 = true
-            }
-            return A64Instruction(opcode: desc.id, is64Bit: is64, rd: .x0, rn: .x1)
-        case .atomicStoreExcl:
-            return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, rm: .x2)
-        case .fpMovGprToFp:
-            return A64Instruction(opcode: desc.id, is64Bit: true, rn: .x1, vd: .v0, scalarWidth: .d)
-        case .fpMovFpToGpr:
-            return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, vn: .v1, scalarWidth: .d)
-        case .fpMovReg:
-            return A64Instruction(opcode: desc.id, is64Bit: true, vd: .v0, vn: .v1, scalarWidth: .d)
-        case .fpCvtReg:
-            let sw: A64ScalarWidth = (desc.id == .fcvtStoD) ? .d : .s
-            return A64Instruction(opcode: desc.id, is64Bit: sw == .d, vd: .v0, vn: .v1, scalarWidth: sw)
-        case .fpIntToFp:
-            return A64Instruction(opcode: desc.id, is64Bit: true, rn: .x1, vd: .v0, scalarWidth: .d)
-        case .fpToInt:
-            return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, vn: .v1, scalarWidth: .d)
-        case .fpBinary:
-            return A64Instruction(opcode: desc.id, is64Bit: true, vd: .v0, vn: .v1, vm: .v2, scalarWidth: .d)
-        case .fpCmpReg:
-            return A64Instruction(opcode: desc.id, is64Bit: true, vn: .v0, vm: .v1, scalarWidth: .d)
-        case .fpCmpZero:
-            return A64Instruction(opcode: desc.id, is64Bit: true, vn: .v0, scalarWidth: .d)
-        case .simdThreeSameInt, .simdPermute:
-            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, vm: .v2, arrangement: .s4)
-        case .simdThreeSameBit, .simdTblOne:
-            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, vm: .v2, arrangement: .b16)
-        case .simdThreeSameFp:
-            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, vm: .v2, arrangement: .s4)
-        case .simdTwoRegMisc:
-            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, arrangement: .b16)
-        case .simdShiftImm:
-            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, arrangement: .s4, amount: 4)
-        case .simdDupGpr:
-            return A64Instruction(opcode: desc.id, is64Bit: false, rn: .x1, vd: .v0, arrangement: .s4)
-        case .simdInsGpr:
-            return A64Instruction(opcode: desc.id, is64Bit: false, rn: .x1, vd: .v0, scalarWidth: .s, index: 1)
+        case .atomicLoad, .atomicStore, .atomicStoreExcl, .atomicLoadPair, .atomicStoreExclPair:
+            return A64Instruction(opcode: desc.id, is64Bit: (desc.opcodeMask & (1 << 30)) == 0, rd: .x0, rn: .x1, rm: .x2, ra: .x3)
+        case .lseAtomic, .lseCas:
+            return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, rm: .x2, scalarWidth: .d, acquire: true, release: true)
+        case .lseCasp:
+            return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x4, rn: .x1, rm: .x2, scalarWidth: .d, acquire: true)
+        case .fpLdstPreImm9, .fpLdstPostImm9, .fpLdstUnscaledImm9:
+            return A64Instruction(opcode: desc.id, rn: .x1, vd: .v0, scalarWidth: .q, imm: -16)
+        case .fpLdstRegOffset:
+            return A64Instruction(opcode: desc.id, rn: .x1, rm: .x2, vd: .v0, scalarWidth: .d, extendKind: .sxtw, amount: 3)
+        case .fpLdrLiteral:
+            return A64Instruction(opcode: desc.id, vd: .v3, scalarWidth: .q, imm: 64)
+        case .fpLdpStpSigned, .fpLdpStpPre, .fpLdpStpPost:
+            return A64Instruction(opcode: desc.id, rn: .sp, vd: .v8, vn: .v9, scalarWidth: .d, imm: -16)
+        case .fpMovGprToFp, .fpMovFpToGpr, .fpIntToFp, .fpToInt:
+            return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, vd: .v0, vn: .v1, scalarWidth: width)
+        case .fpFixedToFp, .fpToFixed:
+            return A64Instruction(opcode: desc.id, is64Bit: true, rd: .x0, rn: .x1, vd: .v0, vn: .v1, scalarWidth: width, imm: 16)
+        case .fpDp1:
+            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, scalarWidth: width)
+        case .fpCvtPrecision:
+            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, scalarWidth: .d, scalarWidth2: .s)
+        case .fpBinary, .fpDp3, .fpCmpReg, .fpCmpZero, .fpCondSelect:
+            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, vm: .v2, va: .v3, scalarWidth: width, cond: .ge)
+        case .fpCondCompare:
+            return A64Instruction(opcode: desc.id, vn: .v1, vm: .v2, scalarWidth: width, cond: .ge, imm2: 4)
+        case .fpImm:
+            return A64Instruction(opcode: desc.id, vd: .v0, scalarWidth: width, imm: 0x70)
+        case .simdThreeSameInt, .simdThreeSameBit, .simdThreeSameFp, .simdPermute, .simdTwoRegMisc,
+             .simdCmpZero, .simdTwoRegMiscFp, .simdAcrossLanes, .simdNarrow:
+            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, vm: .v2, arrangement: arr)
+        case .simdShiftImm, .simdShiftLong, .simdShiftNarrow:
+            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, arrangement: arr, amount: 4)
+        case .simdDupElem, .simdDupGpr:
+            return A64Instruction(opcode: desc.id, is64Bit: false, rn: .x1, vd: .v0, vn: .v1, arrangement: arr, index: 1)
+        case .simdDupScalar, .simdInsGpr, .simdInsElem:
+            return A64Instruction(opcode: desc.id, is64Bit: false, rn: .x1, vd: .v0, vn: .v1, scalarWidth: .s, index: 1, imm2: 2)
         case .simdUmovSmov:
             return A64Instruction(opcode: desc.id, is64Bit: desc.id == .simdSmov, rd: .x0, vn: .v1, scalarWidth: .b, index: 2)
-        case .simdLd1St1One:
-            return A64Instruction(opcode: desc.id, rn: .x1, vd: .v0, arrangement: .b16)
+        case .simdModImm:
+            switch desc.id {
+            case .simdFmovImm:
+                return A64Instruction(opcode: desc.id, vd: .v0, arrangement: .s4, imm: 0x70)
+            case .simdMovi:
+                return A64Instruction(opcode: desc.id, vd: .v0, arrangement: .d2, imm: Int64(bitPattern: 0xFF00_FF00_0000_FFFF))
+            default:
+                return A64Instruction(opcode: desc.id, vd: .v0, arrangement: .s4, shiftKind: .lsl, amount: 8, imm: 0xAB)
+            }
+        case .simdLdStMulti, .simdLdStMultiPost:
+            let count: UInt8
+            switch desc.id {
+            case .simdLd2, .simdSt2, .simdLd2Post, .simdSt2Post: count = 2
+            case .simdLd3, .simdSt3, .simdLd3Post, .simdSt3Post: count = 3
+            case .simdLd4, .simdSt4, .simdLd4Post, .simdSt4Post: count = 4
+            default: count = 1
+            }
+            return A64Instruction(opcode: desc.id, rn: .x1, rm: .xzr, vd: .v0, arrangement: .b16, imm: Int64(count) * 16, imm2: count)
+        case .simdLd1R, .simdLd1RPost:
+            return A64Instruction(opcode: desc.id, rn: .x1, rm: .xzr, vd: .v0, arrangement: .s4, imm: 4)
+        case .simdLdStLane, .simdLdStLanePost:
+            return A64Instruction(opcode: desc.id, rn: .x1, rm: .xzr, vd: .v0, scalarWidth: .s, index: 3, imm: 4)
+        case .simdTbl:
+            return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, vm: .v2, arrangement: .b16, imm2: 1)
         case .simdExt:
             return A64Instruction(opcode: desc.id, vd: .v0, vn: .v1, vm: .v2, arrangement: .b16, amount: 4)
         case .sveLdrStrZ:
@@ -3175,9 +4119,15 @@ extension A64InstructionTable {
         }
     }
 
-    /// Exhaustively verifies every entry in `A64InstructionTable`:
-    /// constructs a representative instruction, encodes it to `UInt32`, disassembles it back,
-    /// re-encodes the decoded instruction, and asserts `encoded1 == encoded2`.
+    /// The register width a sample GPR load/store uses: X where the descriptor allows it.
+    private static func sampleIs64(_ desc: A64InstrDesc) -> Bool {
+        if desc.scaleLog2 == 255 || (desc.opcodeMask & (1 << 30)) == 0 { return true }
+        // Fixed-size sign-extending loads target X when `opc<0>` = 0.
+        return (desc.opcodeBits >> 23) & 1 != 0 && (desc.opcodeBits >> 22) & 1 == 0
+    }
+
+    /// Verifies one representative instruction per entry in `A64InstructionTable`: encodes it, decodes the
+    /// word, re-encodes the decoded instruction, and asserts the two words are equal.
     public static func verifyRoundTrip() -> [(mnemonic: String, encoded: UInt32, disassembled: String)] {
         var results: [(mnemonic: String, encoded: UInt32, disassembled: String)] = []
         results.reserveCapacity(entries.count)

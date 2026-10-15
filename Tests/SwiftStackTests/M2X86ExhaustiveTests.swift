@@ -421,36 +421,9 @@ private func hex(_ bytes: [UInt8]) -> String {
     bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
 }
 
-/// Assembles `lines` with llvm-mc in one invocation; `nil` for a line LLVM rejects. A `fixup` line (an
-/// encoding with unresolved bytes) is returned with the known bytes only and flagged.
+/// Assembles `lines` with llvm-mc in one invocation; `nil` for a line LLVM rejects.
 private func llvmAssemble(_ lines: [String], mode: X86CodeMode, mc: String) throws -> [(bytes: [UInt8], fixup: Bool)?] {
-    let header = mode == .mode16 ? [".code16"] : []
-    let r = try ExternalTool.run(mc, ["-triple=x86_64", "-show-encoding"], stdin: (header + lines).joined(separator: "\n") + "\n")
-    var failed = Set<Int>()
-    for line in r.stderr.split(separator: "\n") where line.hasPrefix("<stdin>:") && line.contains(": error:") {
-        let fields = line.split(separator: ":")
-        if fields.count > 1, let n = Int(fields[1]) { failed.insert(n - 1 - header.count) }
-    }
-    var encodings: [(bytes: [UInt8], fixup: Bool)] = []
-    encodings.reserveCapacity(lines.count)
-    for line in r.stdout.split(separator: "\n") {
-        guard let lb = line.range(of: "encoding: ["), let rb = line[lb.upperBound...].firstIndex(of: "]") else { continue }
-        let fields = line[lb.upperBound..<rb].split(separator: ",")
-        let bytes = fields.compactMap { $0.hasPrefix("0x") ? UInt8($0.dropFirst(2), radix: 16) : nil }
-        encodings.append((bytes, bytes.count != fields.count))
-    }
-    var out: [(bytes: [UInt8], fixup: Bool)?] = []
-    out.reserveCapacity(lines.count)
-    var next = 0
-    for i in lines.indices {
-        if failed.contains(i) || next >= encodings.count {
-            out.append(nil)
-        } else {
-            out.append(encodings[next])
-            next += 1
-        }
-    }
-    return out
+    try LLVMMC.assemble(lines, mc: mc, args: ["-triple=x86_64"], header: mode == .mode16 ? [".code16"] : [])
 }
 
 /// `.text` bytes of `lines` assembled by our own assembler (the AT&T parser in Asm/X86Assembler.swift),

@@ -405,3 +405,70 @@ enum DifferentialAssembly {
         }
     }
 }
+
+// MARK: - Batched LLVM MC
+
+/// One llvm-mc invocation per batch of instructions, for the exhaustive encoder sweeps.
+enum LLVMMC {
+    /// Assembles one instruction per line with `--show-encoding`; `nil` for a line LLVM rejects. An encoding
+    /// with unresolved (fixup) bytes is returned with the known bytes only and flagged. `header` lines (such
+    /// as `.code16`) are prepended and produce no encoding.
+    static func assemble(_ lines: [String], mc: String, args: [String], header: [String] = []) throws -> [(bytes: [UInt8], fixup: Bool)?] {
+        let r = try ExternalTool.run(mc, args + ["-show-encoding"], stdin: (header + lines).joined(separator: "\n") + "\n")
+        var failed = Set<Int>()
+        for line in r.stderr.split(separator: "\n") where line.hasPrefix("<stdin>:") && line.contains(": error:") {
+            let fields = line.split(separator: ":")
+            if fields.count > 1, let n = Int(fields[1]) { failed.insert(n - 1 - header.count) }
+        }
+        var encodings: [(bytes: [UInt8], fixup: Bool)] = []
+        encodings.reserveCapacity(lines.count)
+        for line in r.stdout.split(separator: "\n") {
+            guard let lb = line.range(of: "encoding: ["), let rb = line[lb.upperBound...].firstIndex(of: "]") else { continue }
+            let fields = line[lb.upperBound..<rb].split(separator: ",")
+            let bytes = fields.compactMap { $0.hasPrefix("0x") ? UInt8($0.dropFirst(2), radix: 16) : nil }
+            encodings.append((bytes, bytes.count != fields.count))
+        }
+        var out: [(bytes: [UInt8], fixup: Bool)?] = []
+        out.reserveCapacity(lines.count)
+        var next = 0
+        for i in lines.indices {
+            if failed.contains(i) || next >= encodings.count {
+                out.append(nil)
+            } else {
+                out.append(encodings[next])
+                next += 1
+            }
+        }
+        return out
+    }
+
+    /// Disassembles one instruction per element; `nil` where LLVM reports an invalid encoding. Each
+    /// instruction's bytes are on their own input line so diagnostics map back to it.
+    static func disassemble(_ instructions: [[UInt8]], mc: String, args: [String]) throws -> [String?] {
+        let input = instructions.map { $0.map { String(format: "0x%02x", $0) }.joined(separator: " ") }.joined(separator: "\n") + "\n"
+        let r = try ExternalTool.run(mc, args + ["--disassemble"], stdin: input)
+        // An invalid encoding (reported as a warning or an error) produces no output line; a "potentially
+        // undefined" (unpredictable) one is still printed.
+        var failed = Set<Int>()
+        for line in r.stderr.split(separator: "\n") where line.hasPrefix("<stdin>:") && line.contains("invalid instruction encoding") {
+            let fields = line.split(separator: ":")
+            if fields.count > 1, let n = Int(fields[1]) { failed.insert(n - 1) }
+        }
+        let decoded = r.stdout.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix(".text") }
+        var out: [String?] = []
+        out.reserveCapacity(instructions.count)
+        var next = 0
+        for i in instructions.indices {
+            if failed.contains(i) || next >= decoded.count {
+                out.append(nil)
+            } else {
+                // Drop a trailing `// ...` comment (LLVM annotates `mov` immediates with their value).
+                let text = decoded[next]
+                out.append(text.range(of: "//").map { String(text[..<$0.lowerBound]).trimmingCharacters(in: .whitespaces) } ?? text)
+                next += 1
+            }
+        }
+        return out
+    }
+}
