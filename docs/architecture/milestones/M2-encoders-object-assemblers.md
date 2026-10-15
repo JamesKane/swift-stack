@@ -133,4 +133,23 @@ All 104 round-trip objects match exactly. The last 9 needed x86-64 `shld`/`shrd`
 
 The `swift-stack` driver passes its target options to the assembler as clang's driver passes them to its integrated assembler (05 §4.10): `--target=`/`-target`, `-march`, `-mabi`, `-mrelax`/`-mno-relax`, `-f[no-]pic`/`-f[no-]pie` (last wins), `-Wa,--noexecstack` and x86-64 `-Wa,-mrelax-relocations=yes|no`. Without `-march`/`-mabi`, RISC-V gets clang's defaults for the triple. `M2DriverAssemblerTests.swift` assembles `.s` and `.S` files through `DriverOptions.parse` and `DriverPipeline` (what `swift-stack` runs) with 27 flag sets on the three architectures and compares each object with `clang -c` given the same arguments, exactly. This found that LLVM MC 22 pads RISC-V code alignment under relaxation with `align − 2` bytes and writes a `c.nop` in any padding even without C (Swift-Stack used `align − 4` and two zero bytes).
 
-Not done: Swift-Stack does not normalize a hand-written `.attribute arch` string (clang's output is already normalized), names `.`-temporaries for RISC-V `.L0 ` without LLVM's counter details, and does not synthesize DWARF from `.file`/`.loc` (`-g`).
+## 3. Known gaps
+
+M2's exit criteria are met. These are the gaps left at its close (2026-10-15), each with where it is expected to be closed. The instruction coverage left out of each table is listed with the table in §1.1.
+
+**On the desktop path, needed later:**
+- **DWARF from `.file`/`.loc`:** the assembler accepts the directives but writes no `.debug_line`, so `-g` assembly (including clang's `-g -S` output) loses line information. Needed by M3's debug-info deliverable (07); it fits there, with the code generator's own line tables.
+- **`-march` is not enforced on x86-64 or AArch64:** every instruction in the tables assembles whatever `-march` says, where clang rejects instructions outside the selected features (`ldadd` without `+lse`, `vpbroadcastd` without AVX2). Accepting more is harmless for correct input but hides mistakes in hand-written `.S`, and M3's code generator needs the same feature sets to choose instructions (17 §5.4). RISC-V `-march` is honoured.
+- **Driver options not supported** (warned and ignored): `-mcpu`, `-mrelax-all`, and RISC-V `-Wa,-march=`.
+- **`_BitInt` layout on AArch64 and RISC-V** (C front end, M1): it uses the x86-64 rules; AAPCS64 and the RISC-V psABI differ for widths above 64 bits. Needed before M5's AArch64 back end, and before then by any VectraOS arm64 header that uses `_BitInt` (none do today).
+
+**Minor, no consumer yet:**
+- A hand-written `.attribute arch` string is not normalized as LLVM MC normalizes it (clang's output is already normalized, so the round trip is unaffected).
+- RISC-V `.`-temporaries are named `.L0 ` without LLVM's counter details.
+- AArch64 `.cfi_b_key_frame` is not supported (VectraOS signs with the A key).
+- RISC-V Zcb compressions are not applied by the assembler (`RVAsmOptions` has no Zcb switch; §1.1); VectraOS's `rv64imac` does not have Zcb.
+- RISC-V linker relaxation is emitted by the assembler, but not yet performed by a Swift-Stack linker. M3's linker targets x86-64; RV64 linking, with relaxation, comes with the RV64 back end (M5, [06](../06-linker.md)), and until then RV64 objects are linked with `ld.lld`.
+
+**Left out of the tables deliberately** (§1.1): x87, MMX, AVX-512/EVEX and x86 extensions beyond the 2013 Mac Pro floor and its opt-in set; AArch64 pointer authentication outside the hint space, LOR, FHM `fmlal`, FP16 scalar pairwise and SVE beyond VectraOS's inline assembly; RISC-V extensions outside RVA23.
+
+**Decisions open** (not M2 defects): the RV64 floor for VectraOS (`rv64gc` plus runtime V against RVA23, [17](../17-simd-and-vectorization.md) §8 question 6); VectraOS's amd64 user build adopting the D9 floor flags (it builds for baseline SSE2 today).
