@@ -100,6 +100,61 @@ public struct AIRFunction: ~Copyable {
 
 **Use lists** are not maintained incrementally. Passes that need def-use information build a CSR use index (`useStart`, `useInsts`) in one linear pass into the scratch arena, and discard it when they finish.
 
+#### 4.1.1 Types and C operations (M3)
+
+The C half of AIR is built (`AIR/AIRFunction.swift`, lowered from SemIR by `AIRLowering`; M3 plan §3). Three points differ from the sketch above:
+- The `type` column holds an `AIRType`, not a `TypeId`.
+- Instructions are numbered in block order, so a block is a contiguous `InstId` range (`blockStart`), with no `blockOrder` column.
+- A builder (`AIRBuilder`) collects each function and lays it out when it finishes.
+
+**Values are scalars.** An `AIRType` is `void`, an integer of any width (`i1` to `i8192`), a float (`f16`, `f32`, `f64`, the x87 `f80`, `f128`), or `ptr`. C types map to them as follows:
+- `bool` is `i1` as a value and `i8` in memory.
+- A `_BitInt(N)` is `iN` as a value and its storage size in memory.
+- An enumeration takes its underlying type.
+
+**Aggregates live in memory and are handled by address.**
+- An aggregate argument is the address of its value.
+- An aggregate result is written through the `call`'s destination operand, and a function returns one with `ret` of its address.
+- An aggregate parameter is the address of the callee's copy.
+
+How each one travels is decided by the ABI lowering ([04](04-backend.md) §4.7.1), which reads the C function type that every `call` carries.
+
+**At `-O0`, every named local lives in a stack slot.** Each slot is an `alloca` in the entry block, sized and aligned by the function's `slots` table. On x86-64, an array variable of 16 bytes or more is 16-byte aligned (psABI §3.1.2). Temporaries are SSA values. `&&`, `||` and `?:` merge through `phi`s.
+
+**Constants.** Like LLVM's IR builder, the builder folds integer operations and conversions on constants, and conversions of constants to floats (exactly rounded, by `SoftFloat`).
+
+The opcodes, with operand layouts documented on `AIROpcode`:
+
+| Group | Opcodes |
+|---|---|
+| Memory | `alloca`, `dyn_alloca` (VLAs, `__builtin_alloca`), `load`/`store` (with alignment and `volatile`), `copy`/`fill` (`memcpy`/`memset`), `ptradd` (bytes), `tls_addr`, `block_addr`, `stack_save`/`stack_restore` |
+| Integer | `add` `sub` `mul` `sdiv` `udiv` `srem` `urem` `and` `or` `xor` `shl` `lshr` `ashr`, `bswap` `clz` `ctz` `popcount`, `icmp` (10 predicates), `select` |
+| Float | `fadd` `fsub` `fmul` `fdiv` `fneg` `fabs`, `fcmp` (ordered and unordered predicates) |
+| Conversion | `trunc` `zext` `sext` `fptrunc` `fpext` `fptosi` `fptoui` `sitofp` `uitofp` `ptrtoint` `inttoptr` `bitcast` |
+| Calls, variadics | `call`, `va_start` `va_end` `va_copy`, `va_arg` (yields the argument's address; the ABI lowering computes it) |
+| Atomics | `atomic_load` `atomic_store` `atomic_rmw` (xchg, add, sub, and, or, xor, nand) `cmpxchg` `fence`, orderings numbered as `__ATOMIC_*` |
+| Other | `asm` (template, constraints, output addresses, inputs, clobbers), `frame_address`, `return_address`, `phi` |
+| Terminators | `br` `cond_br` `switch` `indirect_br` `ret` `unreachable` `trap` `asm_goto` |
+
+**How C constructs lower:**
+- **Bit-fields** are accessed as exactly the bytes they span, from the byte holding their first bit. A packed field is therefore never read past its record, and a 40-bit field at bit 9 is an `i48`.
+- **VLAs.** A VLA's length is stored in a slot when its declaration (or the parameter's, on entry) is reached. Its storage is released by restoring the stack pointer saved before it: at the end of its block, and by a `break`, `continue` or `goto` that leaves it.
+- **GNU case ranges** of up to 64 values become `switch` cases; wider ranges are tested on the way to the default.
+- **Builtins** become operations or calls to the library function they name. For example, `__builtin_add_overflow` computes the exact result in an integer wide enough to hold it.
+
+**Symbols.** A module's symbols are its functions and objects, defined or referred to. As Clang does, an internal definition is emitted only when something emitted refers to it (`static` functions, block-scope statics, string literals). An inline-only definition (C23 6.7.5, or GNU `extern inline`) is not emitted, and its name refers to an external definition.
+
+**Verifier.** `AIRVerifier` runs under `--verify-each` and on every corpus. It checks:
+- block structure;
+- the CSR edges;
+- operand validity and types, opcode by opcode;
+- calls against their C function type;
+- `phi` edges against predecessors;
+- SSA dominance, using Cooper–Harvey–Kennedy dominators (§4.6);
+- the module's symbols and data images.
+
+**Dump.** `--dump=air` prints each function's slots and blocks, then the objects with their data images, then the undefined symbols. It is deterministic, and the golden tests in `Tests/Golden/air` use it.
+
 ### 4.2 Swift semantics in AIR
 
 **Ownership.** Before ownership lowering, every SSA value has an ownership kind: `owned`, `guaranteed` (borrowed), `none` (trivial), or `unowned`. Ownership is managed by these instructions:

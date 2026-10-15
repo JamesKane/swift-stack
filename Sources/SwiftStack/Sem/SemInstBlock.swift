@@ -131,7 +131,8 @@ public enum SemInstKind: UInt16, BitwiseCopyable, Sendable, CaseIterable {
     /// extra: the statements in order. A scope: its declarations end at its end.
     case compound = 80
     /// A local object with automatic storage. arg0: DeclId; extra: [initializer or 0, VLA count, (VLA TypeId, length
-    /// as `size_t`)...]; each VLA length is evaluated, outermost first, when the declaration is reached.
+    /// as `size_t`)...]; each VLA length is evaluated, outermost first, when the declaration is reached. A typedef
+    /// name or a variably modified parameter (at the start of the body) only evaluates the lengths.
     case declLocal = 81
     /// arg0: the expression, evaluated for its side effects.
     case exprStmt = 82
@@ -166,7 +167,10 @@ public enum SemInstKind: UInt16, BitwiseCopyable, Sendable, CaseIterable {
     case continueStmt = 94
     /// arg0: value converted to the return type, or 0.
     case returnStmt = 95
-    /// Inline `asm`: its operands are not modeled yet.
+    /// GNU inline `asm` (`SemAsm` decodes it). extra: [template (index into `stringConstants`), flags (`SemAsm`), output
+    /// count, input count, clobber count, label count, then per output (constraint, name or `SemAsm.noName`, lvalue),
+    /// per input (constraint, name, rvalue, or lvalue for a memory-only constraint), the clobbers (string indices),
+    /// and the `goto` label numbers].
     case asmStmt = 96
     case nullStmt = 97
 
@@ -444,6 +448,17 @@ public struct SemInstBlock: ~Copyable {
         return UInt32(intConstants.count - 1)
     }
 
+    /// Stores a string that is not a literal of the program (an `asm` template, constraint or clobber) and returns
+    /// its index in `stringConstants`.
+    public mutating func addStringConstant(_ value: StringConstant) -> UInt32 {
+        stringConstants.append(value)
+        return UInt32(stringConstants.count - 1)
+    }
+
+    public func stringConstant(at index: UInt32) -> StringConstant {
+        Int(index) < stringConstants.count ? stringConstants[Int(index)] : StringConstant(bytes: [0], elementSize: 1, encoding: .ordinary)
+    }
+
     @discardableResult
     public mutating func appendFloatLiteral(value: FloatConstant, type: QualType, node: NodeId = .nilId) -> SemInstId {
         let idx = UInt32(floatConstants.count)
@@ -510,5 +525,59 @@ public struct SemInstBlock: ~Copyable {
         intConstants.removeLast(intConstants.count - mark.ints)
         floatConstants.removeLast(floatConstants.count - mark.floats)
         stringConstants.removeLast(stringConstants.count - mark.strings)
+    }
+}
+
+/// A decoded `asmStmt` (`SemInstKind.asmStmt`).
+public struct SemAsm {
+    public static let volatileFlag: UInt32 = 1
+    public static let gotoFlag: UInt32 = 2
+    public static let inlineFlag: UInt32 = 4
+    public static let noName = UInt32.max
+
+    public struct Operand {
+        public let constraint: String
+        /// The `[name]` of the operand, or "".
+        public let name: String
+        public let value: SemInstId
+    }
+
+    public let template: String
+    public let flags: UInt32
+    public let outputs: [Operand]
+    public let inputs: [Operand]
+    public let clobbers: [String]
+    public let labels: [UInt32]
+
+    public var isVolatile: Bool { flags & Self.volatileFlag != 0 }
+    public var isGoto: Bool { flags & Self.gotoFlag != 0 }
+
+    /// Whether a constraint allows only a memory operand (its operand is then an lvalue).
+    public static func isMemoryOnly(_ constraint: String) -> Bool {
+        let letters = constraint.filter { $0.isLetter }
+        return !letters.isEmpty && letters.allSatisfy { "moVQ".contains($0) }
+    }
+
+    public init?(_ id: SemInstId, in block: borrowing SemInstBlock) {
+        let extra = Array(block.extra(of: id))
+        guard extra.count >= 6 else { return nil }
+        let nOut = Int(extra[2]), nIn = Int(extra[3]), nClobber = Int(extra[4]), nLabel = Int(extra[5])
+        guard extra.count == 6 + 3 * (nOut + nIn) + nClobber + nLabel else { return nil }
+        func text(_ i: UInt32) -> String {
+            i == Self.noName ? "" : String(decoding: block.stringConstant(at: i).bytes.dropLast(), as: UTF8.self)
+        }
+        func operands(_ start: Int, _ n: Int) -> [Operand] {
+            (0..<n).map { k in
+                let b = start + 3 * k
+                return Operand(constraint: text(extra[b]), name: text(extra[b + 1]), value: SemInstId(extra[b + 2]))
+            }
+        }
+        template = text(extra[0])
+        flags = extra[1]
+        outputs = operands(6, nOut)
+        inputs = operands(6 + 3 * nOut, nIn)
+        let clobberStart = 6 + 3 * (nOut + nIn)
+        clobbers = extra[clobberStart..<(clobberStart + nClobber)].map { text($0) }
+        labels = Array(extra[(clobberStart + nClobber)...])
     }
 }

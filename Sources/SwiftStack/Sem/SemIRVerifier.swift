@@ -97,15 +97,22 @@ public struct SemIRVerifier {
 
     // MARK: - Instructions
 
-    /// The operands of an instruction (instruction references only), and which must be lvalues.
     private func operands(_ id: SemInstId, _ c: SemInstBlockContainer) -> [(inst: SemInstId, lvalue: Bool?)] {
+        Self.operands(id, c)
+    }
+
+    /// The operands of an instruction (instruction references only), and which must be lvalues (nil: either).
+    public static func operands(_ id: SemInstId, _ c: SemInstBlockContainer) -> [(inst: SemInstId, lvalue: Bool?)] {
         let a0 = SemInstId(c.block.arg0[id]), a1 = SemInstId(c.block.arg1[id])
         let extra = Array(c.block.extra(of: id))
         func opt(_ i: SemInstId, _ lv: Bool?) -> [(SemInstId, Bool?)] { i.isValid ? [(i, lv)] : [] }
         switch c.block.kind(of: id) {
         case .nilInst, .intLiteral, .floatLiteral, .stringLiteral, .nullptrLiteral, .declRef, .labelAddress, .gotoStmt,
-             .breakStmt, .continueStmt, .asmStmt, .nullStmt:
+             .breakStmt, .continueStmt, .nullStmt:
             return []
+        case .asmStmt:
+            guard let asm = SemAsm(id, in: c.block) else { return [] }
+            return asm.outputs.map { ($0.value, true) } + asm.inputs.map { ($0.value, SemAsm.isMemoryOnly($0.constraint) ? nil : false) }
         case .member, .bitField, .lvalueToRvalue, .arrayToPointer, .functionToPointer, .addrOf, .preInc, .preDec, .postInc,
              .postDec, .vaArg:
             return [(a0, true)]
@@ -322,6 +329,9 @@ public struct SemIRVerifier {
                 if let initInst = c.block.extra(of: id).first, initInst != 0 {
                     verifyInitializer(SemInstId(initInst), for: module.declTable.type(of: decl), c, fail: fail)
                 }
+            } else if declKind == .parameter {
+                // A variably modified parameter's lengths, evaluated on entry
+                if let initInst = c.block.extra(of: id).first, initInst != 0 { fail("initializes a parameter") }
             } else if declKind != .typedefDecl {
                 fail("declares a \(declKind)")
             }
@@ -367,10 +377,15 @@ public struct SemIRVerifier {
         guard extra.count >= 3, Int(extra[2]) == extra.count - 3 else { fail("malformed argument list"); return }
         let args = extra.dropFirst(3).map { SemInstId($0) }
         if Int(extra[1]) != params.count { fail("records \(extra[1]) parameters, the type has \(params.count)") }
-        if !same(ret.unqualified(), type) && !ret.isError { fail("returns \(typePool.name(of: type)), the callee \(typePool.name(of: ret))") }
+        // An implicitly declared builtin (`long (...)`) takes its result type from its signature
+        let calleeName = module.declTable.name(of: DeclId(extra[0]))
+        let isBuiltin = ["__builtin_", "__atomic_", "__sync_", "__c11_atomic_"].contains { calleeName.hasPrefix($0) }
+        if !same(ret.unqualified(), type) && !ret.isError && !isBuiltin {
+            fail("returns \(typePool.name(of: type)), the callee \(typePool.name(of: ret))")
+        }
         if args.count < params.count || (args.count > params.count && !variadic) {
             // A call with the wrong number of arguments is diagnosed; this one was accepted, so it is a builtin
-            if module.declTable.name(of: DeclId(extra[0])).hasPrefix("__builtin_") == false && !isPoisonedAny(args, c) {
+            if !calleeName.hasPrefix("__builtin_") && !isPoisonedAny(args, c) {
                 fail("\(args.count) arguments for \(params.count) parameters")
             }
         }
@@ -531,6 +546,10 @@ public struct SemIRVerifier {
             if context.loops == 0 { report(blockIndex, id, "continue outside a loop") }
         case .returnStmt, .indirectGoto:
             walkExpression(a0)
+        case .asmStmt:
+            guard let asm = SemAsm(id, in: c.block) else { report(blockIndex, id, "asm: malformed"); return }
+            for operand in asm.outputs + asm.inputs { walkExpression(operand.value) }
+            for n in asm.labels { gotos.append((id, n)) }
         default:
             break
         }

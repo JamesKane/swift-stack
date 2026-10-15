@@ -165,7 +165,19 @@ Both are resolved by type-checking the operand without evaluating it, except tha
 - **`#pragma pack`.** `pack(N)`, `pack()`, `pack(push[, N])` and `pack(pop)`, with Clang's Itanium layout rules (§4.2.7).
 - **Case ranges.** GNU `case low ... high:` (a `caseRange` statement in SemIR); a range that overlaps another label is a duplicate case value.
 - **Builtins.** A documented `__builtin_*` catalog, covering what the profiled headers reference: `__builtin_va_*`, `__builtin_expect`, `__builtin_bswap*`, `__builtin_clz*`, `__builtin_offsetof`, `__builtin_unreachable`, and the overflow builtins.
+  - A builtin is declared implicitly on first use, as `long (...)`, so its arguments get the default argument promotions.
+  - A call to one takes the builtin's own result type (`builtinResultType`). For example, `__builtin_inff` gives `float`, and `__atomic_load_n` gives the type its pointer argument points to.
+  - AIR lowering implements them ([03](03-intermediate-representation.md) §4.1.1).
 - **Inline `asm`.** Basic and extended inline `asm`, with the constraint subset that VectraOS's C needs (`r`, `m`, `i`, `=`, `+`, `&`, register-pinned operands, `memory`/`cc` clobbers).
+  - SemIR models the template, the qualifiers, each operand with its constraint and `[name]`, the clobbers and the `goto` labels (`asmStmt`, decoded by `SemAsm`).
+  - Outputs are lvalues. An input is an lvalue if its constraint allows only memory, and a value otherwise.
+  - A file-scope `asm` goes to `SemModule.moduleAsm`.
+  - A `register` variable's register (`register T x asm("x17")`) is not modeled yet.
+- **Inline definitions.** Like Clang in C23 mode, the profile predefines `__GNUC_STDC_INLINE__`, and `__NO_INLINE__` (nothing is inlined at `-O0`). A definition is inline-only (`SemFunction.isInlineOnly`) in two cases:
+  - it is `inline`, and no file-scope declaration of the function lacks `inline` or has `extern` (C23 6.7.5p7);
+  - it is GNU `extern inline` with `gnu_inline`, as glibc's wrappers are.
+
+  An inline-only definition is not emitted, and its name refers to the external definition.
 - **Nullability qualifiers** (`_Nonnull`, `_Nullable`, `_Nullable_result`, `_Null_unspecified`) are kept as type sugar for Swift import (§4.6). VectraOS's kernel, loader and runtime headers annotate every pointer with them, including inside array parameter brackets (`uint32_t out[_Nonnull 4]`).
 - **Vector extensions.** `__attribute__((vector_size(N)))`, `ext_vector_type(N)`, `__builtin_shufflevector` and `__builtin_convertvector`. They map to the TypePool's builtin vector types, shared with Swift `SIMDn` ([17](17-simd-and-vectorization.md) §5.7), and macOS `<simd/simd.h>` needs them. Target intrinsics headers are a non-goal.
 
@@ -182,6 +194,7 @@ Both are resolved by type-checking the operand without evaluating it, except tha
 - **Layout.** A per-target `DataLayout` gives the scalar sizes and alignments, the `long double` format, each psABI's `_BitInt` rule, and `char` signedness. Members are placed by the x86-64 System V rules, which the AArch64 and RISC-V psABIs share for ordinary members and bit-fields. A bit-field shares the storage unit of its declared type with the preceding bits unless it would cross that unit's boundary, and a zero-width bit-field closes the unit. On x86-64 and RISC-V unnamed bit-fields do not affect alignment; AAPCS64 counts them as named ones, and its zero-width bit-field raises the alignment to its type's even in a packed record. `packed`, `aligned`, `alignas` and `mode` are applied; an explicit member alignment survives `packed`.
 - **`#pragma pack(N)`** (Clang's Itanium rules) caps every member's alignment at N, an explicit member alignment included but not the record's own; places bit-fields without padding, so they may straddle units; and gives a bit-field of a packed record its unpacked alignment, capped. The preprocessor records each change at its token (`TokenBuffer.packChanges`), and a definition takes the value in effect at its tag.
 - **Checked against Clang.** `sizeof`, `_Alignof` and `offsetof` of generated types match clang 22 on x86-64, AArch64 and RISC-V (`M3ClangProbeTests`).
+- **Array variables.** On x86-64 an array *variable* of 16 bytes or more is 16-byte aligned, static or automatic (psABI §3.1.2, `DataLayout.variableAlignment`). The type's alignment does not change. As in Clang, a variable with an alignment attribute of its own (`_Alignas(8) char b[64]`) keeps that alignment; one whose aligned typedef gives the alignment still gets 16.
 - **Bit-field promotion** (C23 6.3.1.1p2, as Clang's `isPromotableBitField`, compatible with GCC): an integer or enumeration bit-field narrower than `int` promotes to `int` whatever its declared type, one as wide as `int` to `int` or `unsigned int` by its signedness, and a wider or `_BitInt` one is not promoted. The rule applies wherever the integer promotions or usual arithmetic conversions do: `unsigned f : 3` compares with `-1` as an `int`.
 - **Enumerations.** Without a fixed underlying type, the enumerated type is compatible with `unsigned int` when no value is negative and with `int` otherwise (64-bit types when a value needs them), as in GCC and Clang. An enumeration constant has type `int` when its value fits.
 

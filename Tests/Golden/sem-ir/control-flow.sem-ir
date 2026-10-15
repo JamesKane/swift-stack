@@ -92,7 +92,7 @@ function control(n#4: int) -> int
   %91 = load %90 : void *
   %92 = goto_indirect %91
   %93 = compound [%2, %36, %45, %55, %68, %76, %78, %92]
-global control.targets: void *[2] align 8 internal init %81 in block 1
+global control.targets: void *[2] align 16 internal init %81 in block 1
   bytes [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
   reloc +0 8 bytes -> control label 2+0
   reloc +8 8 bytes -> control label 1+0

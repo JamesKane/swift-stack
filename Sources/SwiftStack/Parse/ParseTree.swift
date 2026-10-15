@@ -56,6 +56,11 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
     case breakStmt = 46
     case labelStmt = 47
     case asmStmt = 48
+    /// Operands of an `asm` statement (see `CParser.parseAsm`).
+    case asmOutput = 76
+    case asmInput = 77
+    case asmClobber = 78
+    case asmLabel = 79
     /// GNU `case low ... high:`: children are the two bounds, then the labeled statement, if any.
     case caseRangeStmt = 75
 
@@ -142,6 +147,10 @@ public enum CNodeKind: UInt8, Sendable, BitwiseCopyable, CustomStringConvertible
         case .breakStmt: return "breakStmt"
         case .labelStmt: return "labelStmt"
         case .asmStmt: return "asmStmt"
+        case .asmOutput: return "asmOutput"
+        case .asmInput: return "asmInput"
+        case .asmClobber: return "asmClobber"
+        case .asmLabel: return "asmLabel"
         case .assignExpr: return "assignExpr"
         case .binaryExpr: return "binaryExpr"
         case .unaryExpr: return "unaryExpr"

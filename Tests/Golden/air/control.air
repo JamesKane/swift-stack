@@ -1,0 +1,149 @@
+function @loops(i32 %a0) -> i32 : int (int)
+  slot s0: 4 bytes align 4 (n)
+  slot s1: 4 bytes align 4 (sum)
+  slot s2: 4 bytes align 4 (i)
+bb1:
+  %1 = alloca s0 (n)
+  %2 = alloca s1 (sum)
+  %3 = alloca s2 (i)
+  store i32 %a0, %1, align 4
+  store i32 0, %2, align 4
+  store i32 0, %3, align 4
+  br bb2
+bb2: preds bb1, bb12
+  %8 = load i32, %3, align 4
+  %9 = load i32, %1, align 4
+  %10 = icmp slt i32 %8, %9
+  cond_br %10, bb3, bb13
+bb3: preds bb2
+  %12 = load i32, %3, align 4
+  %13 = srem i32 %12, 3
+  %14 = icmp eq i32 %13, 0
+  cond_br %14, bb5, bb4
+bb4: preds bb3
+  %16 = load i32, %3, align 4
+  %17 = icmp eq i32 %16, 7
+  br bb5
+bb5: preds bb3, bb4
+  %19 = phi i1 [bb3: true], [bb4: %17]
+  cond_br %19, bb6, bb7
+bb6: preds bb5
+  br bb12
+bb7: preds bb5
+  %22 = load i32, %3, align 4
+  %23 = icmp sgt i32 %22, 100
+  cond_br %23, bb8, bb9
+bb8: preds bb7
+  %25 = load i32, %1, align 4
+  %26 = icmp slt i32 %25, 1000
+  br bb9
+bb9: preds bb7, bb8
+  %28 = phi i1 [bb7: false], [bb8: %26]
+  cond_br %28, bb10, bb11
+bb10: preds bb9
+  br bb13
+bb11: preds bb9
+  %31 = load i32, %3, align 4
+  %32 = load i32, %2, align 4
+  %33 = add i32 %32, %31
+  store i32 %33, %2, align 4
+  br bb12
+bb12: preds bb6, bb11
+  %36 = load i32, %3, align 4
+  %37 = add i32 %36, 1
+  store i32 %37, %3, align 4
+  br bb2
+bb13: preds bb2, bb10
+  br bb14
+bb14: preds bb13, bb15
+  %41 = load i32, %1, align 4
+  %42 = sub i32 %41, 1
+  store i32 %42, %1, align 4
+  %44 = icmp sgt i32 %41, 0
+  cond_br %44, bb15, bb16
+bb15: preds bb14
+  %46 = load i32, %1, align 4
+  %47 = load i32, %2, align 4
+  %48 = xor i32 %47, %46
+  store i32 %48, %2, align 4
+  br bb14
+bb16: preds bb14
+  br bb17
+bb17: preds bb16, bb18
+  %52 = load i32, %2, align 4
+  %53 = add i32 %52, 1
+  store i32 %53, %2, align 4
+  br bb18
+bb18: preds bb17
+  %56 = load i32, %2, align 4
+  %57 = icmp slt i32 %56, 10
+  cond_br %57, bb17, bb19
+bb19: preds bb18
+  %59 = load i32, %2, align 4
+  %60 = icmp sgt i32 %59, 0
+  cond_br %60, bb20, bb21
+bb20: preds bb19
+  %62 = load i32, %2, align 4
+  br bb22
+bb21: preds bb19
+  %64 = load i32, %2, align 4
+  %65 = sub i32 0, %64
+  br bb22
+bb22: preds bb20, bb21
+  %67 = phi i32 [bb20: %62], [bb21: %65]
+  ret i32 %67
+function @classify(i32 %a0) -> i32 : int (int)
+  slot s0: 4 bytes align 4 (c)
+  slot s1: 4 bytes align 4 (kind)
+bb1:
+  %1 = alloca s0 (c)
+  %2 = alloca s1 (kind)
+  store i32 %a0, %1, align 4
+  store i32 0, %2, align 4
+  %5 = load i32, %1, align 4
+  switch i32 %5, default bb2 [97: bb3, 98: bb3, 99: bb3, 100: bb3, 101: bb3, 120: bb4]
+bb2: preds bb1
+  %7 = sub i32 %5, 1000
+  %8 = icmp ule i32 %7, 1000
+  cond_br %8, bb5, bb6
+bb3: preds bb1
+  store i32 1, %2, align 4
+  br bb4
+bb4: preds bb1, bb3
+  %12 = load i32, %2, align 4
+  %13 = add i32 %12, 2
+  store i32 %13, %2, align 4
+  br bb7
+bb5: preds bb2
+  store i32 3, %2, align 4
+  br bb7
+bb6: preds bb2
+  br bb8
+bb7: preds bb4, bb5
+  %19 = load i32, %2, align 4
+  %20 = mul i32 %19, 2
+  store i32 %20, %2, align 4
+  br bb8
+bb8 (out): preds bb6, bb7
+  %23 = load i32, %2, align 4
+  ret i32 %23
+function @dispatch(i32 %a0) -> i32 : int (int)
+  slot s0: 4 bytes align 4 (i)
+bb1:
+  %1 = alloca s0 (i)
+  store i32 %a0, %1, align 4
+  %3 = load i32, %1, align 4
+  %4 = and i32 %3, 1
+  %5 = sext i32 %4 to i64
+  %6 = mul i64 %5, 8
+  %7 = ptradd @dispatch.table, %6
+  %8 = load ptr, %7, align 8
+  indirect_br %8 [bb2, bb3]
+bb2 (one): preds bb1 address-taken
+  ret i32 1
+bb3 (two): preds bb1 address-taken
+  ret i32 2
+object @dispatch.table: void *[2] size 16 align 16 internal
+  bytes [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
+  reloc +0 8 bytes -> @dispatch bb2+0
+  reloc +8 8 bytes -> @dispatch bb3+0

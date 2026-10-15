@@ -1,754 +1,636 @@
 // Sources/SwiftStack/AIR/AIRLowering.swift
+//
+// SemIR → AIR (03-intermediate-representation.md §4.1; milestones/M3-plan.md §2, phase 2). Each function body, a
+// tree of SemIR instructions, is walked from its root; static objects take their data images from the
+// static-initializer evaluator. At `-O0` every named local lives in a stack slot (an `alloca` in the entry block) and
+// every temporary is an SSA value; aggregates are handled by address (see `AIRFunction.swift`).
+
 import Foundation
 
-/// Lowers type-checked ParseTree nodes into an AIRModule (03-intermediate-representation.md §4.1).
-public struct AIRLowering {
-    private let tree: UnsafePointer<ParseTree>
-    private let tokens: UnsafePointer<TokenBuffer>
-    private let semResult: SemResult
-    private let typePool: TypePool
-    private let sourceBuffer: UnsafePointer<UInt8>
-    private let sourceLength: Int
-    /// Resolves token spellings in any buffer (included headers, macro expansions, pasted tokens).
-    private let sourceManager: SourceManager?
-    public private(set) var hasLoweringError: Bool = false
-    /// Frame offsets (below the frame pointer) of the current function's parameters and locals, by declaration:
-    /// sema assigns no frame locations, so this throwaway lowering lays the frame out as it meets each object.
-    private var frameSlots: [DeclId: UInt32] = [:]
+/// A construct AIR lowering cannot express. The module is still produced, with the construct replaced by a trap.
+public struct AIRLoweringIssue: CustomStringConvertible, Sendable {
+    public let function: String
+    public let message: String
+    public var description: String { function.isEmpty ? message : "\(function): \(message)" }
+}
 
-    public init(
-        tree: UnsafePointer<ParseTree>,
-        tokens: UnsafePointer<TokenBuffer>,
-        semResult: SemResult,
-        typePool: TypePool,
-        sourceBuffer: UnsafePointer<UInt8>,
-        sourceLength: Int,
-        sourceManager: SourceManager? = nil
-    ) {
-        self.sourceManager = sourceManager
-        self.tree = tree
-        self.tokens = tokens
-        self.semResult = semResult
-        self.typePool = typePool
-        self.sourceBuffer = sourceBuffer
-        self.sourceLength = sourceLength
+public final class AIRLowering {
+    let sem: SemModule
+    public let module: AIRModule
+    public private(set) var issues: [AIRLoweringIssue] = []
+    var typePool: TypePool { sem.typePool }
+
+    /// The symbol of each declaration referred to.
+    private var declSymbols: [DeclId: Int] = [:]
+    /// String literals of function bodies (`.str`, `.str.1`, ...), by contents.
+    private var stringSymbols: [StringConstant: Int] = [:]
+    /// String literals of static initializers (`SemModule.staticStrings`), by index.
+    private var staticStringSymbols: [Int: Int] = [:]
+    /// Labels whose address a static initializer takes, by function symbol name.
+    var staticLabelAddresses: [String: Set<UInt32>] = [:]
+    /// Function types of the library functions builtins call.
+    private var libraryTypes: [String: TypeId] = [:]
+
+    public init(_ sem: SemModule) {
+        self.sem = sem
+        self.module = AIRModule(typePool: sem.typePool)
     }
 
-    private func spelling(of tok: TokenId) -> String {
-        guard tok.isValid else { return "" }
-        let startLoc = tokens.pointee.start(of: tok)
-        let endLoc = tokens.pointee.end(of: tok)
-        if let sm = sourceManager, let text = sm.text(from: startLoc, to: endLoc) {
-            return text
-        }
-        let s = Int(startLoc.rawValue)
-        let e = Int(endLoc.rawValue)
-        guard s >= 0, e >= s, e <= sourceLength else { return "" }
-        return String(decoding: UnsafeBufferPointer(start: sourceBuffer + s, count: e - s), as: UTF8.self)
+    /// Lowers a module; `issues` lists what could not be lowered.
+    public static func lower(_ sem: SemModule) -> AIRLowering {
+        let l = AIRLowering(sem)
+        l.run()
+        return l
     }
 
-    /// Arithmetic opcode of a compound assignment (`+=` → `add`), or nil for plain `=`.
-    private static func compoundAssignmentOpcode(_ k: CTokenKind) -> AIROpcode? {
-        switch k {
-        case .plusEqual:           return .add
-        case .minusEqual:          return .sub
-        case .starEqual:           return .mul
-        case .slashEqual:          return .sdiv
-        case .percentEqual:        return .srem
-        case .ampEqual:            return .band
-        case .pipeEqual:           return .bor
-        case .caretEqual:          return .bxor
-        case .lessLessEqual:       return .shl
-        case .greaterGreaterEqual: return .shr
-        default:                   return nil
-        }
+    func report(_ function: String, _ message: String) {
+        if issues.count < 1000 { issues.append(AIRLoweringIssue(function: function, message: message)) }
     }
 
-    public mutating func lower() -> AIRModule {
-        var module = AIRModule(stringLiterals: semResult.stringLiterals)
+    /// Internal definitions not yet emitted, by declaration: emitted when something emitted refers to them.
+    private var pendingFunctions: [DeclId: SemFunction] = [:]
+    private var pendingObjects: [DeclId: SemGlobal] = [:]
+    private var functionQueue: [(SemFunction, Int)] = []
+    private var objectQueue: [(SemGlobal, Int)] = []
 
-        // Lower each function definition in deterministic source declaration order
-        for fnName in semResult.functionOrder {
-            guard let sig = semResult.functions[fnName], sig.bodyNode.isValid else { continue }
-            var airFn = AIRFunctionSoA(
-                name: sig.name,
-                returnType: sig.returnType,
-                paramTypes: sig.paramTypes,
-                stackFrameSize: 0
-            )
-            frameSlots = [:]
-
-            let entryBlock = airFn.createBlock()
-            var currentBlock = entryBlock
-
-            // Lower parameters into stack slots
-            for (idx, pName) in sig.paramNames.enumerated() {
-                // Every parameter has a slot, so the frame layout matches the order of declaration
-                let pType = QualType(typeId: sig.paramTypes[idx])
-                let pDecl = idx < sig.paramDecls.count ? sig.paramDecls[idx] : .nilId
-                let absOff = slot(for: pDecl, type: pType, in: &airFn)
-                if !pName.isEmpty {
-                    let pVal = ValueId.instResult(airFn.appendInstruction(
-                        opcode: .param,
-                        type: pType.typeId,
-                        aux: UInt32(idx),
-                        inBlock: currentBlock
-                    ))
-                    do {
-                        let ptrVal = ValueId.instResult(airFn.appendInstruction(
-                            opcode: .alloca,
-                            type: typePool.pointerTo(pType),
-                            aux: absOff,
-                            inBlock: currentBlock
-                        ))
-                        _ = airFn.appendInstruction(
-                            opcode: .store,
-                            type: .void,
-                            op0: pVal,
-                            op1: ptrVal,
-                            inBlock: currentBlock
-                        )
-                    }
-                }
-            }
-
-            // Lower function body
-            lowerStatement(sig.bodyNode, airFn: &airFn, currentBlock: &currentBlock)
-
-            // Ensure block ends with a terminator if open
-            if currentBlock.isValid {
-                _ = airFn.appendInstruction(
-                    opcode: .ret,
-                    type: .void,
-                    op0: .nilId,
-                    inBlock: currentBlock
-                )
-            }
-            // 16-byte align the stack frame
-            airFn.stackFrameSize = (airFn.stackFrameSize + 15) & ~15
-
-            module.addFunction(consume airFn)
-        }
-
-        return consume module
-    }
-
-    /// The frame offset of a parameter's or local's slot: assigned on first use, 8-byte aligned, at least 8 bytes.
-    private mutating func slot(for decl: DeclId, type: QualType, in airFn: inout AIRFunctionSoA) -> UInt32 {
-        if decl.isValid, let existing = frameSlots[decl] { return existing }
-        let size = max(8, typePool.size(of: type.typeId))
-        airFn.stackFrameSize += Int32((size + 7) & ~7)
-        let offset = UInt32(airFn.stackFrameSize)
-        if decl.isValid { frameSlots[decl] = offset }
-        return offset
-    }
-
-    private mutating func lowerStatement(
-        _ stmtNode: NodeId,
-        airFn: inout AIRFunctionSoA,
-        currentBlock: inout BlockId
-    ) {
-        guard currentBlock.isValid else { return }
-        let kind = tree.pointee.kind(of: stmtNode)
-
-        switch kind {
-        case .compoundStmt:
-            for child in tree.pointee.children(of: stmtNode) {
-                lowerStatement(child, airFn: &airFn, currentBlock: &currentBlock)
-            }
-
-        case .varDecl:
-            // Children: `declSpecs`, then each `declarator` followed by its initializer, if any
-            let children = tree.pointee.children(of: stmtNode)
-            for (idx, declarator) in children.enumerated() where tree.pointee.kind(of: declarator) == .declarator {
-                var initVal: ValueId? = nil
-                if idx + 1 < children.count, tree.pointee.kind(of: children[idx + 1]) != .declarator,
-                   tree.pointee.kind(of: children[idx + 1]) != .attributeSpec {
-                    initVal = lowerExpression(children[idx + 1], airFn: &airFn, currentBlock: &currentBlock)
-                }
-                guard let sym = semResult.symbolRefs[declarator] else { continue }
-                switch sym.storage {
-                case .local, .staticLocal: break
-                default: continue
-                }
-                let absOff = slot(for: sym.declId, type: sym.type, in: &airFn)
-                let ptrVal = ValueId.instResult(airFn.appendInstruction(
-                    opcode: .alloca,
-                    type: typePool.pointerTo(sym.type),
-                    aux: absOff,
-                    inBlock: currentBlock
-                ))
-                if let val = initVal {
-                    _ = airFn.appendInstruction(
-                        opcode: .store,
-                        type: .void,
-                        op0: val,
-                        op1: ptrVal,
-                        inBlock: currentBlock
-                    )
-                }
-            }
-
-        case .returnStmt:
-            let children = tree.pointee.children(of: stmtNode)
-            var retVal: ValueId = .nilId
-            if let expr = children.first {
-                retVal = lowerExpression(expr, airFn: &airFn, currentBlock: &currentBlock)
-            }
-            _ = airFn.appendInstruction(
-                opcode: .ret,
-                type: .void,
-                op0: retVal,
-                inBlock: currentBlock
-            )
-            currentBlock = .nilId // Block is terminated
-
-        case .ifStmt:
-            let children = tree.pointee.children(of: stmtNode)
-            guard children.count >= 2 else { return }
-            let condVal = lowerExpression(children[0], airFn: &airFn, currentBlock: &currentBlock)
-
-            let thenBlock = airFn.createBlock()
-            let mergeBlock = airFn.createBlock()
-            let elseBlock = children.count >= 3 ? airFn.createBlock() : mergeBlock
-
-            _ = airFn.appendInstruction(
-                opcode: .cond_br,
-                type: .void,
-                op0: condVal,
-                op1: ValueId(elseBlock.rawIndex),
-                aux: thenBlock.rawIndex,
-                inBlock: currentBlock
-            )
-
-            // Then branch
-            var thenCurrent = thenBlock
-            lowerStatement(children[1], airFn: &airFn, currentBlock: &thenCurrent)
-            if thenCurrent.isValid {
-                _ = airFn.appendInstruction(
-                    opcode: .br,
-                    type: .void,
-                    aux: mergeBlock.rawIndex,
-                    inBlock: thenCurrent
-                )
-            }
-
-            // Else branch if present
-            if children.count >= 3 {
-                var elseCurrent = elseBlock
-                lowerStatement(children[2], airFn: &airFn, currentBlock: &elseCurrent)
-                if elseCurrent.isValid {
-                    _ = airFn.appendInstruction(
-                        opcode: .br,
-                        type: .void,
-                        aux: mergeBlock.rawIndex,
-                        inBlock: elseCurrent
-                    )
-                }
-            }
-
-            currentBlock = mergeBlock
-
-        case .whileStmt:
-            let children = tree.pointee.children(of: stmtNode)
-            guard children.count >= 2 else { return }
-
-            let headerBlock = airFn.createBlock()
-            let bodyBlock = airFn.createBlock()
-            let exitBlock = airFn.createBlock()
-
-            _ = airFn.appendInstruction(
-                opcode: .br,
-                type: .void,
-                aux: headerBlock.rawIndex,
-                inBlock: currentBlock
-            )
-
-            // Header (Condition test)
-            var headerCurrent = headerBlock
-            let condVal = lowerExpression(children[0], airFn: &airFn, currentBlock: &headerCurrent)
-            _ = airFn.appendInstruction(
-                opcode: .cond_br,
-                type: .void,
-                op0: condVal,
-                op1: ValueId(exitBlock.rawIndex),
-                aux: bodyBlock.rawIndex,
-                inBlock: headerCurrent
-            )
-
-            // Loop body
-            var bodyCurrent = bodyBlock
-            lowerStatement(children[1], airFn: &airFn, currentBlock: &bodyCurrent)
-            if bodyCurrent.isValid {
-                _ = airFn.appendInstruction(
-                    opcode: .br,
-                    type: .void,
-                    aux: headerBlock.rawIndex,
-                    inBlock: bodyCurrent
-                )
-            }
-
-            currentBlock = exitBlock
-
-        case .exprStmt:
-            let children = tree.pointee.children(of: stmtNode)
-            if let expr = children.first {
-                _ = lowerExpression(expr, airFn: &airFn, currentBlock: &currentBlock)
-            }
-
-        default:
-            break
-        }
-    }
-
-    private mutating func lowerExpression(
-        _ exprNode: NodeId,
-        airFn: inout AIRFunctionSoA,
-        currentBlock: inout BlockId
-    ) -> ValueId {
-        let kind = tree.pointee.kind(of: exprNode)
-        let exprType = semResult.nodeTypes[exprNode] ?? .int
-
-        switch kind {
-        case .intLiteral:
-            let tok = tree.pointee.token(of: exprNode)
-            let txt = spelling(of: tok)
-            let val = CLiteral.integerValue(txt)?.value ?? 0
-            if val > UInt64(UInt32.max) {
-                let inst = airFn.appendInstruction(
-                    opcode: .iconst64,
-                    type: exprType,
-                    op0: ValueId(UInt32(val >> 32)),
-                    aux: UInt32(truncatingIfNeeded: val),
-                    inBlock: currentBlock
-                )
-                return ValueId.instResult(inst)
+    /// Emits the external definitions, then, as Clang does, the internal ones (`static` functions and objects,
+    /// block-scope statics, compound literals) that something emitted refers to, transitively. Inline-only
+    /// definitions are not emitted.
+    public func run() {
+        module.moduleAsm = sem.moduleAsm
+        for g in sem.globals {
+            if g.isExternal {
+                if module.symbol(named: g.symbol) == nil { objectQueue.append((g, addObject(g))) }
+                declSymbols[g.declId] = module.symbol(named: g.symbol)
             } else {
-                let inst = airFn.appendInstruction(
-                    opcode: .iconst,
-                    type: exprType,
-                    aux: UInt32(truncatingIfNeeded: val),
-                    inBlock: currentBlock
-                )
-                return ValueId.instResult(inst)
+                pendingObjects[g.declId] = g
             }
-
-        case .charLiteral:
-            let tok = tree.pointee.token(of: exprNode)
-            let txt = spelling(of: tok)
-            var b: UInt8 = 0
-            if txt.count >= 3 && txt.hasPrefix("'") && txt.hasSuffix("'") {
-                let inner = txt.dropFirst().dropLast()
-                b = inner.utf8.first ?? 0
+        }
+        for f in sem.functions where !f.isInlineOnly {
+            if f.isExternal {
+                functionQueue.append((f, addFunction(f)))
+            } else {
+                pendingFunctions[f.declId] = f
             }
-            let inst = airFn.appendInstruction(
-                opcode: .iconst,
-                type: .char,
-                aux: UInt32(b),
-                inBlock: currentBlock
-            )
-            return ValueId.instResult(inst)
-
-        case .stringLiteral:
-            let tok = tree.pointee.token(of: exprNode)
-            let unescaped = CLiteral.unescapedString(CLiteral.body(of: spelling(of: tok), quote: "\""))
-            let idx = semResult.stringLiterals[unescaped] ?? 0
-            let inst = airFn.appendInstruction(
-                opcode: .stringConst,
-                type: typePool.pointerTo(.char),
-                aux: UInt32(idx),
-                inBlock: currentBlock
-            )
-            return ValueId.instResult(inst)
-
-        case .identExpr:
-            if let sym = semResult.symbolRefs[exprNode] {
-                switch sym.storage {
-                case .local, .staticLocal, .param:
-                    let absOff = slot(for: sym.declId, type: sym.type, in: &airFn)
-                    let ptrInst = airFn.appendInstruction(
-                        opcode: .alloca,
-                        type: typePool.pointerTo(sym.type),
-                        aux: absOff,
-                        inBlock: currentBlock
-                    )
-                    let loadInst = airFn.appendInstruction(
-                        opcode: .load,
-                        type: sym.type.typeId,
-                        op0: ValueId.instResult(ptrInst),
-                        inBlock: currentBlock
-                    )
-                    return ValueId.instResult(loadInst)
-                case .global:
-                    hasLoweringError = true
-                default:
-                    break
+        }
+        for g in sem.globals {
+            for r in g.image?.relocations ?? [] {
+                if case .label(let fn, let label) = r.target { staticLabelAddresses[sem.symbolName(of: fn), default: []].insert(label) }
+            }
+        }
+        while !functionQueue.isEmpty || !objectQueue.isEmpty {
+            if let (g, s) = objectQueue.popLast() {
+                // The image's relocations may name internal definitions, which this emits in turn
+                guard let image = g.image else {
+                    report("", "no data image for '\(g.symbol)': \(g.unsupportedReason)")
+                    continue
                 }
+                module.symbols[s].image = convert(image, of: g.symbol)
+                // An initialized flexible array member makes the object larger than its type (GNU)
+                module.symbols[s].size = max(module.symbols[s].size, image.bytes.count)
+                continue
             }
-            return .nilId
+            let (f, s) = functionQueue.removeFirst()
+            var lowering = FunctionLowering(self, f, symbol: s)
+            let function = lowering.lower()
+            module.functions.append(AIRFunctionBox(function))
+            module.symbols[s].function = module.functions.count - 1
+        }
+        resolveLabelRelocations()
+    }
 
-        case .assignExpr:
-            let children = tree.pointee.children(of: exprNode)
-            guard children.count == 2 else { return .nilId }
-            let lhs = children[0]
-            let rhs = children[1]
-            var rhsVal = lowerExpression(rhs, airFn: &airFn, currentBlock: &currentBlock)
-            let assignOp = CTokenKind(rawValue: tokens.pointee.kind(of: tree.pointee.token(of: exprNode))) ?? .equal
-            let compoundOp = Self.compoundAssignmentOpcode(assignOp)
+    private func addObject(_ g: SemGlobal) -> Int {
+        let isLocal = sem.staticSymbols[g.declId] != nil
+        let s = module.add(AIRSymbol(
+            name: isLocal ? module.uniqueName(g.symbol) : g.symbol, kind: .object, linkage: g.isExternal ? .external : .internal,
+            isThreadLocal: g.isThreadLocal, isConstant: isConstant(g.type), cType: g.type, size: typePool.size(of: g.type.typeId),
+            alignment: g.alignment, isTentative: g.isTentative, image: nil, function: nil))
+        declSymbols[g.declId] = s
+        return s
+    }
 
-            /// For `lhs op= rhs`: loads the current value through `ptr` and combines it with `rhs`.
-            func combine(withValueAt ptr: ValueId, lhsType: TypeId, airFn: inout AIRFunctionSoA, block: BlockId) -> ValueId {
-                guard let op = compoundOp else { return rhsVal }
-                let cur = ValueId.instResult(airFn.appendInstruction(opcode: .load, type: lhsType, op0: ptr, inBlock: block))
-                var r = rhsVal
-                if (op == .add || op == .sub) && typePool.isPointer(type: lhsType) {
-                    let sz = typePool.size(of: typePool.pointeeType(of: lhsType).typeId)
-                    if sz > 1 {
-                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: block))
-                        r = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: r, op1: szVal, inBlock: block))
-                    }
-                }
-                return ValueId.instResult(airFn.appendInstruction(opcode: op, type: lhsType, op0: cur, op1: r, inBlock: block))
+    private func addFunction(_ f: SemFunction) -> Int {
+        let name = sem.symbolName(of: f.declId)
+        let s: Int
+        if let existing = module.symbol(named: name) {
+            module.symbols[existing].linkage = f.isExternal ? .external : .internal
+            s = existing
+        } else {
+            s = module.add(AIRSymbol(
+                name: name, kind: .function, linkage: f.isExternal ? .external : .internal, isThreadLocal: false, isConstant: true,
+                cType: sem.declTable.type(of: f.declId), size: 0, alignment: 1, isTentative: false, image: nil, function: nil))
+        }
+        declSymbols[f.declId] = s
+        return s
+    }
+
+    /// Relocations to label addresses, once every function is lowered.
+    private var labelRelocations: [(symbol: Int, index: Int, function: Int, label: UInt32)] = []
+
+    private func resolveLabelRelocations() {
+        for r in labelRelocations {
+            guard let index = module.symbols[r.function].function,
+                  let block = module.functions[index].function.labelBlocks[r.label],
+                  var image = module.symbols[r.symbol].image else {
+                report("", "'\(module.symbols[r.symbol].name)': the address of label \(r.label) of '\(module.symbols[r.function].name)' has no block")
+                continue
             }
-
-            if tree.pointee.kind(of: lhs) == .identExpr, let sym = semResult.symbolRefs[lhs] {
-                switch sym.storage {
-                case .local, .staticLocal, .param:
-                    let absOff = slot(for: sym.declId, type: sym.type, in: &airFn)
-                    let ptrInst = airFn.appendInstruction(
-                        opcode: .alloca,
-                        type: typePool.pointerTo(sym.type),
-                        aux: absOff,
-                        inBlock: currentBlock
-                    )
-                    rhsVal = combine(withValueAt: ValueId.instResult(ptrInst), lhsType: sym.type.typeId, airFn: &airFn, block: currentBlock)
-                    _ = airFn.appendInstruction(
-                        opcode: .store,
-                        type: .void,
-                        op0: rhsVal,
-                        op1: ValueId.instResult(ptrInst),
-                        inBlock: currentBlock
-                    )
-                    return rhsVal
-                default:
-                    break
-                }
-            } else if tree.pointee.kind(of: lhs) == .unaryExpr {
-                // Check if dereference: *p = val
-                let opTok = tree.pointee.token(of: lhs)
-                let opKind = CTokenKind(rawValue: tokens.pointee.kind(of: opTok))
-                if opKind == .star, let ptrExpr = tree.pointee.children(of: lhs).first {
-                    let ptrVal = lowerExpression(ptrExpr, airFn: &airFn, currentBlock: &currentBlock)
-                    if compoundOp != nil, let lhsType = semResult.nodeTypes[lhs] {
-                        rhsVal = combine(withValueAt: ptrVal, lhsType: lhsType, airFn: &airFn, block: currentBlock)
-                    }
-                    _ = airFn.appendInstruction(
-                        opcode: .store,
-                        type: .void,
-                        op0: rhsVal,
-                        op1: ptrVal,
-                        inBlock: currentBlock
-                    )
-                    return rhsVal
-                }
-            }
-            return rhsVal
-
-        case .binaryExpr:
-            let children = tree.pointee.children(of: exprNode)
-            guard children.count == 2 else { return .nilId }
-            let opTok = tree.pointee.token(of: exprNode)
-            let opKind = CTokenKind(rawValue: tokens.pointee.kind(of: opTok)) ?? .errorToken
-
-            // Handle short-circuiting && and ||
-            if opKind == .ampAmp {
-                // a && b
-                airFn.stackFrameSize += 8
-                let slotOffset = UInt32(airFn.stackFrameSize)
-                let resSlot = airFn.appendInstruction(opcode: .alloca, type: .int, aux: slotOffset, inBlock: currentBlock)
-                let zeroVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: 0, inBlock: currentBlock))
-                _ = airFn.appendInstruction(opcode: .store, type: .void, op0: zeroVal, op1: ValueId.instResult(resSlot), inBlock: currentBlock)
-
-                let evalRhsBlock = airFn.createBlock()
-                let mergeBlock = airFn.createBlock()
-
-                let v0 = lowerExpression(children[0], airFn: &airFn, currentBlock: &currentBlock)
-                let cond0 = airFn.appendInstruction(opcode: .icmp_ne, type: .int, op0: v0, op1: zeroVal, inBlock: currentBlock)
-                _ = airFn.appendInstruction(
-                    opcode: .cond_br,
-                    type: .void,
-                    op0: ValueId.instResult(cond0),
-                    op1: ValueId(mergeBlock.rawIndex),
-                    aux: evalRhsBlock.rawIndex,
-                    inBlock: currentBlock
-                )
-
-                currentBlock = evalRhsBlock
-                let v1 = lowerExpression(children[1], airFn: &airFn, currentBlock: &currentBlock)
-                let cond1 = airFn.appendInstruction(opcode: .icmp_ne, type: .int, op0: v1, op1: zeroVal, inBlock: currentBlock)
-                _ = airFn.appendInstruction(opcode: .store, type: .void, op0: ValueId.instResult(cond1), op1: ValueId.instResult(resSlot), inBlock: currentBlock)
-                _ = airFn.appendInstruction(
-                    opcode: .br,
-                    type: .void,
-                    aux: mergeBlock.rawIndex,
-                    inBlock: currentBlock
-                )
-
-                currentBlock = mergeBlock
-                let finalVal = airFn.appendInstruction(opcode: .load, type: .int, op0: ValueId.instResult(resSlot), inBlock: currentBlock)
-                return ValueId.instResult(finalVal)
-            }
-
-            if opKind == .pipePipe {
-                // a || b
-                airFn.stackFrameSize += 8
-                let slotOffset = UInt32(airFn.stackFrameSize)
-                let resSlot = airFn.appendInstruction(opcode: .alloca, type: .int, aux: slotOffset, inBlock: currentBlock)
-                let oneVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: 1, inBlock: currentBlock))
-                let zeroVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: 0, inBlock: currentBlock))
-                _ = airFn.appendInstruction(opcode: .store, type: .void, op0: oneVal, op1: ValueId.instResult(resSlot), inBlock: currentBlock)
-
-                let evalRhsBlock = airFn.createBlock()
-                let mergeBlock = airFn.createBlock()
-
-                let v0 = lowerExpression(children[0], airFn: &airFn, currentBlock: &currentBlock)
-                let cond0 = airFn.appendInstruction(opcode: .icmp_ne, type: .int, op0: v0, op1: zeroVal, inBlock: currentBlock)
-                _ = airFn.appendInstruction(
-                    opcode: .cond_br,
-                    type: .void,
-                    op0: ValueId.instResult(cond0),
-                    op1: ValueId(evalRhsBlock.rawIndex),
-                    aux: mergeBlock.rawIndex,
-                    inBlock: currentBlock
-                )
-
-                currentBlock = evalRhsBlock
-                let v1 = lowerExpression(children[1], airFn: &airFn, currentBlock: &currentBlock)
-                let cond1 = airFn.appendInstruction(opcode: .icmp_ne, type: .int, op0: v1, op1: zeroVal, inBlock: currentBlock)
-                _ = airFn.appendInstruction(opcode: .store, type: .void, op0: ValueId.instResult(cond1), op1: ValueId.instResult(resSlot), inBlock: currentBlock)
-                _ = airFn.appendInstruction(
-                    opcode: .br,
-                    type: .void,
-                    aux: mergeBlock.rawIndex,
-                    inBlock: currentBlock
-                )
-
-                currentBlock = mergeBlock
-                let finalVal = airFn.appendInstruction(opcode: .load, type: .int, op0: ValueId.instResult(resSlot), inBlock: currentBlock)
-                return ValueId.instResult(finalVal)
-            }
-
-            let t0 = semResult.nodeTypes[children[0]] ?? .int
-            let t1 = semResult.nodeTypes[children[1]] ?? .int
-            var v0 = lowerExpression(children[0], airFn: &airFn, currentBlock: &currentBlock)
-            var v1 = lowerExpression(children[1], airFn: &airFn, currentBlock: &currentBlock)
-
-            // Pointer arithmetic element size scaling
-            if opKind == .plus {
-                if typePool.isPointer(type: t0) {
-                    let elem = typePool.pointeeType(of: t0)
-                    let sz = typePool.size(of: elem.typeId)
-                    if sz > 1 {
-                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
-                        v1 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v1, op1: szVal, inBlock: currentBlock))
-                    }
-                } else if typePool.isPointer(type: t1) {
-                    let elem = typePool.pointeeType(of: t1)
-                    let sz = typePool.size(of: elem.typeId)
-                    if sz > 1 {
-                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
-                        v0 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v0, op1: szVal, inBlock: currentBlock))
-                    }
-                }
-            } else if opKind == .minus {
-                if typePool.isPointer(type: t0) && typePool.isPointer(type: t1) {
-                    let elem = typePool.pointeeType(of: t0)
-                    let sz = typePool.size(of: elem.typeId)
-                    let diff = airFn.appendInstruction(opcode: .sub, type: .int, op0: v0, op1: v1, inBlock: currentBlock)
-                    if sz > 1 {
-                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
-                        let scaled = airFn.appendInstruction(opcode: .sdiv, type: .int, op0: ValueId.instResult(diff), op1: szVal, inBlock: currentBlock)
-                        return ValueId.instResult(scaled)
-                    }
-                    return ValueId.instResult(diff)
-                } else if typePool.isPointer(type: t0) {
-                    let elem = typePool.pointeeType(of: t0)
-                    let sz = typePool.size(of: elem.typeId)
-                    if sz > 1 {
-                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: currentBlock))
-                        v1 = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: v1, op1: szVal, inBlock: currentBlock))
-                    }
-                }
-            }
-
-            let airOp: AIROpcode
-            switch opKind {
-            case .plus: airOp = .add
-            case .minus: airOp = .sub
-            case .star: airOp = .mul
-            case .slash: airOp = .sdiv
-            case .percent: airOp = .srem
-            case .amp: airOp = .band
-            case .pipe: airOp = .bor
-            case .caret: airOp = .bxor
-            case .lessLess: airOp = .shl
-            case .greaterGreater: airOp = .shr
-            case .equalEqual: airOp = .icmp_eq
-            case .exclaimEqual: airOp = .icmp_ne
-            case .less: airOp = .icmp_slt
-            case .lessEqual: airOp = .icmp_sle
-            case .greater: airOp = .icmp_sgt
-            case .greaterEqual: airOp = .icmp_sge
-            default: airOp = .add
-            }
-
-            let inst = airFn.appendInstruction(
-                opcode: airOp,
-                type: exprType,
-                op0: v0,
-                op1: v1,
-                inBlock: currentBlock
-            )
-            return ValueId.instResult(inst)
-
-        case .unaryExpr:
-            let children = tree.pointee.children(of: exprNode)
-            guard let child = children.first else { return .nilId }
-            let opTok = tree.pointee.token(of: exprNode)
-            let opKind = CTokenKind(rawValue: tokens.pointee.kind(of: opTok)) ?? .errorToken
-
-            switch opKind {
-            case .minus:
-                let v = lowerExpression(child, airFn: &airFn, currentBlock: &currentBlock)
-                let zeroInst = airFn.appendInstruction(
-                    opcode: .iconst,
-                    type: exprType,
-                    aux: 0,
-                    inBlock: currentBlock
-                )
-                let subInst = airFn.appendInstruction(
-                    opcode: .sub,
-                    type: exprType,
-                    op0: ValueId.instResult(zeroInst),
-                    op1: v,
-                    inBlock: currentBlock
-                )
-                return ValueId.instResult(subInst)
-
-            case .exclaim:
-                let v = lowerExpression(child, airFn: &airFn, currentBlock: &currentBlock)
-                let zeroInst = airFn.appendInstruction(
-                    opcode: .iconst,
-                    type: exprType,
-                    aux: 0,
-                    inBlock: currentBlock
-                )
-                let eqInst = airFn.appendInstruction(
-                    opcode: .icmp_eq,
-                    type: .int,
-                    op0: v,
-                    op1: ValueId.instResult(zeroInst),
-                    inBlock: currentBlock
-                )
-                return ValueId.instResult(eqInst)
-
-            case .tilde:
-                let v = lowerExpression(child, airFn: &airFn, currentBlock: &currentBlock)
-                let negOne = airFn.appendInstruction(
-                    opcode: .iconst,
-                    type: exprType,
-                    aux: 0xFFFF_FFFF,
-                    inBlock: currentBlock
-                )
-                let xorInst = airFn.appendInstruction(
-                    opcode: .bxor,
-                    type: exprType,
-                    op0: v,
-                    op1: ValueId.instResult(negOne),
-                    inBlock: currentBlock
-                )
-                return ValueId.instResult(xorInst)
-
-            case .amp: // address-of &x
-                if tree.pointee.kind(of: child) == .identExpr, let sym = semResult.symbolRefs[child] {
-                    switch sym.storage {
-                    case .local, .staticLocal, .param:
-                        let absOff = slot(for: sym.declId, type: sym.type, in: &airFn)
-                        let ptrInst = airFn.appendInstruction(
-                            opcode: .alloca,
-                            type: typePool.pointerTo(sym.type),
-                            aux: absOff,
-                            inBlock: currentBlock
-                        )
-                        return ValueId.instResult(ptrInst)
-                    default:
-                        break
-                    }
-                }
-                return .nilId
-
-            case .star: // dereference *p
-                let ptrVal = lowerExpression(child, airFn: &airFn, currentBlock: &currentBlock)
-                let loadInst = airFn.appendInstruction(
-                    opcode: .load,
-                    type: exprType,
-                    op0: ptrVal,
-                    inBlock: currentBlock
-                )
-                return ValueId.instResult(loadInst)
-
-            default:
-                return lowerExpression(child, airFn: &airFn, currentBlock: &currentBlock)
-            }
-
-        case .callExpr:
-            let children = tree.pointee.children(of: exprNode)
-            guard children.count >= 1 else { return .nilId }
-            let calleeNode = children[0]
-            let calleeTok = tree.pointee.token(of: calleeNode)
-            let calleeName = spelling(of: calleeTok)
-
-            var argVals: [ValueId] = []
-            if children.count > 1 {
-                let argListNode = children[1]
-                for arg in tree.pointee.children(of: argListNode) {
-                    let v = lowerExpression(arg, airFn: &airFn, currentBlock: &currentBlock)
-                    argVals.append(v)
-                }
-            }
-
-            // Put args into extra operands
-            let extraStart = airFn.extra.count
-            for arg in argVals {
-                _ = airFn.appendExtra(arg)
-            }
-
-            // Aux encodes: high 16 bits = arg count, low 16 bits = deterministic callee ID
-            let calleeId = deterministicCalleeId(calleeName)
-            let auxVal = (UInt32(argVals.count) << 16) | (calleeId & 0xFFFF)
-
-            let callInst = airFn.appendInstruction(
-                opcode: .call,
-                type: exprType,
-                op0: ValueId(extraStart),
-                aux: auxVal,
-                inBlock: currentBlock
-            )
-            return ValueId.instResult(callInst)
-
-        default:
-            return .nilId
+            let old = image.relocations[r.index]
+            image.relocations[r.index] = AIRDataImage.Relocation(offset: old.offset, size: old.size, target: .block(function: index, block: block),
+                                                                 addend: old.addend)
+            module.symbols[r.symbol].image = image
         }
     }
 
-    private func deterministicCalleeId(_ name: String) -> UInt32 {
-        if name == "write" { return 1 }
-        if name == "exit" { return 2 }
-        for (idx, fn) in semResult.functionOrder.enumerated() {
-            if fn == name {
-                return UInt32(3 + idx)
+    /// Whether an object of `type` is read-only: const-qualified, or an array of const-qualified elements.
+    func isConstant(_ type: QualType) -> Bool {
+        if type.isConst { return true }
+        if case .array(let element, _) = typePool.typeInfo(of: typePool.canonical(of: type.typeId)).kind { return isConstant(element) }
+        if case .typedef(_, let underlying) = typePool.typeInfo(of: type.typeId).kind { return isConstant(underlying) }
+        return false
+    }
+
+    private func convert(_ image: DataImage, of name: String) -> AIRDataImage {
+        var relocations: [AIRDataImage.Relocation] = []
+        let objectSymbol = module.symbol(named: name) ?? -1
+        for r in image.relocations {
+            let target: AIRDataImage.Target
+            switch r.target {
+            case .decl(let d):
+                target = .symbol(symbol(for: d))
+            case .string(let i):
+                target = .symbol(staticStringSymbol(i))
+            case .label(let fn, let label):
+                // Resolved when the function is lowered
+                let s = symbol(for: fn)
+                labelRelocations.append((objectSymbol, relocations.count, s, label))
+                target = .symbol(s)
+            }
+            relocations.append(AIRDataImage.Relocation(offset: r.offset, size: r.size, target: target, addend: r.addend))
+        }
+        return AIRDataImage(bytes: image.bytes, relocations: relocations)
+    }
+
+    // MARK: - Symbols
+
+    /// The symbol of an object or function: its definition, or an undefined symbol for a declaration.
+    func symbol(for decl: DeclId) -> Int {
+        if let s = declSymbols[decl] { return s }
+        let name = sem.symbolName(of: decl)
+        // An internal definition referred to for the first time is emitted (a file-scope one may be referred to
+        // through another declaration of the same name)
+        if let g = pendingObjects.removeValue(forKey: decl) ?? pendingDefinition(named: name, in: \.pendingObjects) {
+            let s = addObject(g)
+            objectQueue.append((g, s))
+            declSymbols[decl] = s
+            return s
+        }
+        if let f = pendingFunctions.removeValue(forKey: decl) ?? pendingDefinition(named: name, in: \.pendingFunctions) {
+            let s = addFunction(f)
+            functionQueue.append((f, s))
+            declSymbols[decl] = s
+            return s
+        }
+        let s: Int
+        if sem.staticSymbols[decl] == nil, let existing = module.symbol(named: name) {
+            s = existing
+        } else {
+            let type = sem.declTable.type(of: decl)
+            let isFunction = sem.declTable.kind(of: decl) == .function
+            let complete = !type.isError && typePool.isComplete(type.typeId) && !isFunction
+            s = module.add(AIRSymbol(
+                name: sem.staticSymbols[decl] != nil ? module.uniqueName(name) : name, kind: isFunction ? .function : .object,
+                linkage: .undefined, isThreadLocal: sem.attributes(of: decl).isThreadLocal, isConstant: isConstant(type), cType: type,
+                size: complete ? typePool.size(of: type.typeId) : 0, alignment: complete ? typePool.alignment(of: type.typeId) : 1,
+                isTentative: false, image: nil, function: nil))
+        }
+        declSymbols[decl] = s
+        return s
+    }
+
+    /// A pending file-scope definition with symbol `name` (not a block-scope static, whose name is not its symbol).
+    private func pendingDefinition<T>(named name: String, in table: ReferenceWritableKeyPath<AIRLowering, [DeclId: T]>) -> T? {
+        guard let entry = self[keyPath: table].first(where: { sem.staticSymbols[$0.key] == nil && sem.symbolName(of: $0.key) == name }) else {
+            return nil
+        }
+        self[keyPath: table][entry.key] = nil
+        return entry.value
+    }
+
+    /// The symbol of a string literal of a function body: a read-only object `.str`, `.str.1`, ... (one per contents).
+    func stringSymbol(_ value: StringConstant) -> Int {
+        if let s = stringSymbols[value] { return s }
+        let s = addString(value)
+        stringSymbols[value] = s
+        return s
+    }
+
+    private func staticStringSymbol(_ index: Int) -> Int {
+        if let s = staticStringSymbols[index] { return s }
+        let s = stringSymbol(sem.staticStrings[index])
+        staticStringSymbols[index] = s
+        return s
+    }
+
+    private func addString(_ value: StringConstant) -> Int {
+        let element: TypeId
+        switch value.elementSize {
+        case 2: element = .ushort
+        case 4: element = .uint
+        default: element = .char
+        }
+        let type = QualType(typeId: typePool.arrayType(elementType: QualType(typeId: element).withConst(),
+                                                         count: UInt64(value.bytes.count / max(1, value.elementSize))))
+        return module.add(AIRSymbol(
+            name: module.uniqueName(".str"), kind: .object, linkage: .internal, isThreadLocal: false, isConstant: true, cType: type,
+            size: value.bytes.count, alignment: value.elementSize, isTentative: false,
+            image: AIRDataImage(bytes: value.bytes, relocations: []), function: nil))
+    }
+
+    /// A library function a builtin becomes (`memcpy`, `sqrt`, ...), declared with its C type.
+    func librarySymbol(_ name: String, returns: QualType, params: [QualType]) -> (symbol: Int, type: TypeId) {
+        let type: TypeId
+        if let t = libraryTypes[name] { type = t } else {
+            type = typePool.functionType(returnType: returns, paramTypes: params)
+            libraryTypes[name] = type
+        }
+        if let s = module.symbol(named: name) { return (s, type) }
+        let s = module.add(AIRSymbol(name: name, kind: .function, linkage: .undefined, isThreadLocal: false, isConstant: true,
+                                     cType: QualType(typeId: type), size: 0, alignment: 1, isTentative: false, image: nil, function: nil))
+        return (s, type)
+    }
+}
+
+/// Where an lvalue designates: memory at an address, or a bit-field in a storage unit.
+enum AIRLValue {
+    case memory(address: ValueId, alignment: Int, isVolatile: Bool)
+    case bitField(unit: ValueId, unitBytes: Int, bitOffset: Int, width: Int, isSigned: Bool, alignment: Int, isVolatile: Bool)
+}
+
+/// Lowers one function body.
+struct FunctionLowering {
+    let parent: AIRLowering
+    let sem: SemModule
+    let function: SemFunction
+    let symbol: Int
+    let c: SemInstBlockContainer
+    var b = AIRBuilder()
+    var typePool: TypePool { sem.typePool }
+    var module: AIRModule { parent.module }
+    let layout: DataLayout
+
+    var paramTypes: [AIRType] = []
+    var paramIsAggregate: [Bool] = []
+    var returnCType: QualType = .void
+
+    /// The home of each local object and parameter: its address, and its alignment.
+    var locals: [DeclId: (address: ValueId, alignment: Int)] = [:]
+    /// A VLA object's address is stored in a slot when its declaration is reached.
+    var vlaObjects: [DeclId: ValueId] = [:]
+    /// The slot holding the length (`i64`) of each VLA type, stored where the type's size expression is evaluated.
+    var vlaLengths: [TypeId: ValueId] = [:]
+    /// The block of each label.
+    var labels: [UInt32: BlockId] = [:]
+    /// The VLA declarations in scope at each label, outermost first (`vlaChain`).
+    var labelChains: [UInt32: [SemInstId]] = [:]
+    /// The VLA declarations in scope here, outermost first, and the slot each one saved the stack pointer in before
+    /// allocating.
+    var vlaChain: [SemInstId] = []
+    var vlaSaves: [SemInstId: ValueId] = [:]
+
+    struct JumpTarget {
+        let breakBlock: BlockId
+        let continueBlock: BlockId?
+        let vlaDepth: Int
+    }
+    var jumpTargets: [JumpTarget] = []
+    /// The block of each `case`/`default` label of the enclosing `switch` statements.
+    var caseBlocks: [SemInstId: BlockId] = [:]
+    /// `indirectBr`s, given the address-taken blocks when the body is done.
+    var indirectBranches: [ValueId] = []
+
+    init(_ parent: AIRLowering, _ function: SemFunction, symbol: Int) {
+        self.parent = parent
+        self.sem = parent.sem
+        self.function = function
+        self.symbol = symbol
+        self.c = parent.sem.block(function.blockId)
+        self.layout = parent.sem.typePool.dataLayout
+    }
+
+    func report(_ message: String) {
+        parent.report(function.name, message)
+    }
+
+    // MARK: - Types
+
+    func canonicalKind(_ t: QualType) -> CTypeKind { typePool.typeInfo(of: typePool.canonical(of: t.typeId)).kind }
+
+    /// Whether values of `t` live in memory (structs, unions, arrays; functions are designators).
+    func isAggregate(_ t: QualType) -> Bool {
+        switch canonicalKind(t) {
+        case .struct, .array, .function: return true
+        default: return false
+        }
+    }
+
+    func isVoid(_ t: QualType) -> Bool {
+        if case .void = canonicalKind(t) { return true }
+        return false
+    }
+
+    /// The AIR type of a scalar of C type `t` (`ptr` for an aggregate, which is handled by address).
+    func airType(_ t: QualType) -> AIRType {
+        switch canonicalKind(t) {
+        case .void, .error: return .void
+        case .bool: return .i1
+        case .int(let w, _): return .int(w)
+        case .enum(_, let underlying, _): return airType(QualType(typeId: underlying))
+        case .float(let w): return .float(w)
+        case .pointer, .nullptr, .struct, .array, .function: return .ptr
+        case .typedef(_, let u): return airType(u)
+        }
+    }
+
+    /// The type a scalar of `t` is stored as: its size in bits for integers (`bool` as `i8`, a `_BitInt(N)` in its
+    /// storage), else its value type.
+    func memoryType(_ t: QualType) -> AIRType {
+        let v = airType(t)
+        guard v.isInt else { return v }
+        return .int(max(8, typePool.size(of: t.typeId) * 8))
+    }
+
+    func isSigned(_ t: QualType) -> Bool { typePool.isSignedInteger(type: t.typeId) }
+    func isFloating(_ t: QualType) -> Bool { typePool.isFloating(type: t.typeId) }
+    func isPointer(_ t: QualType) -> Bool {
+        switch canonicalKind(t) {
+        case .pointer, .nullptr: return true
+        default: return false
+        }
+    }
+    func isBool(_ t: QualType) -> Bool { typePool.canonical(of: t.typeId) == .bool }
+    func size(_ t: QualType) -> Int { typePool.size(of: t.typeId) }
+    func alignment(_ t: QualType) -> Int { max(1, typePool.alignment(of: t.typeId)) }
+    func pointee(_ t: QualType) -> QualType { typePool.pointeeType(of: t.typeId) }
+
+    /// The alignment known for an address `offset` bytes past one aligned to `base`.
+    func alignment(_ base: Int, offset: Int) -> Int {
+        offset == 0 ? base : min(base, offset & -offset)
+    }
+
+    // MARK: - Constants
+
+    mutating func const(_ type: AIRType, _ value: Int64) -> ValueId {
+        let n = max(1, (type.width + 63) / 64)
+        var words = [UInt64(bitPattern: value)]
+        for _ in 1..<n { words.append(value < 0 ? ~0 : 0) }
+        return b.constants.intern(type, words)
+    }
+
+    mutating func i64(_ value: Int) -> ValueId { const(.i64, Int64(value)) }
+
+    mutating func floatConst(_ type: AIRType, _ value: FloatConstant) -> ValueId {
+        b.constants.intern(type, [value.lo, value.hi])
+    }
+
+    func floatFormat(_ type: AIRType) -> FloatFormat {
+        switch type.width {
+        case 16: return .half
+        case 32: return .single
+        case 80: return .x87Extended
+        case 128: return .quad
+        default: return .double
+        }
+    }
+
+    mutating func floatConst(_ type: AIRType, _ value: SoftFloat) -> ValueId {
+        floatConst(type, value.constant)
+    }
+
+    mutating func floatOne(_ type: AIRType) -> ValueId {
+        floatConst(type, SoftFloat.parse("1", format: floatFormat(type)) ?? .zero(floatFormat(type)))
+    }
+
+    mutating func zero(_ type: AIRType) -> ValueId {
+        type.isFloat ? floatConst(type, SoftFloat.zero(floatFormat(type))) : (type.isPointer ? nullPointer() : const(type, 0))
+    }
+
+    mutating func nullPointer() -> ValueId { b.constants.intern(.ptr, [0]) }
+
+    // MARK: - Function
+
+    mutating func lower() -> AIRFunction {
+        let fnType = sem.declTable.type(of: function.declId)
+        var cParams: [QualType] = []
+        if case .function(let ret, let params, _) = canonicalKind(fnType) {
+            returnCType = ret
+            cParams = params
+        }
+        paramTypes = cParams.map { airType($0) }
+        paramIsAggregate = cParams.map { isAggregate($0) }
+        let returnsAggregate = isAggregate(returnCType)
+
+        // Parameters: a scalar is stored to its slot; an aggregate is the address of the callee's copy
+        for (i, decl) in function.params.enumerated() where i < cParams.count {
+            let t = sem.declTable.type(of: decl)
+            if paramIsAggregate[i] {
+                locals[decl] = (.parameter(UInt32(i)), alignment(t))
+            } else {
+                let home = slot(for: decl)
+                storeScalar(.parameter(UInt32(i)), to: home.address, type: t, alignment: home.alignment, isVolatile: false)
             }
         }
-        return 0
+
+        let root = c.block.root
+        collectLabelChains(root, chain: [])
+        statement(root)
+
+        // Falling off the end: `main` returns 0 (C23 5.1.2.3.4), other functions an unspecified value
+        if !b.isTerminated {
+            if isVoid(returnCType) {
+                b.emit(.ret)
+            } else if returnsAggregate {
+                let t = temporary(returnCType)
+                b.emit(.ret, .void, t)
+            } else {
+                let t = airType(returnCType)
+                b.emit(.ret, .void, zero(t))
+            }
+        }
+        let targets = b.addressTaken.map(\.rawIndex)
+        for br in indirectBranches { b.setAux(br, b.list(targets)) }
+        let symbolName = module.symbols[symbol].name
+        return b.finish(symbol: symbol, name: symbolName, cType: typePool.canonical(of: fnType.typeId),
+                        returnType: returnsAggregate ? .void : airType(returnCType), returnsAggregate: returnsAggregate,
+                        paramTypes: paramTypes, paramIsAggregate: paramIsAggregate)
+    }
+
+    /// The stack slot of a local object or parameter (created on first use).
+    mutating func slot(for decl: DeclId) -> (address: ValueId, alignment: Int) {
+        if let home = locals[decl] { return home }
+        let t = sem.declTable.type(of: decl)
+        var align = max(alignment(t), sem.objectAlignments[decl] ?? 1)
+        if case .array = canonicalKind(t), sem.objectAlignments[decl] == nil {
+            align = layout.variableAlignment(arraySize: size(t), typeAlignment: align)
+        }
+        let address = b.alloca(size: max(1, size(t)), alignment: align, name: sem.declTable.name(of: decl), decl: decl)
+        locals[decl] = (address, align)
+        return (address, align)
+    }
+
+    /// A temporary stack slot for a value of `t`.
+    mutating func temporary(_ t: QualType) -> ValueId {
+        b.alloca(size: max(1, size(t)), alignment: alignment(t))
+    }
+
+    // MARK: - Memory
+
+    mutating func loadScalar(from address: ValueId, type t: QualType, alignment: Int, isVolatile: Bool) -> ValueId {
+        let v = airType(t), m = memoryType(t)
+        let loaded = b.emit(.load, m, address, aux: AIRMemFlags(alignment: alignment, isVolatile: isVolatile).rawValue)
+        return v == m ? loaded : b.emit(.trunc, v, loaded)
+    }
+
+    mutating func storeScalar(_ value: ValueId, to address: ValueId, type t: QualType, alignment: Int, isVolatile: Bool) {
+        let v = airType(t), m = memoryType(t)
+        let stored = v == m ? value : b.emit(isSigned(t) ? .sext : .zext, m, value)
+        b.emit(.store, .void, stored, address, aux: AIRMemFlags(alignment: alignment, isVolatile: isVolatile).rawValue)
+    }
+
+    mutating func copy(to dst: ValueId, from src: ValueId, size: ValueId, alignment: Int, isVolatile: Bool = false) {
+        let list = b.list([size.rawIndex, AIRMemFlags(alignment: alignment, isVolatile: isVolatile).rawValue])
+        b.emit(.copy, .void, dst.rawIndex, src.rawIndex, aux: list)
+    }
+
+    mutating func fill(_ dst: ValueId, byte: UInt8 = 0, size: ValueId, alignment: Int) {
+        let list = b.list([size.rawIndex, AIRMemFlags(alignment: alignment).rawValue])
+        let value = const(.i8, Int64(byte))
+        b.emit(.fill, .void, dst.rawIndex, value.rawIndex, aux: list)
+    }
+
+    mutating func offset(_ address: ValueId, by bytes: Int) -> ValueId {
+        bytes == 0 ? address : b.emit(.ptrAdd, .ptr, address, i64(bytes))
+    }
+
+    /// The value at an lvalue (`t` is its type): a loaded scalar, an extracted bit-field, or an aggregate's address.
+    mutating func load(_ lv: AIRLValue, type t: QualType) -> ValueId {
+        switch lv {
+        case .memory(let address, let align, let isVolatile):
+            if isAggregate(t) { return address }
+            return loadScalar(from: address, type: t, alignment: align, isVolatile: isVolatile)
+        case .bitField(let unit, let unitBytes, let bitOffset, let width, let isSigned, let align, let isVolatile):
+            let ut = AIRType.int(unitBytes * 8)
+            var v = b.emit(.load, ut, unit, aux: AIRMemFlags(alignment: align, isVolatile: isVolatile).rawValue)
+            if isSigned {
+                let left = unitBytes * 8 - bitOffset - width
+                if left > 0 { v = b.emit(.shl, ut, v, const(ut, Int64(left))) }
+                if unitBytes * 8 - width > 0 { v = b.emit(.ashr, ut, v, const(ut, Int64(unitBytes * 8 - width))) }
+            } else {
+                if bitOffset > 0 { v = b.emit(.lshr, ut, v, const(ut, Int64(bitOffset))) }
+                if width < unitBytes * 8 { v = b.emit(.and, ut, v, mask(ut, width)) }
+            }
+            return resize(v, from: ut, to: airType(t), signed: isSigned)
+        }
+    }
+
+    /// Stores `value` (of type `t`) to an lvalue, and returns the value the object then holds (a bit-field's value
+    /// is truncated to its width; not computed unless `needsResult`).
+    @discardableResult
+    mutating func store(_ value: ValueId, to lv: AIRLValue, type t: QualType, needsResult: Bool = true) -> ValueId {
+        switch lv {
+        case .memory(let address, let align, let isVolatile):
+            if isAggregate(t) {
+                if address != value { copy(to: address, from: value, size: sizeValue(t), alignment: align, isVolatile: isVolatile) }
+                return address
+            }
+            storeScalar(value, to: address, type: t, alignment: align, isVolatile: isVolatile)
+            return value
+        case .bitField(let unit, let unitBytes, let bitOffset, let width, let isSigned, let align, let isVolatile):
+            let ut = AIRType.int(unitBytes * 8)
+            let flags = AIRMemFlags(alignment: align, isVolatile: isVolatile).rawValue
+            let widened = resize(value, from: airType(t), to: ut, signed: false)
+            let fieldMask = mask(ut, width)
+            var bits = b.emit(.and, ut, widened, fieldMask)
+            if bitOffset > 0 { bits = b.emit(.shl, ut, bits, const(ut, Int64(bitOffset))) }
+            let old = b.emit(.load, ut, unit, aux: flags)
+            let keep = b.emit(.and, ut, old, b.emit(.xor, ut, b.emit(.shl, ut, fieldMask, const(ut, Int64(bitOffset))), const(ut, -1)))
+            b.emit(.store, .void, b.emit(.or, ut, keep, bits), unit, aux: flags)
+            guard needsResult else { return .nilId }
+            // The value read back: the low `width` bits, extended
+            var stored = widened
+            if isSigned {
+                if unitBytes * 8 > width {
+                    stored = b.emit(.ashr, ut, b.emit(.shl, ut, widened, const(ut, Int64(unitBytes * 8 - width))), const(ut, Int64(unitBytes * 8 - width)))
+                }
+            } else {
+                stored = b.emit(.and, ut, widened, fieldMask)
+            }
+            return resize(stored, from: ut, to: airType(t), signed: isSigned)
+        }
+    }
+
+    /// The low `width` bits set, in `type`.
+    mutating func mask(_ type: AIRType, _ width: Int) -> ValueId {
+        var words = [UInt64](repeating: 0, count: max(1, (type.width + 63) / 64))
+        for i in 0..<width { words[i / 64] |= 1 << UInt64(i % 64) }
+        return b.constants.intern(type, words)
+    }
+
+    /// An integer converted between widths (truncated, or extended by `signed`).
+    mutating func resize(_ v: ValueId, from: AIRType, to: AIRType, signed: Bool) -> ValueId {
+        if from == to { return v }
+        if from.width > to.width { return b.emit(.trunc, to, v) }
+        return b.emit(signed && from.width > 1 ? .sext : .zext, to, v)
+    }
+
+    // MARK: - Sizes
+
+    /// The size of `t` in bytes as an `i64`: a constant, or computed from the lengths of the VLA types in it.
+    mutating func sizeValue(_ t: QualType) -> ValueId {
+        guard typePool.isVariablyModified(t.typeId), case .array(let element, let count) = canonicalKind(t) else { return i64(size(t)) }
+        let elementSize = sizeValue(element)
+        let length: ValueId
+        if typePool.isVariableLengthArray(t.typeId) {
+            length = vlaLength(typePool.canonical(of: t.typeId))
+        } else {
+            length = i64(Int(count))
+        }
+        if case .constant = elementSize.valueTag, b.constants.int64(elementSize.index) == 1 { return length }
+        return b.emit(.mul, .i64, length, elementSize)
+    }
+
+    /// The length of a VLA type, as evaluated where its declaration was reached.
+    mutating func vlaLength(_ type: TypeId) -> ValueId {
+        guard let home = vlaLengths[type] else {
+            report("the length of a variable length array type is not evaluated before its use")
+            return i64(0)
+        }
+        return b.emit(.load, .i64, home, aux: AIRMemFlags(alignment: 8).rawValue)
+    }
+
+    /// Stores the lengths of VLA types: (TypeId, length instruction) pairs, outermost first.
+    mutating func evaluateVLALengths(_ pairs: ArraySlice<UInt32>) {
+        var i = pairs.startIndex
+        while i + 1 < pairs.endIndex {
+            let type = typePool.canonical(of: TypeId(pairs[i]))
+            let length = value(SemInstId(pairs[i + 1]))
+            let home: ValueId
+            if let h = vlaLengths[type] { home = h } else {
+                home = b.alloca(size: 8, alignment: 8, name: "vla.length")
+                vlaLengths[type] = home
+            }
+            b.emit(.store, .void, resize(length, from: b.type(of: length, params: paramTypes), to: .i64, signed: false), home,
+                   aux: AIRMemFlags(alignment: 8).rawValue)
+            i += 2
+        }
+    }
+
+    /// The size of the objects a pointer of type `t` points to (1 for `void` and functions, as GNU C has it).
+    mutating func pointeeSize(_ t: QualType) -> ValueId {
+        let p = pointee(t)
+        switch canonicalKind(p) {
+        case .void, .function: return i64(1)
+        default: return sizeValue(p)
+        }
     }
 }

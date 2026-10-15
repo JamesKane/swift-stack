@@ -83,9 +83,9 @@ global ptr: int * align 8 init %10
 global mid: char * align 8 init %15
   bytes [00 00 00 00 00 00 00 00]
   reloc +0 8 bytes -> string#0 "string\x00"+3
-global range: int [6] align 4 init %18
+global range: int [6] align 16 init %18
   bytes [00 00 00 00 09 00 00 00 09 00 00 00 09 00 00 00 00 00 00 00 01 00 00 00]
-global elided: struct P [2] align 8 init %33
+global elided: struct P [2] align 16 init %33
   bytes [01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 04 00 00 00 00 00 00 00 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
 global bits: struct B align 8 init %41
   bytes [ff fe ff ff ff ff 00 00]

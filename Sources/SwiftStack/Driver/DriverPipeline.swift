@@ -309,18 +309,40 @@ public final class DriverPipeline {
                 return 0
             }
 
+            // AIR from SemIR (M3 phase 2). The M0.5 slice below still generates code from its own AIR until phase 3.
+            if options.dumpStage == "air" || options.verifyEach {
+                let lowering = AIRLowering.lower(semRes.semModule)
+                if !lowering.issues.isEmpty {
+                    let text = lowering.issues.prefix(50).map { "AIR lowering: \($0)" }.joined(separator: "\n")
+                    FileHandle.standardError.write(Data((text + "\n").utf8))
+                    return 1
+                }
+                if options.verifyEach {
+                    let issues = AIRVerifier.verify(lowering.module)
+                    if !issues.isEmpty {
+                        let text = issues.prefix(50).map { "AIR verifier: \($0)" }.joined(separator: "\n")
+                        FileHandle.standardError.write(Data((text + "\n").utf8))
+                        return 1
+                    }
+                }
+                if options.dumpStage == "air" {
+                    print(lowering.module.dumpText(), terminator: "")
+                    return 0
+                }
+            }
+
             if semRes.functionOrder.isEmpty {
                 FileHandle.standardError.write(Data("Error: no function definitions found in source\n".utf8))
                 return 1
             }
 
             // Phase 4: AIR Lowering
-            var airMod: AIRModule? = nil
+            var airMod: SliceAIRModule? = nil
             var hasLoweringError = false
             let p4_start = ss_monotonic_time_ns()
             withUnsafePointer(to: tree) { treePtr in
                 Profiler.shared.timeBlock(name: "Phase 4: AIR Lowering", category: "air") {
-                    var lowering = AIRLowering(
+                    var lowering = SliceAIRLowering(
                         tree: treePtr,
                         tokens: tokPtr,
                         semResult: semRes,
@@ -353,10 +375,6 @@ public final class DriverPipeline {
             self.airCommittedBytes = module.bytesCommitted
             self.airReservedBytes = module.bytesReserved
 
-            if options.dumpStage == "air" {
-                dumpAIR(module: module)
-                return 0
-            }
 
             // Phase 5: Codegen (Isel + Linear Scan RegAlloc + x86-64 Encoding)
             var encoded: [EncodedFunction] = []
@@ -550,25 +568,6 @@ public final class DriverPipeline {
 
     public func dumpSemIR(sem: SemResult) {
         sem.semModule.dump()
-    }
-
-    public func dumpAIR(module: borrowing AIRModule) {
-        print("=== AIR Module Dump (\(module.functionCount) functions) ===")
-        for i in 0..<module.functionCount {
-            module.withFunction(i) { fn in
-                print("function @\(fn.name)() -> TypeId(\(fn.returnType.rawIndex)) {")
-                for j in 1..<Int(fn.instructionCount) {
-                    let id = InstId(UInt32(j))
-                    let op = AIROpcode(rawValue: fn.opcode[id]) ?? .nilOp
-                    let ty = fn.type[id]
-                    let op0 = fn.op0[id]
-                    let op1 = fn.op1[id]
-                    let aux = fn.aux[id]
-                    print(String(format: "  %%%3d = %-12@ [type:%d, op0:%d, op1:%d, aux:0x%X]", j, "\(op)", ty, op0, op1, aux))
-                }
-                print("}")
-            }
-        }
     }
 
     public func dumpCode(functions: [EncodedFunction]) {

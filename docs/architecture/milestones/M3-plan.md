@@ -58,6 +58,60 @@ Carried forward:
   - Clang 22 emits an initialized array of `_BitInt(N > 128)`, or a record holding one, with LLVM's larger allocation size: `_BitInt(300) a[6]` has `sizeof` 240 but a 280-byte symbol. The image probes keep these out.
   - The D7 profile predefines clang 19's `__clang_version__` and GCC 14's `__GNUC__`, so a string built from them differs from clang 22's (SQLite's compile options).
 
+**Phase 2 is done** (2026-10-15). AIR is the design of [03](../03-intermediate-representation.md) §4.1, with the C types and operations of §4.1.1. `AIRLowering` lowers SemIR to it. The M0.5 AIR is kept as `SliceAIR*` until phase 3 replaces the code generator that reads it.
+
+The gate:
+- **The AIR verifier passes on every corpus,** with no construct left unlowered. The verifier checks structure, types, calls against their C types, `phi` edges, and SSA dominance. The corpora:
+
+  | Corpus | Files | Functions | Instructions |
+  |---|---|---|---|
+  | c-testsuite | 220 | 424 | 9,312 |
+  | SQLite | 1 | 2,604 | 270,937 |
+  | Lua | 35 | 1,097 | 68,391 |
+  | VectraOS (three architectures) | 36 | 678 | 68,641 |
+
+  The constraint probes, the VectraOS headers and the glibc headers pass too. The one exception is a `_Complex` probe, listed as known.
+- **Golden `--dump=air` tests** (`Tests/Golden/air`) cover:
+  - integers of every width;
+  - floats, `long double` included;
+  - control flow;
+  - aggregates and bit-fields;
+  - globals and TLS;
+  - varargs and VLAs;
+  - atomics, volatile accesses, builtins and `asm`.
+
+  Each dump was reviewed by hand.
+- **Negative tests** check that the verifier reports each kind of defect.
+- **`--dump=air` and `--verify-each`** run the new AIR in the driver.
+
+The lowering found these front-end gaps, now fixed:
+- **Builtin result types.** Every builtin had been typed `long (...)`, so a call's result was a `long` (`__builtin_inff`, `__atomic_load_n` on a pointer).
+- **Inline `asm` operands.** They had been skipped by the parser. They are now parsed and modeled in SemIR (`SemAsm`), and file-scope `asm` is kept.
+- **VLA parameters.** The length expressions of a variably modified parameter were dropped. They are now evaluated on entry.
+- **Inline-only definitions.** `__GNUC_STDC_INLINE__` and `__NO_INLINE__` were not predefined, so glibc's inline wrappers were not `gnu_inline`. An inline-only definition is now not emitted.
+- **Array alignment.** Clang aligns x86-64 array *variables* of 16 bytes or more to 16, static ones included, unless the variable has an alignment attribute. The phase 1 image probes compared bytes, not symbol alignment, so they missed this.
+- **Flexible array members.** An object whose flexible array member is initialized is larger than its type.
+
+As Clang does at `-O0`, the lowering emits an internal function or object only when something emitted refers to it. VectraOS drops from 1,047 functions to 678 this way, and no unused `static inline` function from a header brings in undefined references.
+
+Carried forward to phase 3, which must lower all of these:
+- integers of widths that are not powers of two: bit-field units spanning 3, 5, 6 or 7 bytes, and `_BitInt(N)`;
+- `i128`, and wider integers through runtime calls (`__divei4`, ...);
+- `f80` on the x87;
+- aggregates passed and returned by address, which the ABI lowering turns into eightbytes;
+- `va_arg`, which yields an address;
+- `phi`s;
+- `dyn_alloca` with `stack_save`/`stack_restore`;
+- `clz`/`ctz`: the 2013 Mac Pro floor has no `LZCNT`/`TZCNT`, so `bsr`/`bsf` with the zero case left undefined;
+- 16-byte atomics (`cmpxchg16b`);
+- `asm` constraints and symbolic operand names.
+
+Not modeled yet:
+- `register` variables pinned to a register with `asm("reg")` (VectraOS's AArch64 `usertest`);
+- `_Complex`;
+- vector extensions;
+- `__builtin_va_arg_pack`, which only appears in `gnu_inline` bodies, and those are never emitted.
+
 ## 4. Decisions taken in scoping
 
 - **SQLite is staged.** The M3 exit uses the amalgamation and its shell on a scripted SQL corpus. SQLite's TCL test suite (`testfixture`, dynamically linked against the host's libtcl) becomes a follow-on gate once dynamic linking is proven.

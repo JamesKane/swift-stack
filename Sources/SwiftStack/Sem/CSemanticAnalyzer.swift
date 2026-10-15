@@ -75,6 +75,16 @@ public struct CSemanticAnalyzer: ~Copyable {
     private var currentFunctionName: String = ""
     /// Names of the compiler-provided declarations (`write`, `exit`), which headers may redeclare.
     private var builtinNames: Set<String> = ["write", "exit"]
+    /// Builtins declared implicitly on first use (`__builtin_*`, the atomics), as `long (...)`: a call to one takes
+    /// its result type from `builtinResultType`.
+    private var implicitBuiltins: Set<DeclId> = []
+    /// Functions with a file-scope declaration that makes their definition external: one without `inline`, or with
+    /// `extern` (C23 6.7.5p7).
+    private var externallyDeclaredFunctions: Set<String> = []
+    /// Function definitions declared `inline`: whether `extern`, and whether with GNU89 semantics (`gnu_inline`).
+    private var inlineDefinitions: [DeclId: (isExtern: Bool, isGNU: Bool)] = [:]
+    /// File-scope `asm` declarations, in order (`SemModule.moduleAsm`).
+    private var moduleAsm: [String] = []
 
     /// A `switch` being analyzed: the case values seen (for duplicates), its labels, and the promoted type of its
     /// controlling expression.
@@ -175,6 +185,11 @@ public struct CSemanticAnalyzer: ~Copyable {
             case .varDecl, .typedefDecl:
                 var none: [UInt32] = []
                 analyzeDeclaration(decl, isFileScope: true, into: &none, tree: tree, tokens: tokens)
+            case .asmStmt:
+                // File-scope `asm("...")`: module-level assembly, in order
+                if let template = tree.children(of: decl).first(where: { tree.kind(of: $0) == .stringLiteral }) {
+                    moduleAsm.append(String(decoding: stringLiteralConstant(tree.token(of: template), tokens: tokens).bytes.dropLast(), as: UTF8.self))
+                }
             case .staticAssertDecl:
                 analyzeStaticAssert(decl, tree: tree, tokens: tokens)
             default:
@@ -188,6 +203,15 @@ public struct CSemanticAnalyzer: ~Copyable {
                         args: ["tentative definition has type '\(typeName(t.type))' that is never completed"])
         }
 
+        // An inline definition provides no external definition (C23 6.7.5p7): with GNU89 semantics an `extern
+        // inline` one; otherwise one whose every file-scope declaration is `inline` without `extern`
+        let inlineDefinitions = self.inlineDefinitions, externallyDeclared = externallyDeclaredFunctions
+        let finalFunctions = semFunctions.map { f in
+            guard let inline = inlineDefinitions[f.declId], f.isExternal else { return f }
+            let inlineOnly = inline.isGNU ? inline.isExtern : (!inline.isExtern && !externallyDeclared.contains(f.name))
+            return SemFunction(declId: f.declId, name: f.name, blockId: f.blockId, params: f.params, labels: f.labels, isExternal: f.isExternal,
+                               isInlineOnly: inlineOnly)
+        }
         let finalMod = SemModule(
             declTable: consume declTable,
             instBlocks: instBlocks,
@@ -195,10 +219,12 @@ public struct CSemanticAnalyzer: ~Copyable {
             diagnosticBag: consume diagnosticBag,
             fileScopeBlock: fileScopeContainer
         )
-        finalMod.functions = semFunctions
+        finalMod.functions = finalFunctions
         finalMod.globals = semGlobals
         finalMod.staticSymbols = staticSymbols
         finalMod.asmLabels = asmLabels
+        finalMod.objectAlignments = objectAlignments
+        finalMod.moduleAsm = moduleAsm
 
         // Data images of the static-storage objects (C23 6.7.10p10)
         var evaluator = StaticInitializerEvaluator(module: finalMod)
@@ -248,6 +274,9 @@ public struct CSemanticAnalyzer: ~Copyable {
         var isStatic = false
         var isConstexpr = false
         var isThreadLocal = false
+        var isInline = false
+        /// GNU `__attribute__((gnu_inline))`: `inline` has its GNU89 meaning.
+        var isGNUInline = false
         /// C23 `auto` (or GNU `__auto_type`) without a type specifier: the type is that of the initializer.
         var infersType = false
     }
@@ -305,6 +334,7 @@ public struct CSemanticAnalyzer: ~Copyable {
         var qualifiers: UInt32 = 0
         var sawSpecifier = false
 
+        spec.isGNUInline = hasAttribute(["gnu_inline", "__gnu_inline__"], tree.children(of: node), tree: tree, tokens: tokens)
         for child in tree.children(of: node) {
             switch tree.kind(of: child) {
             case .specifier:
@@ -328,6 +358,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                 case .kwStatic: spec.isStatic = true; continue
                 case .kwConstexpr: spec.isConstexpr = true; continue
                 case .kwThreadLocal: spec.isThreadLocal = true; continue
+                case .kwInline: spec.isInline = true; continue
                 case .kwAuto: auto = true; continue
                 case .identifier:
                     let name = spelling(of: tok, in: tokens)
@@ -646,6 +677,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                     stmts.append(emitLocalDeclaration(declId, initializer: .nilId, node: declarator).rawIndex)
                 }
             } else if isFunctionType(type) {
+                if isFileScope && (!spec.isInline || spec.isExtern) { externallyDeclaredFunctions.insert(name) }
                 if let initializer {
                     reportError("illegal initializer", diagId: .semaInvalidDeclaration, at: tree.token(of: initializer), in: tokens,
                                 args: ["illegal initializer (only variables can be initialized)"])
@@ -657,6 +689,16 @@ public struct CSemanticAnalyzer: ~Copyable {
             }
         }
         pendingVLALengths.removeAll()
+    }
+
+    /// Whether type `t` is or is derived (by pointers and arrays) from type `part`.
+    private func typeMentions(_ t: QualType, _ part: TypeId) -> Bool {
+        let can = typePool.canonical(of: t.typeId)
+        if can == typePool.canonical(of: part) { return true }
+        switch typePool.typeInfo(of: can).kind {
+        case .pointer(let inner), .array(let inner, _): return typeMentions(inner, part)
+        default: return false
+        }
     }
 
     /// A `declLocal` statement for `decl`, taking the VLA lengths elaborated by its declarator.
@@ -808,6 +850,13 @@ public struct CSemanticAnalyzer: ~Copyable {
         return declId
     }
 
+    /// The alignment of a variable of type `t` whose alignment is otherwise `alignment` (an array's may be larger:
+    /// `DataLayout.variableAlignment`, unless the variable has an alignment attribute of its own, as in Clang).
+    private func variableAlignment(_ t: QualType, _ alignment: Int, explicit: Bool) -> Int {
+        guard !explicit, !t.isError, case .array = canonicalKind(t) else { return alignment }
+        return dataLayout.variableAlignment(arraySize: typePool.size(of: t.typeId), typeAlignment: alignment)
+    }
+
     /// Records a file-scope object definition or tentative definition, keeping one per name: a definition replaces
     /// a tentative one (C23 6.9.2p2).
     private mutating func registerFileScopeObject(_ global: SemGlobal) {
@@ -884,7 +933,9 @@ public struct CSemanticAnalyzer: ~Copyable {
             if initializer != nil || !spec.isExtern {
                 registerFileScopeObject(SemGlobal(
                     declId: declId, symbol: asmLabels[name] ?? name, type: varType, isExternal: !isStatic, isThreadLocal: spec.isThreadLocal,
-                    alignment: max(objectAlignment, alignment ?? 1), initBlock: .nilId, initInst: initInst, isTentative: initializer == nil))
+                    alignment: variableAlignment(varType, max(objectAlignment, alignment ?? 1), explicit: alignment != nil), initBlock: .nilId,
+                    initInst: initInst,
+                    isTentative: initializer == nil))
             }
 
             let sym = CSymbol(name: name, declId: declId, type: varType, storage: .global(name: name))
@@ -944,7 +995,8 @@ public struct CSemanticAnalyzer: ~Copyable {
             staticSymbols[declId] = symbol
             semGlobals.append(SemGlobal(
                 declId: declId, symbol: symbol, type: varType, isExternal: false, isThreadLocal: spec.isThreadLocal,
-                alignment: max(objectAlignment, varType.isError ? 1 : typePool.alignment(of: varType.typeId)),
+                alignment: variableAlignment(varType, max(objectAlignment, varType.isError ? 1 : typePool.alignment(of: varType.typeId)),
+                                             explicit: alignment != nil),
                 initBlock: currentBlockId, initInst: initInst, isTentative: false))
         } else {
             pendingVLALengths = vlaLengths
@@ -1017,6 +1069,12 @@ public struct CSemanticAnalyzer: ~Copyable {
         let fnName = spelling(of: fnTok, in: tokens)
         let signature = resolveParameters(paramsNode, tree: tree, tokens: tokens)
         let fnDeclId = declareFunction(fnName, type: fnType, isStatic: spec.isStatic, isDefinition: true, at: fnTok, tokens: tokens)
+        let gnuInline = spec.isGNUInline || hasAttribute(["gnu_inline", "__gnu_inline__"], tree.children(of: declarator), tree: tree, tokens: tokens)
+        if spec.isInline && !spec.isStatic {
+            inlineDefinitions[fnDeclId] = (spec.isExtern, gnuInline)
+        } else {
+            externallyDeclaredFunctions.insert(fnName)
+        }
         if !definedFunctions.insert(fnName).inserted {
             reportError("redefinition of '\(fnName)'", diagId: .semaRedefinition, at: fnTok, in: tokens, args: [fnName])
         }
@@ -1053,8 +1111,43 @@ public struct CSemanticAnalyzer: ~Copyable {
             currentScope.insertOrdinary(symbol: CSymbol(name: pName, declId: pDecl, type: pType, storage: .param(index: idx)))
         }
 
-        // The body's `compound` is the block's last instruction, its root
-        _ = analyzeCompound(bodyNode, tree: tree, tokens: tokens)
+        // A variably modified parameter's size expressions are evaluated on entry (C23 6.9.1p10): its declarator is
+        // elaborated again in the function's scope, the parameter takes the resulting type, and a `declLocal` of the
+        // parameter evaluates the lengths
+        var entryStatements: [UInt32] = []
+        let paramNodes = tree.children(of: paramsNode).filter { tree.kind(of: $0) == .paramDecl }
+        for (idx, pDecl) in paramDecls.enumerated() where idx < paramNodes.count && !signature.types[idx].isError
+            && typePool.isVariablyModified(signature.types[idx].typeId) {
+            let children = tree.children(of: paramNodes[idx])
+            guard let specsNode = children.first(where: { tree.kind(of: $0) == .declSpecs }),
+                  let declarator = children.first(where: { tree.kind(of: $0) == .declarator }) else { continue }
+            let pSpec = resolveDeclSpecs(specsNode, tree: tree, tokens: tokens)
+            pendingVLALengths.removeAll()
+            let pInfo = applyDeclarator(declarator, to: pSpec.type, tree: tree, tokens: tokens)
+            var adjusted = pInfo.type
+            switch canonicalKind(adjusted) {
+            case .array(let element, _): adjusted = QualType(typeId: typePool.pointerTo(element), qualifiers: UInt8(pInfo.arrayQualifiers))
+            case .function: adjusted = QualType(typeId: typePool.pointerTo(adjusted))
+            default: break
+            }
+            // The outermost array's length, adjusted away, is evaluated for its side effects only
+            let kept = pendingVLALengths.filter { typePool.isVariablyModified(adjusted.typeId) && typeMentions(adjusted, $0.type) }
+            for dropped in pendingVLALengths where !kept.contains(where: { $0.type == dropped.type }) {
+                entryStatements.append(emit(.exprStmt, .void, dropped.length.rawIndex, node: declarator).rawIndex)
+            }
+            pendingVLALengths = kept
+            declTable.setType(for: pDecl, type: adjusted)
+            if paramNames[idx] != "" {
+                currentScope.insertOrdinary(symbol: CSymbol(name: paramNames[idx], declId: pDecl, type: adjusted, storage: .param(index: idx)))
+            }
+            entryStatements.append(emitLocalDeclaration(pDecl, initializer: .nilId, node: declarator).rawIndex)
+        }
+
+        // The body's `compound` is the block's last instruction, its root (with the parameters' lengths first, if any)
+        let body = analyzeCompound(bodyNode, tree: tree, tokens: tokens)
+        if !entryStatements.isEmpty {
+            _ = emitList(.compound, .void, items: entryStatements + [body.rawIndex], node: bodyNode)
+        }
         self.currentBlockContainer = fileScopeContainer
         currentBlockId = .nilId
         currentFunctionDecl = .nilId
@@ -1076,7 +1169,8 @@ public struct CSemanticAnalyzer: ~Copyable {
             paramDecls: paramDecls
         )
         semFunctions.append(SemFunction(declId: fnDeclId, name: fnName, blockId: blockId, params: paramDecls, labels: labelNames,
-                                        isExternal: DeclAttributes(rawValue: declTable.attrs[fnDeclId]).storage == .external))
+                                        isExternal: DeclAttributes(rawValue: declTable.attrs[fnDeclId]).storage == .external,
+                                        isInlineOnly: false))
         currentFunctionName = ""
 
         self.currentScope = fnScope.parent ?? CScope()
@@ -1235,6 +1329,11 @@ public struct CSemanticAnalyzer: ~Copyable {
 
     /// Whether a struct or union specifier carries GNU `__attribute__((packed))`.
     private func hasPackedAttribute(_ children: [NodeId], tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> Bool {
+        hasAttribute(["packed", "__packed__"], children, tree: tree, tokens: tokens)
+    }
+
+    /// Whether one of the GNU attributes among `children` is named one of `names`.
+    private func hasAttribute(_ names: Set<String>, _ children: [NodeId], tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> Bool {
         for attr in children where tree.kind(of: attr) == .attributeSpec {
             var i = Int(tree.token(of: attr).rawIndex) + 1
             var depth = 0
@@ -1245,8 +1344,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                 case .lParen: depth += 1
                 case .rParen: depth -= 1
                 case .identifier:
-                    let word = spelling(of: tok, in: tokens)
-                    if word == "packed" || word == "__packed__" { return true }
+                    if names.contains(spelling(of: tok, in: tokens)) { return true }
                 default: break
                 }
                 i += 1
@@ -1613,6 +1711,66 @@ public struct CSemanticAnalyzer: ~Copyable {
     /// Compiler builtins, declared implicitly: `__builtin_*`, the GNU and C11 atomics, and the legacy `__sync_*`.
     private func isBuiltinFunctionName(_ name: String) -> Bool {
         name.hasPrefix("__builtin_") || name.hasPrefix("__atomic_") || name.hasPrefix("__c11_atomic_") || name.hasPrefix("__sync_")
+    }
+
+    /// The result type of a call to an implicitly declared builtin (GCC's and Clang's signatures), given its
+    /// arguments after the default argument promotions; nil for a builtin not listed, which keeps `long`. The atomics
+    /// and the `__sync` functions return the type their first argument points to (unqualified).
+    private func builtinResultType(_ name: String, args: [SemInstId]) -> QualType? {
+        let voidPtr = QualType(typeId: typePool.pointerTo(.void))
+        func pointee(_ i: Int) -> QualType? {
+            guard i < args.count, isTyped(args[i]), case .pointer(let p) = canonicalKind(typeOf(args[i])) else { return nil }
+            return p.unqualified()
+        }
+        /// The floating type a math builtin's suffix names: `f` float, `l` long double, none double.
+        func floating(_ base: String) -> QualType {
+            name == base + "f" ? .float : (name == base + "l" ? .longdouble : .double)
+        }
+        let size = QualType(typeId: dataLayout.sizeType)
+        switch name {
+        case "__builtin_expect", "__builtin_expect_with_probability":
+            return .long
+        case "__builtin_bswap16": return .ushort
+        case "__builtin_bswap32": return .uint
+        case "__builtin_bswap64": return .ulong
+        case "__builtin_clz", "__builtin_clzl", "__builtin_clzll", "__builtin_ctz", "__builtin_ctzl", "__builtin_ctzll",
+             "__builtin_popcount", "__builtin_popcountl", "__builtin_popcountll", "__builtin_parity", "__builtin_parityl",
+             "__builtin_parityll", "__builtin_ffs", "__builtin_ffsl", "__builtin_ffsll", "__builtin_clrsb", "__builtin_clrsbl",
+             "__builtin_clrsbll", "__builtin_constant_p", "__builtin_isnan", "__builtin_isinf", "__builtin_isfinite",
+             "__builtin_isnormal", "__builtin_signbit", "__builtin_signbitf", "__builtin_signbitl", "__builtin_isinf_sign",
+             "__builtin_isgreater", "__builtin_isgreaterequal", "__builtin_isless", "__builtin_islessequal",
+             "__builtin_islessgreater", "__builtin_isunordered", "__builtin_fpclassify", "__builtin_memcmp", "__builtin_strcmp",
+             "__builtin_strncmp", "__builtin_abs", "__builtin_types_compatible_p":
+            return .int
+        case "__builtin_labs": return .long
+        case "__builtin_llabs": return .longlong
+        case "__builtin_inf", "__builtin_inff", "__builtin_infl": return floating("__builtin_inf")
+        case "__builtin_huge_val", "__builtin_huge_valf", "__builtin_huge_vall": return floating("__builtin_huge_val")
+        case "__builtin_nan", "__builtin_nanf", "__builtin_nanl": return floating("__builtin_nan")
+        case "__builtin_nans", "__builtin_nansf", "__builtin_nansl": return floating("__builtin_nans")
+        case "__builtin_fabs", "__builtin_fabsf", "__builtin_fabsl": return floating("__builtin_fabs")
+        case "__builtin_copysign", "__builtin_copysignf", "__builtin_copysignl": return floating("__builtin_copysign")
+        case "__builtin_sqrt", "__builtin_sqrtf", "__builtin_sqrtl": return floating("__builtin_sqrt")
+        case "__builtin_memcpy", "__builtin_memmove", "__builtin_memset", "__builtin_alloca", "__builtin_alloca_with_align",
+             "__builtin_frame_address", "__builtin_return_address", "__builtin_assume_aligned", "__builtin_extract_return_addr":
+            return voidPtr
+        case "__builtin_strlen", "__builtin_object_size", "__builtin_dynamic_object_size":
+            return size
+        case "__builtin_add_overflow", "__builtin_sub_overflow", "__builtin_mul_overflow", "__atomic_compare_exchange",
+             "__atomic_compare_exchange_n", "__atomic_test_and_set", "__atomic_always_lock_free", "__atomic_is_lock_free",
+             "__sync_bool_compare_and_swap", "__c11_atomic_compare_exchange_strong", "__c11_atomic_compare_exchange_weak",
+             "__c11_atomic_is_lock_free":
+            return .bool
+        case "__builtin_trap", "__builtin_unreachable", "__builtin_va_start", "__builtin_c23_va_start", "__builtin_va_end",
+             "__builtin_va_copy", "__builtin_prefetch", "__builtin___clear_cache", "__atomic_store", "__atomic_store_n",
+             "__atomic_load", "__atomic_exchange", "__atomic_thread_fence", "__atomic_signal_fence", "__atomic_clear",
+             "__sync_synchronize", "__sync_lock_release", "__c11_atomic_store", "__c11_atomic_init", "__c11_atomic_thread_fence",
+             "__c11_atomic_signal_fence", "__builtin_assume":
+            return .void
+        default:
+            if name.hasPrefix("__atomic_") || name.hasPrefix("__sync_") || name.hasPrefix("__c11_atomic_") { return pointee(0) }
+            return nil
+        }
     }
 
     /// Whether an expression where an integer constant expression is required certainly is not one: it reads an
@@ -2164,11 +2322,74 @@ public struct CSemanticAnalyzer: ~Copyable {
             }
 
         case .asmStmt:
-            stmts.append(emit(.asmStmt, .void, node: stmtNode).rawIndex)
+            stmts.append(analyzeAsm(stmtNode, tree: tree, tokens: tokens).rawIndex)
 
         default:
             break
         }
+    }
+
+    /// A GNU `asm` statement (`SemInstKind.asmStmt`): its template, qualifiers, operands, clobbers and `goto` labels.
+    /// Outputs are lvalues; an input is an lvalue if its constraint allows only memory (`m`, `o`, `V`, `Q`), else
+    /// a value.
+    private mutating func analyzeAsm(_ node: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> SemInstId {
+        let children = tree.children(of: node)
+        var flags: UInt32 = 0
+        var i = Int(tree.token(of: node).rawIndex) + 1
+        while i < tokens.count, CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(i)))) != .lParen {
+            switch spelling(of: TokenId(UInt32(i)), in: tokens) {
+            case "volatile", "__volatile__", "__volatile": flags |= SemAsm.volatileFlag
+            case "goto": flags |= SemAsm.gotoFlag
+            case "inline", "__inline__", "__inline": flags |= SemAsm.inlineFlag
+            default: break
+            }
+            i += 1
+        }
+        var template: UInt32 = 0
+        var outputs: [UInt32] = [], inputs: [UInt32] = [], clobbers: [UInt32] = [], labels: [UInt32] = []
+        for child in children {
+            let tok = tree.token(of: child)
+            switch tree.kind(of: child) {
+            case .stringLiteral:
+                template = block.block.addStringConstant(stringLiteralConstant(tok, tokens: tokens))
+            case .asmOutput, .asmInput:
+                let constraint = stringLiteralConstant(tok, tokens: tokens)
+                // `[name] "constraint"`
+                var name: UInt32 = SemAsm.noName
+                if tok.rawIndex >= 3, CTokenKind(rawValue: tokens.kind(of: TokenId(tok.rawIndex - 1))) == .rBracket {
+                    let nameTok = TokenId(tok.rawIndex - 2)
+                    name = block.block.addStringConstant(StringConstant(bytes: Array(spelling(of: nameTok, in: tokens).utf8) + [0], elementSize: 1,
+                                                                        encoding: .ordinary))
+                }
+                guard let operandNode = tree.children(of: child).first else { continue }
+                let operand = analyzeExpression(operandNode, tree: tree, tokens: tokens)
+                let text = String(decoding: constraint.bytes.dropLast(), as: UTF8.self)
+                let value: SemInstId
+                if tree.kind(of: child) == .asmOutput {
+                    if isTyped(operand) && !kindOf(operand).isLvalue {
+                        reportError("invalid lvalue in asm output", diagId: .semaInvalidOperands, at: tok, in: tokens, args: ["asm output", "", ""])
+                    }
+                    value = operand
+                } else {
+                    value = SemAsm.isMemoryOnly(text) && kindOf(operand).isLvalue ? operand : rvalue(operand)
+                }
+                let entry = [block.block.addStringConstant(constraint), name, value.rawIndex]
+                if tree.kind(of: child) == .asmOutput { outputs += entry } else { inputs += entry }
+            case .asmClobber:
+                clobbers.append(block.block.addStringConstant(stringLiteralConstant(tok, tokens: tokens)))
+            case .asmLabel:
+                let name = spelling(of: tok, in: tokens)
+                pendingGotos.append((name, tok))
+                labels.append(labelNumber(name))
+            default:
+                break
+            }
+        }
+        // An `asm` without outputs is implicitly volatile (GCC)
+        if outputs.isEmpty { flags |= SemAsm.volatileFlag }
+        let items = [template, flags, UInt32(outputs.count / 3), UInt32(inputs.count / 3), UInt32(clobbers.count), UInt32(labels.count)]
+            + outputs + inputs + clobbers + labels
+        return emitList(.asmStmt, .void, items: items, node: node)
     }
 
     /// `[[fallthrough]];` (or GNU `__attribute__((fallthrough));`): a null statement anchored at its attribute.
@@ -2280,6 +2501,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                       name == "asm" || name == "__asm__" || name == "__asm" {
                 let fnType = QualType(typeId: typePool.functionType(returnType: .long, paramTypes: [], isVariadic: true))
                 let declId = declTable.append(kind: .function, name: name, type: fnType, attrs: DeclAttributes(storage: .external).rawValue)
+                implicitBuiltins.insert(declId)
                 let sym = CSymbol(name: name, declId: declId, type: fnType, storage: .function(name: name))
                 currentScope.insertOrdinary(symbol: sym)
                 symbolRefs[exprNode] = sym
@@ -2635,7 +2857,8 @@ public struct CSemanticAnalyzer: ~Copyable {
             staticSymbols[declId] = ".compoundliteral"
             semGlobals.append(SemGlobal(
                 declId: declId, symbol: ".compoundliteral", type: objectType, isExternal: false, isThreadLocal: false,
-                alignment: objectType.isError ? 1 : typePool.alignment(of: objectType.typeId), initBlock: .nilId,
+                alignment: objectType.isError ? 1 : variableAlignment(objectType, typePool.alignment(of: objectType.typeId), explicit: false),
+                initBlock: .nilId,
                 initInst: resolved.inst, isTentative: false))
         }
         nodeTypes[node] = objectType.typeId
@@ -2916,11 +3139,17 @@ public struct CSemanticAnalyzer: ~Copyable {
             directDecl = .nilId
         }
         var items: [UInt32] = [directDecl.rawIndex, UInt32(paramTypes.count), UInt32(args.count)]
+        var argValues: [SemInstId] = []
         for (i, arg) in args.enumerated() {
             let value = i < paramTypes.count
                 ? convertForAssignment(arg.inst, node: arg.node, to: paramTypes[i], tree: tree, tokens: tokens)
                 : argumentPromoted(rvalue(arg.inst))
             items.append(value.rawIndex)
+            argValues.append(value)
+        }
+        if implicitBuiltins.contains(directDecl), let builtinType = builtinResultType(calleeName, args: argValues) {
+            retType = builtinType
+            nodeTypes[exprNode] = retType.typeId
         }
         return emitList(.call, retType.unqualified(), arg0: calleeValue.rawIndex, items: items, node: exprNode)
     }

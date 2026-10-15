@@ -49,6 +49,13 @@ public struct DataLayout: Sendable, Equatable {
     /// a zero-width one only closes the storage unit.
     public let unnamedBitFieldsAlign: Bool
 
+    /// The alignment of a variable (not a type) of array type: x86-64 psABI §3.1.2 gives an array variable of 16
+    /// bytes or more 16-byte alignment, local or global (clang applies it to both, but not to a variable with an
+    /// alignment attribute of its own); other targets use the type's.
+    public func variableAlignment(arraySize: Int, typeAlignment: Int) -> Int {
+        arch == .x86_64 && arraySize >= 16 ? max(typeAlignment, 16) : typeAlignment
+    }
+
     public static let x86_64 = DataLayout(
         arch: .x86_64, pointerSize: 8, longSize: 8, longDoubleFormat: .x87Extended, bitIntRule: .words64, bitIntMaxWidth: 8192,
         charIsSigned: true, wcharType: .int, wintType: .uint, sizeType: .ulong, ptrdiffType: .long, maxAlignment: 16,

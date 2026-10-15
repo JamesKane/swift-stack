@@ -246,6 +246,10 @@ public final class CPreprocessor {
         defineMacro("__clang_patchlevel__", replacement: "0")
         defineMacro("__clang_version__", replacement: "\"19.1.0 (Swift-Stack C23)\"")
         defineMacro("__VERSION__", replacement: "\"14.2.1 (Swift-Stack C23 compatible)\"")
+        // C99 `inline` semantics, and no inlining (`-O0`): glibc then marks its inline wrappers `gnu_inline`, which
+        // are never emitted on their own
+        defineMacro("__GNUC_STDC_INLINE__", replacement: "1")
+        defineMacro("__NO_INLINE__", replacement: "1")
 
         // Atomic memory order & floating point mantissa digits
         defineMacro("__ATOMIC_RELAXED", replacement: "0")

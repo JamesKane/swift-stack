@@ -1,0 +1,158 @@
+function @make(i32 %a0) -> sret : struct point (int)
+  slot s0: 4 bytes align 4 (x)
+  slot s1: 8 bytes align 4 (p)
+bb1:
+  %1 = alloca s0 (x)
+  %2 = alloca s1 (p)
+  store i32 %a0, %1, align 4
+  fill %2, i8 0, size 8, align 4
+  %5 = ptradd %2, 4
+  %6 = load i32, %1, align 4
+  store i32 %6, %5, align 4
+  ret ptr %2
+function @fields(ptr %a0, byval ptr %a1) -> i32 : int (struct flags *, struct flags)
+  slot s0: 8 bytes align 8 (f)
+bb1:
+  %1 = alloca s0 (f)
+  store ptr %a0, %1, align 8
+  %3 = load ptr, %1, align 8
+  %4 = load i8, %a1, align 8
+  %5 = ashr i8 %4, 3
+  %6 = sext i8 %5 to i32
+  %7 = trunc i32 %6 to i8
+  %8 = and i8 %7, 7
+  %9 = load i8, %3, align 8
+  %10 = and i8 %9, -8
+  %11 = or i8 %10, %8
+  store i8 %11, %3, align 8
+  %13 = load ptr, %1, align 8
+  %14 = load i8, %13, align 8
+  %15 = and i8 %14, 7
+  %16 = or i8 %15, -24
+  store i8 %16, %13, align 8
+  %18 = load ptr, %1, align 8
+  %19 = ptradd %18, 1
+  %20 = load i48, %19, align 1
+  %21 = lshr i48 %20, 1
+  %22 = and i48 %21, 1099511627775
+  %23 = zext i48 %22 to i64
+  %24 = add i64 %23, 1
+  %25 = trunc i64 %24 to i48
+  %26 = and i48 %25, 1099511627775
+  %27 = shl i48 %26, 1
+  %28 = load i48, %19, align 1
+  %29 = and i48 %28, -2199023255551
+  %30 = or i48 %29, %27
+  store i48 %30, %19, align 1
+  %32 = load ptr, %1, align 8
+  %33 = load i8, %32, align 8
+  %34 = and i8 %33, 7
+  %35 = zext i8 %34 to i32
+  %36 = load ptr, %1, align 8
+  %37 = load i8, %36, align 8
+  %38 = ashr i8 %37, 3
+  %39 = sext i8 %38 to i32
+  %40 = add i32 %35, %39
+  %41 = ptradd %a1, 1
+  %42 = load i8, %41, align 1
+  %43 = and i8 %42, 1
+  %44 = trunc i8 %43 to i1
+  %45 = zext i1 %44 to i32
+  %46 = add i32 %40, %45
+  %47 = load ptr, %1, align 8
+  %48 = ptradd %47, 1
+  %49 = load i48, %48, align 1
+  %50 = lshr i48 %49, 1
+  %51 = and i48 %50, 1099511627775
+  %52 = zext i48 %51 to i64
+  %53 = trunc i64 %52 to i32
+  %54 = add i32 %46, %53
+  ret i32 %54
+function @arrays(i32 %a0) -> i32 : int (int)
+  slot s0: 4 bytes align 4 (i)
+  slot s1: 64 bytes align 16 (a)
+  slot s2: 8 bytes align 8 (init.index)
+  slot s3: 8 bytes align 1 (s)
+  slot s4: 16 bytes align 16 (ps)
+  slot s5: 8 bytes align 4
+  slot s6: 4 bytes align 4 (n)
+  slot s7: 8 bytes align 8 (p)
+  slot s8: 12 bytes align 4
+  slot s9: 8 bytes align 4
+bb1:
+  %1 = alloca s0 (i)
+  %2 = alloca s1 (a)
+  %3 = alloca s2 (init.index)
+  %4 = alloca s3 (s)
+  %5 = alloca s4 (ps)
+  %6 = alloca s5
+  %7 = alloca s6 (n)
+  %8 = alloca s7 (p)
+  %9 = alloca s8
+  %10 = alloca s9
+  store i32 %a0, %1, align 4
+  fill %2, i8 0, size 64, align 16
+  %13 = ptradd %2, 8
+  store i32 1, %13, align 8
+  %15 = load i32, %1, align 4
+  store i64 4, %3, align 8
+  br bb2
+bb2: preds bb1, bb3
+  %18 = load i64, %3, align 8
+  %19 = icmp uge i64 %18, 16
+  cond_br %19, bb4, bb3
+bb3: preds bb2
+  %21 = mul i64 %18, 4
+  %22 = ptradd %2, %21
+  store i32 %15, %22, align 4
+  %24 = add i64 %18, 1
+  store i64 %24, %3, align 8
+  br bb2
+bb4: preds bb2
+  %27 = ptradd %4, 3
+  fill %27, i8 0, size 5, align 1
+  copy %4, @.str, size 3, align 1
+  fill %5, i8 0, size 16, align 16
+  store i32 1, %5, align 16
+  %32 = ptradd %5, 4
+  store i32 2, %32, align 4
+  %34 = ptradd %5, 8
+  %35 = load i32, %1, align 4
+  call void @make(i32 %35) into %6 : struct point (int)
+  copy %34, %6, size 8, align 8
+  %38 = ptradd %5, 8
+  copy %5, %38, size 8, align 4
+  fill %7, i8 0, size 4, align 4
+  store f32 0x3fc00000, %7, align 4
+  fill %9, i8 0, size 12, align 4
+  store i32 7, %9, align 4
+  %44 = ptradd %9, 4
+  store i32 8, %44, align 4
+  %46 = ptradd %9, 8
+  store i32 9, %46, align 4
+  store ptr %9, %8, align 8
+  %49 = load i32, %1, align 4
+  %50 = sext i32 %49 to i64
+  %51 = mul i64 %50, 4
+  %52 = ptradd %2, %51
+  %53 = load i32, %52, align 4
+  %54 = ptradd %4, 1
+  %55 = load i8, %54, align 1
+  %56 = sext i8 %55 to i32
+  %57 = add i32 %53, %56
+  %58 = ptradd %5, 4
+  %59 = load i32, %58, align 4
+  %60 = add i32 %57, %59
+  %61 = load i32, %7, align 4
+  %62 = add i32 %60, %61
+  %63 = load ptr, %8, align 8
+  %64 = ptradd %63, 8
+  %65 = load i32, %64, align 4
+  %66 = add i32 %62, %65
+  %67 = load i32, %1, align 4
+  call void @make(i32 %67) into %10 : struct point (int)
+  %69 = load i32, %10, align 4
+  %70 = add i32 %66, %69
+  ret i32 %70
+object @.str: const char [3] size 3 align 1 internal constant
+  bytes [68 69 00]

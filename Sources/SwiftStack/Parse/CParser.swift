@@ -386,12 +386,75 @@ public struct CParser: ~Copyable {
     }
 
     private mutating func parseExternalDeclaration() -> NodeId {
+        // A file-scope `asm("...");` (module-level assembly)
+        if currentKind == .identifier, token(currentTokenId, is: "__asm__") || token(currentTokenId, is: "__asm") || token(currentTokenId, is: "asm"),
+           peekKind() == .lParen {
+            return parseAsm()
+        }
         parseAttributes()
         guard !isAtEnd else { return .nilId }
         if currentKind == .kwStaticAssert {
             return parseStaticAssert()
         }
         return parseDeclaration(allowFunctionDefinition: true)
+    }
+
+    /// A GNU `asm` statement, or a file-scope `asm` declaration: `asm [volatile|inline|goto] ( template [: outputs
+    /// [: inputs [: clobbers [: labels]]]] ) ;`. Tree shape: `asmStmt` (token: the `asm` keyword; the qualifiers
+    /// follow it) with children the template (a `stringLiteral`), then an `asmOutput` per output and an `asmInput` per
+    /// input (token: the constraint string; child: the operand; a `[name]` precedes the constraint), an `asmClobber`
+    /// per clobber (token: the string) and an `asmLabel` per `goto` label (token: the identifier).
+    private mutating func parseAsm() -> NodeId {
+        let start = parseTree.count
+        let anchor = advance()
+        while isQualifierOrStorage(currentKind) || currentKind == .kwGoto ||
+              (currentKind == .identifier && ["__volatile__", "__volatile", "__inline__", "__inline"].contains(tokenSpelling(of: currentTokenId))) {
+            advance()
+        }
+        guard currentKind == .lParen else {
+            expect(.lParen)
+            return parseTree.append(kind: .asmStmt, token: anchor, subtreeSize: parseTree.count - start + 1)
+        }
+        advance()
+        _ = parsePrimaryExpression()
+        var section = 0
+        while currentKind == .colon {
+            section += 1
+            advance()
+            while !isAtEnd && currentKind != .rParen && currentKind != .colon {
+                switch section {
+                case 1, 2:
+                    let operandStart = parseTree.count
+                    if currentKind == .lBracket {
+                        advance()
+                        advance()  // the symbolic name
+                        expect(.rBracket)
+                    }
+                    let constraint = currentTokenId
+                    expect(.stringLiteral)
+                    while currentKind == .stringLiteral { advance() }
+                    expect(.lParen)
+                    _ = parseExpression()
+                    expect(.rParen)
+                    parseTree.append(kind: section == 1 ? .asmOutput : .asmInput, token: constraint,
+                                     subtreeSize: parseTree.count - operandStart + 1)
+                case 3:
+                    let clobber = currentTokenId
+                    expect(.stringLiteral)
+                    while currentKind == .stringLiteral { advance() }
+                    parseTree.appendLeaf(kind: .asmClobber, token: clobber)
+                default:
+                    let label = currentTokenId
+                    expect(.identifier)
+                    parseTree.appendLeaf(kind: .asmLabel, token: label)
+                }
+                guard currentKind == .comma else { break }
+                advance()
+            }
+        }
+        expect(.rParen)
+        expect(.semicolon)
+        return parseTree.append(kind: .asmStmt, token: anchor, subtreeSize: parseTree.count - start + 1)
     }
 
     private mutating func parseStaticAssert() -> NodeId {
@@ -1100,26 +1163,7 @@ public struct CParser: ~Copyable {
         case .identifier:
             // GNU asm statement: `__asm__ [volatile|inline|goto] ( template : outputs : inputs : clobbers ) ;`
             if token(currentTokenId, is: "__asm__") || token(currentTokenId, is: "__asm") || token(currentTokenId, is: "asm") {
-                let start = parseTree.count
-                let anchor = advance()
-                while isQualifierOrStorage(currentKind) || currentKind == .kwGoto ||
-                      (currentKind == .identifier && ["__volatile__", "__volatile", "__inline__", "__inline"].contains(tokenSpelling(of: currentTokenId))) {
-                    advance()
-                }
-                if currentKind == .lParen {
-                    advance()
-                    var depth = 1
-                    while !isAtEnd && depth > 0 {
-                        if currentKind == .lParen { depth += 1 }
-                        else if currentKind == .rParen { depth -= 1 }
-                        advance()
-                    }
-                } else {
-                    expect(.lParen)
-                }
-                expect(.semicolon)
-                let subSize = parseTree.count - start + 1
-                return parseTree.append(kind: .asmStmt, token: anchor, subtreeSize: subSize)
+                return parseAsm()
             }
             // Check for labeled statement: `label:`
             if peekKind() == .colon {

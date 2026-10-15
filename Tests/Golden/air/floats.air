@@ -1,0 +1,99 @@
+function @mix(f32 %a0, f64 %a1, f80 %a2, i32 %a3, i64 %a4) -> f64 : double (float, double, long double, int, unsigned long)
+  slot s0: 4 bytes align 4 (f)
+  slot s1: 8 bytes align 8 (d)
+  slot s2: 16 bytes align 16 (ld)
+  slot s3: 4 bytes align 4 (i)
+  slot s4: 8 bytes align 8 (u)
+  slot s5: 8 bytes align 8 (r)
+bb1:
+  %1 = alloca s0 (f)
+  %2 = alloca s1 (d)
+  %3 = alloca s2 (ld)
+  %4 = alloca s3 (i)
+  %5 = alloca s4 (u)
+  %6 = alloca s5 (r)
+  store f32 %a0, %1, align 4
+  store f64 %a1, %2, align 8
+  store f80 %a2, %3, align 16
+  store i32 %a3, %4, align 4
+  store i64 %a4, %5, align 8
+  %12 = load f32, %1, align 4
+  %13 = fpext f32 %12 to f64
+  %14 = load f64, %2, align 8
+  %15 = fmul f64 %13, %14
+  %16 = load i32, %4, align 4
+  %17 = sitofp i32 %16 to f64
+  %18 = fadd f64 %15, %17
+  store f64 %18, %6, align 8
+  %20 = load i64, %5, align 8
+  %21 = uitofp i64 %20 to f64
+  %22 = load f64, %6, align 8
+  %23 = fsub f64 %22, %21
+  store f64 %23, %6, align 8
+  %25 = load f64, %6, align 8
+  %26 = fpext f64 %25 to f80
+  %27 = load f80, %3, align 16
+  %28 = fdiv f80 %27, %26
+  store f80 %28, %3, align 16
+  %30 = load f32, %1, align 4
+  %31 = fadd f32 %30, 0x3f800000
+  store f32 %31, %1, align 4
+  %33 = load f64, %6, align 8
+  %34 = load f80, %3, align 16
+  %35 = fptrunc f80 %34 to f64
+  %36 = fadd f64 %33, %35
+  %37 = load f32, %1, align 4
+  %38 = fpext f32 %37 to f64
+  %39 = load f64, %2, align 8
+  %40 = fcmp olt f64 %38, %39
+  %41 = zext i1 %40 to i32
+  %42 = sitofp i32 %41 to f64
+  %43 = fadd f64 %36, %42
+  %44 = load f64, %2, align 8
+  %45 = load f64, %6, align 8
+  %46 = fcmp une f64 %44, %45
+  %47 = zext i1 %46 to i32
+  %48 = sitofp i32 %47 to f64
+  %49 = fadd f64 %43, %48
+  ret f64 %49
+function @to_int(f64 %a0, f80 %a1) -> i32 : int (double, long double)
+  slot s0: 8 bytes align 8 (d)
+  slot s1: 16 bytes align 16 (ld)
+  slot s2: 4 bytes align 4 (u)
+  slot s3: 1 bytes align 1 (b)
+bb1:
+  %1 = alloca s0 (d)
+  %2 = alloca s1 (ld)
+  %3 = alloca s2 (u)
+  %4 = alloca s3 (b)
+  store f64 %a0, %1, align 8
+  store f80 %a1, %2, align 16
+  %7 = load f64, %1, align 8
+  %8 = fptoui f64 %7 to i32
+  store i32 %8, %3, align 4
+  %10 = load f80, %2, align 16
+  %11 = fcmp une f80 %10, 0x0
+  %12 = zext i1 %11 to i8
+  store i8 %12, %4, align 1
+  %14 = load f64, %1, align 8
+  %15 = fptosi f64 %14 to i32
+  %16 = load i32, %3, align 4
+  %17 = add i32 %15, %16
+  %18 = load i8, %4, align 1
+  %19 = trunc i8 %18 to i1
+  %20 = zext i1 %19 to i32
+  %21 = add i32 %17, %20
+  %22 = load f80, %2, align 16
+  %23 = fneg f80 %22
+  %24 = fptosi f80 %23 to i32
+  %25 = add i32 %21, %24
+  ret i32 %25
+function @narrow(f64 %a0) -> f32 : float (double)
+  slot s0: 8 bytes align 8 (d)
+bb1:
+  %1 = alloca s0 (d)
+  store f64 %a0, %1, align 8
+  %3 = load f64, %1, align 8
+  %4 = fptrunc f64 %3 to f32
+  %5 = fmul f32 %4, 0x3f000000
+  ret f32 %5

@@ -13,7 +13,7 @@ public struct InstructionSelector {
         return Operand.vreg(v)
     }
 
-    public mutating func select(function airFn: borrowing AIRFunctionSoA) -> LIRFunctionSoA {
+    public mutating func select(function airFn: borrowing SliceAIRFunction) -> LIRFunctionSoA {
         var lir = LIRFunctionSoA(name: airFn.name, stackFrameSize: UInt32(max(0, airFn.stackFrameSize)))
         var airToLirVreg: [InstId: Operand] = [:]
 
@@ -21,7 +21,7 @@ public struct InstructionSelector {
         var allocaOffsets: [InstId: Int64] = [:]
         for i in 1..<airFn.instructionCount {
             let id = InstId(i)
-            if AIROpcode(rawValue: airFn.opcode[id]) == .alloca {
+            if SliceAIROpcode(rawValue: airFn.opcode[id]) == .alloca {
                 allocaOffsets[id] = Int64(airFn.aux[id])
             }
         }
@@ -37,7 +37,7 @@ public struct InstructionSelector {
                 lir.append(opcode: .label, imm: Int64(currentBlock))
             }
 
-            let op = AIROpcode(rawValue: airFn.opcode[id]) ?? .nilOp
+            let op = SliceAIROpcode(rawValue: airFn.opcode[id]) ?? .nilOp
             let v0 = ValueId(airFn.op0[id])
             let v1 = ValueId(airFn.op1[id])
             let aux = airFn.aux[id]

@@ -13,7 +13,7 @@ extension SemModule {
         for f in functions {
             let c = block(f.blockId)
             let params = f.params.map { "\(declTable.name(of: $0).isEmpty ? "_" : declTable.name(of: $0))#\($0.rawIndex): \(typePool.name(of: declTable.type(of: $0)))" }
-            out += "function \(f.name)(\(params.joined(separator: ", "))) -> \(functionReturnTypeName(f.declId))\(f.isExternal ? "" : " internal")\n"
+            out += "function \(f.name)(\(params.joined(separator: ", "))) -> \(functionReturnTypeName(f.declId))\(f.isExternal ? "" : " internal")\(f.isInlineOnly ? " inline_only" : "")\n"
             for i in 1..<Int(c.block.count) {
                 out += "  " + format(SemInstId(UInt32(i)), c) + "\n"
             }
@@ -97,8 +97,15 @@ extension SemModule {
         case .stringLiteral:
             let s = c.block.stringConstant(of: id)
             ops = "\(s.encoding.prefix)\"\(escaped(s.bytes))\""
-        case .nullptrLiteral, .breakStmt, .continueStmt, .asmStmt, .nullStmt, .nilInst:
+        case .nullptrLiteral, .breakStmt, .continueStmt, .nullStmt, .nilInst:
             ops = ""
+        case .asmStmt:
+            guard let asm = SemAsm(id, in: c.block) else { ops = "?"; break }
+            func operand(_ o: SemAsm.Operand) -> String { (o.name.isEmpty ? "" : "[\(o.name)] ") + "\"\(escaped(Array(o.constraint.utf8)))\" \(r(o.value.rawIndex))" }
+            ops = (asm.isVolatile ? "volatile " : "") + (asm.isGoto ? "goto " : "") + "\"\(escaped(Array(asm.template.utf8)))\""
+            ops += " : " + asm.outputs.map(operand).joined(separator: ", ") + " : " + asm.inputs.map(operand).joined(separator: ", ")
+            ops += " : " + asm.clobbers.map { "\"\($0)\"" }.joined(separator: ", ")
+            if asm.isGoto { ops += " : " + asm.labels.map { "label \($0)" }.joined(separator: ", ") }
         case .declRef:
             ops = declName(a0)
         case .member:

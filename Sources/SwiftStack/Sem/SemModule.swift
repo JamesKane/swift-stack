@@ -48,6 +48,9 @@ public struct SemFunction: Sendable {
     /// Label names by number (index 0 is unused).
     public let labels: [String]
     public let isExternal: Bool
+    /// An inline definition that is not an external definition (C23 6.7.5p7, or GNU `extern inline`): only for
+    /// inlining, so it is not emitted, and its name refers to a definition elsewhere.
+    public let isInlineOnly: Bool
 }
 
 /// A relocation in a static object's data image: the address of `target` plus `addend`, stored in `size` bytes at
@@ -125,6 +128,11 @@ public final class SemModule: @unchecked Sendable {
     /// GNU `asm("name")` labels: the symbol of each object or function with linkage declared with one, by C name
     /// (glibc's `__REDIRECT` names `stat` `stat64` under `_FILE_OFFSET_BITS=64`).
     public var asmLabels: [String: String] = [:]
+    /// Explicit alignments (`alignas`, `__attribute__((aligned))`) of objects, by declaration; a local object's
+    /// stack slot takes the larger of this and its type's alignment.
+    public var objectAlignments: [DeclId: Int] = [:]
+    /// File-scope `asm("...")` declarations: module-level assembly, in source order.
+    public var moduleAsm: [String] = []
 
     public init(
         declTable: consuming DeclTable,
