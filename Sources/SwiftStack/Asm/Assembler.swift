@@ -1505,8 +1505,8 @@ public enum AsmFragment: Sendable {
     case inst(bytes: [UInt8], fixups: [AsmInstFixup], lineNumber: Int)
     /// Label definition at the current position in the section.
     case label(name: String)
-    /// Relaxable branch instruction (`isLong` grows monotonically from `false` to `true`).
-    case relaxable(branch: AsmRelaxableBranch, isLong: Bool, lineNumber: Int)
+    /// Relaxable branch instruction (`form` grows monotonically; see `AsmSession.relaxableSize`).
+    case relaxable(branch: AsmRelaxableBranch, form: Int, lineNumber: Int)
     /// Alignment directive (`.balign`, `.p2align`, `.align`).
     case align(alignBytes: Int, fillByte: UInt8?, maxBytes: Int)
     /// Data expression (`.byte`, `.short`, `.long`, `.quad`).
@@ -1537,7 +1537,7 @@ public final class AsmSectionBuilder {
     }
 
     public func emitRelaxable(_ branch: AsmRelaxableBranch, lineNumber: Int = 0) {
-        fragments.append(.relaxable(branch: branch, isLong: false, lineNumber: lineNumber))
+        fragments.append(.relaxable(branch: branch, form: 0, lineNumber: lineNumber))
     }
 
     public func recordAlignment(alignBytes: Int) {
@@ -1725,25 +1725,7 @@ public enum Assembler {
         let shouldPreprocess = path.hasSuffix(".S")
 
         if shouldPreprocess {
-            let pp = CPreprocessor(sourceManager: sm)
-            pp.assemblerMode = true
-            pp.includePaths.append(contentsOf: includePaths)
-            for def in defines {
-                pp.defineMacro(def.name, replacement: def.value)
-            }
-            // Standard built-in architecture macros
-            switch arch {
-            case .x86_64:
-                pp.defineMacro("__x86_64__", replacement: "1")
-                pp.defineMacro("__amd64__", replacement: "1")
-            case .aarch64:
-                pp.defineMacro("__aarch64__", replacement: "1")
-            case .riscv64:
-                pp.defineMacro("__riscv", replacement: "1")
-                pp.defineMacro("__riscv_xlen", replacement: "64")
-            }
-            pp.defineMacro("__ASSEMBLER__", replacement: "1")
-
+            let pp = makeAssemblerPreprocessor(sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines)
             let expandedText = pp.preprocessToText(fileId: fileId)
             return assemble(
                 source: expandedText,
@@ -1777,6 +1759,23 @@ public enum Assembler {
         }
     }
 
+    /// Creates the `assembler-with-cpp` preprocessor for `.S` input: target-architecture predefined macros
+    /// replace the host defaults, then user `-D` definitions are applied so they can override them.
+    private static func makeAssemblerPreprocessor(
+        sourceManager sm: SourceManager,
+        arch: AssemblerArch,
+        includePaths: [String],
+        defines: [(name: String, value: String)]
+    ) -> CPreprocessor {
+        let pp = CPreprocessor(sourceManager: sm)
+        pp.enableAssemblerMode(arch: arch.description)
+        pp.includePaths.append(contentsOf: includePaths)
+        for def in defines {
+            pp.defineMacro(def.name, replacement: def.value)
+        }
+        return pp
+    }
+
     /// Assembles in-memory assembly source text into a `RelocatableObject`.
     public static func assemble(
         source: String,
@@ -1792,23 +1791,7 @@ public enum Assembler {
         if preprocess {
             let sm = sourceManager ?? SourceManager()
             let fileId = sm.addBuffer(bytes: Array(source.utf8), path: fileName)
-            let pp = CPreprocessor(sourceManager: sm)
-            pp.assemblerMode = true
-            pp.includePaths.append(contentsOf: includePaths)
-            for def in defines {
-                pp.defineMacro(def.name, replacement: def.value)
-            }
-            switch arch {
-            case .x86_64:
-                pp.defineMacro("__x86_64__", replacement: "1")
-                pp.defineMacro("__amd64__", replacement: "1")
-            case .aarch64:
-                pp.defineMacro("__aarch64__", replacement: "1")
-            case .riscv64:
-                pp.defineMacro("__riscv", replacement: "1")
-                pp.defineMacro("__riscv_xlen", replacement: "64")
-            }
-            pp.defineMacro("__ASSEMBLER__", replacement: "1")
+            let pp = makeAssemblerPreprocessor(sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines)
             effectiveSource = pp.preprocessToText(fileId: fileId)
         } else {
             effectiveSource = source
@@ -1950,6 +1933,7 @@ internal final class AsmSession {
             if !lhs.isEmpty && lhs.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "$" }) {
                 if let val = AsmExprEvaluator.evaluate(rhs, constants: constants)?.constantValue {
                     constants[lhs] = val
+                    noteSymbol(lhs)
                     return
                 }
             }
@@ -1964,6 +1948,19 @@ internal final class AsmSession {
         }
 
         // 4. Architecture-specific instruction dispatch (closed enum switch per 05-assembler.md §4.3)
+        let sectionBefore = currentSectionIndex
+        let fragmentsBefore = currentSection.fragments.count
+        let errorsBefore = diagnostics.errorCount
+        defer {
+            // Every instruction emits at least one fragment. An instruction parser that neither emitted
+            // anything nor reported an error rejected the operands (e.g. an encoder range check failed),
+            // so report it here rather than silently dropping the statement.
+            if currentSectionIndex == sectionBefore,
+               currentSection.fragments.count == fragmentsBefore,
+               diagnostics.errorCount == errorsBefore {
+                diagnostics.report(.asmInvalidOperands, at: SourceLocation(rawValue: UInt32(max(1, stmt.lineNumber))), args: [mnemonic])
+            }
+        }
         switch arch {
         case .x86_64:
             X86Asm.parseInstruction(mnemonic: mnemonic, args: args, lineNumber: stmt.lineNumber, session: self, diagnostics: &diagnostics)
@@ -2069,7 +2066,8 @@ internal final class AsmSession {
             if parts.count == 2 {
                 let sym = parts[0]
                 noteSymbol(sym)
-                symbolAttrs[sym, default: AsmSymbolAttrs()].sizeExpr = parts[1]
+                // The expression is evaluated after layout, so pin `.` to a temporary label here.
+                symbolAttrs[sym, default: AsmSymbolAttrs()].sizeExpr = bindLocationCounter(in: parts[1])
             }
 
         case ".equ", ".set":
@@ -2078,6 +2076,8 @@ internal final class AsmSession {
                 let sym = parts[0]
                 if let val = AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue {
                     constants[sym] = val
+                    // Like GNU `as`/LLVM MC, an assigned symbol is emitted as a local `SHN_ABS` symbol.
+                    noteSymbol(sym)
                 }
             }
 
@@ -2230,6 +2230,43 @@ internal final class AsmSession {
         }
     }
 
+    /// Replaces each standalone `.` (the location counter) in `expr` with a temporary label defined at the
+    /// current position, so the expression can be evaluated after layout without losing where `.` was.
+    func bindLocationCounter(in expr: String) -> String {
+        let chars = Array(expr.utf8)
+        func isIdentByte(_ c: UInt8) -> Bool {
+            (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F || c == 0x2E || c == 0x24
+        }
+        var out: [UInt8] = []
+        var label: String? = nil
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == 0x2E,
+               i == 0 || !isIdentByte(chars[i - 1]),
+               i + 1 == chars.count || !isIdentByte(chars[i + 1]) {
+                if label == nil {
+                    literalPoolCounter += 1
+                    let name = ".Lloc_\(literalPoolCounter)"
+                    currentSection.fragments.append(.label(name: name))
+                    label = name
+                }
+                out.append(contentsOf: label!.utf8)
+            } else if isIdentByte(c) {
+                // Copy a whole identifier/number so dots inside names (e.g. `.Lfoo`, `a.b`) are untouched
+                while i < chars.count && isIdentByte(chars[i]) {
+                    out.append(chars[i])
+                    i += 1
+                }
+                continue
+            } else {
+                out.append(c)
+            }
+            i += 1
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
     private func inferSectionProperties(name: String, parts: [String]) -> (SectionKind, SectionFlags, UInt8) {
         var flags: SectionFlags = []
         if parts.count >= 2 {
@@ -2313,8 +2350,8 @@ internal final class AsmSession {
                         localLabels[name] = Int64(offset)
                     case .inst(let bytes, _, _):
                         offset += bytes.count
-                    case .relaxable(let branch, let isLong, _):
-                        offset += relaxableSize(branch: branch, isLong: isLong)
+                    case .relaxable(let branch, let form, _):
+                        offset += relaxableSize(branch: branch, form: form)
                     case .align(let alignBytes, _, let maxBytes):
                         offset += computeAlignPadding(currentOffset: offset, alignBytes: alignBytes, maxBytes: maxBytes)
                     case .dataExpr(let width, _, _):
@@ -2333,13 +2370,11 @@ internal final class AsmSession {
                         break
                     case .inst(let bytes, _, _):
                         checkOffset += bytes.count
-                    case .relaxable(let branch, let isLong, let lineNum):
-                        let curSize = relaxableSize(branch: branch, isLong: isLong)
-                        if !isLong {
-                            if shouldGrowRelaxable(branch: branch, instOffset: Int64(checkOffset), curSize: curSize, localLabels: localLabels) {
-                                sec.fragments[fIdx] = .relaxable(branch: branch, isLong: true, lineNumber: lineNum)
-                                changed = true
-                            }
+                    case .relaxable(let branch, let form, let lineNum):
+                        let curSize = relaxableSize(branch: branch, form: form)
+                        if let next = grownForm(branch: branch, form: form, instOffset: Int64(checkOffset), localLabels: localLabels) {
+                            sec.fragments[fIdx] = .relaxable(branch: branch, form: next, lineNumber: lineNum)
+                            changed = true
                         }
                         checkOffset += curSize
                     case .align(let alignBytes, _, let maxBytes):
@@ -2483,13 +2518,18 @@ internal final class AsmSession {
                     }
                     bytes.append(contentsOf: patched)
 
-                case .relaxable(let branch, let isLong, _):
+                case .relaxable(let branch, let form, let lineNum):
+                    var outOfRange = false
                     let (instBytes, relocOpt) = encodeRelaxedBranch(
                         branch: branch,
-                        isLong: isLong,
+                        form: form,
                         instOffset: Int64(fragOffset),
-                        localLabels: localLabels
+                        localLabels: localLabels,
+                        outOfRange: &outOfRange
                     )
+                    if outOfRange {
+                        diagnostics.report(.asmBranchOutOfRange, at: SourceLocation(rawValue: UInt32(max(1, lineNum))), args: [])
+                    }
                     if let r = relocOpt {
                         noteSymbol(r.symbol)
                         pendingRelocs.append(
@@ -2511,56 +2551,57 @@ internal final class AsmSession {
                     }
 
                 case .dataExpr(let width, let exprStr, let lineNum):
+                    // `.` stays symbolic (it is a location, not a constant) so that `sym - .` becomes a
+                    // PC-relative relocation; differences against same-section labels still fold.
+                    var dotLabels = localLabels
+                    dotLabels["."] = Int64(fragOffset)
                     let valOpt = AsmExprEvaluator.evaluate(
                         exprStr,
                         constants: constants,
-                        currentSectionSymbols: localLabels,
-                        dotOffset: Int64(fragOffset)
+                        currentSectionSymbols: dotLabels
                     )
+                    func dotLabel() -> String {
+                        let name = ".Ldot_\(secIdx)_\(fragOffset)"
+                        noteSymbol(name)
+                        definedLabels[name] = (sectionIndex: secIdx, offset: Int64(fragOffset))
+                        return name
+                    }
+                    func addReloc(_ kind: RelocKind, _ sym: String, _ addend: Int64) {
+                        noteSymbol(sym)
+                        pendingRelocs.append(PendingReloc(sectionIndex: secIdx, offset: UInt64(fragOffset), kind: kind, symbol: sym, addend: addend))
+                    }
+                    func reportInvalid() {
+                        diagnostics.report(.asmInvalidExpression, at: SourceLocation(rawValue: UInt32(max(1, lineNum))), args: [exprStr])
+                    }
                     switch valOpt {
                     case .constant(let v):
                         appendLittleEndian(v, width: width, to: &bytes)
                     case .symbolOffset(let sym, let addend, _):
-                        noteSymbol(sym)
-                        let rKind = dataRelocKind(width: width, isPCRel: false)
-                        pendingRelocs.append(
-                            PendingReloc(
-                                sectionIndex: secIdx,
-                                offset: UInt64(fragOffset),
-                                kind: rKind,
-                                symbol: sym,
-                                addend: addend
-                            )
-                        )
+                        if let kind = dataRelocKind(width: width, isPCRel: false) {
+                            addReloc(kind, sym == "." ? dotLabel() : sym, addend)
+                        } else {
+                            reportInvalid()
+                        }
                         appendLittleEndian(0, width: width, to: &bytes)
                     case .symbolDiff(let plusSym, let minusSym, let addend):
-                        if minusSym == "." {
-                            if let pOff = localLabels[plusSym] {
-                                let v = (pOff - Int64(fragOffset)) + addend
-                                appendLittleEndian(v, width: width, to: &bytes)
-                            } else {
-                                noteSymbol(plusSym)
-                                let rKind = dataRelocKind(width: width, isPCRel: true)
-                                pendingRelocs.append(
-                                    PendingReloc(
-                                        sectionIndex: secIdx,
-                                        offset: UInt64(fragOffset),
-                                        kind: rKind,
-                                        symbol: plusSym,
-                                        addend: addend
-                                    )
-                                )
-                                appendLittleEndian(0, width: width, to: &bytes)
-                            }
-                        } else if let pDef = definedLabels[plusSym], let mDef = definedLabels[minusSym], pDef.sectionIndex == mDef.sectionIndex {
-                            let v = (pDef.offset - mDef.offset) + addend
-                            appendLittleEndian(v, width: width, to: &bytes)
+                        if let pDef = definedLabels[plusSym],
+                           let mDef = (minusSym == "." ? (sectionIndex: secIdx, offset: Int64(fragOffset)) : definedLabels[minusSym]),
+                           pDef.sectionIndex == mDef.sectionIndex {
+                            appendLittleEndian((pDef.offset - mDef.offset) + addend, width: width, to: &bytes)
+                        } else if arch == .riscv64, let addKind = riscvPairKinds(width: width) {
+                            // RISC-V encodes symbol differences as an ADD/SUB relocation pair (as GNU `as`/LLVM do).
+                            addReloc(addKind.add, plusSym, addend)
+                            addReloc(addKind.sub, minusSym == "." ? dotLabel() : minusSym, 0)
+                            appendLittleEndian(0, width: width, to: &bytes)
+                        } else if minusSym == ".", let kind = dataRelocKind(width: width, isPCRel: true) {
+                            addReloc(kind, plusSym, addend)
+                            appendLittleEndian(0, width: width, to: &bytes)
                         } else {
-                            diagnostics.report(.asmInvalidExpression, at: SourceLocation(rawValue: UInt32(max(1, lineNum))), args: [exprStr])
+                            reportInvalid()
                             appendLittleEndian(0, width: width, to: &bytes)
                         }
                     case nil:
-                        diagnostics.report(.asmInvalidExpression, at: SourceLocation(rawValue: UInt32(max(1, lineNum))), args: [exprStr])
+                        reportInvalid()
                         appendLittleEndian(0, width: width, to: &bytes)
                     }
 
@@ -2625,10 +2666,10 @@ internal final class AsmSession {
             var symSize: UInt64 = 0
             if let sizeExpr = attrs.sizeExpr {
                 let secLabels = definedLabels[symName].map { sectionSymbolOffsets[$0.sectionIndex] } ?? [:]
-                if let evaluated = AsmExprEvaluator.evaluate(sizeExpr, constants: constants, currentSectionSymbols: secLabels) {
-                    if let c = evaluated.constantValue {
-                        symSize = UInt64(bitPattern: c)
-                    }
+                if let c = AsmExprEvaluator.evaluate(sizeExpr, constants: constants, currentSectionSymbols: secLabels)?.constantValue {
+                    symSize = UInt64(bitPattern: c)
+                } else {
+                    diagnostics.report(.asmInvalidExpression, at: SourceLocation(rawValue: 1), args: [".size \(symName), \(sizeExpr)"])
                 }
             }
 
@@ -2733,116 +2774,158 @@ internal final class AsmSession {
         }
     }
 
-    private func relaxableSize(branch: AsmRelaxableBranch, isLong: Bool) -> Int {
+    /// Encoded size of a relaxable branch in a given form (`05-assembler.md` §4.5).
+    /// Forms only ever grow: x86 `rel8` → `rel32`; A64 short → inverted branch over `B`;
+    /// RV64 compressed → 32-bit → inverted branch over `jal`.
+    private func relaxableSize(branch: AsmRelaxableBranch, form: Int) -> Int {
         switch branch {
         case .x86Branch(let isCond, _, _, _):
-            if !isLong { return 2 }
+            if form == 0 { return 2 }
             return isCond ? 6 : 5
         case .a64Branch:
-            return isLong ? 8 : 4
-        case .rvBranch(let baseInst, let rvcAllowed, _, _):
-            if !isLong {
-                if rvcAllowed && (baseInst.opcode == .c_j || baseInst.opcode == .c_beqz || baseInst.opcode == .c_bnez) {
-                    return 2
-                }
-                return 4
+            return form == 0 ? 4 : 8
+        case .rvBranch:
+            switch form {
+            case 0: return 2
+            case 1: return 4
+            default: return 8
             }
-            return 4
         }
     }
 
-    private func shouldGrowRelaxable(
+    /// Returns the next larger form if the branch does not fit its current form, or nil if it fits
+    /// (or no larger form exists, in which case `encodeRelaxedBranch` reports the range error).
+    private func grownForm(
         branch: AsmRelaxableBranch,
+        form: Int,
         instOffset: Int64,
-        curSize: Int,
         localLabels: [String: Int64]
-    ) -> Bool {
+    ) -> Int? {
         switch branch {
         case .x86Branch(_, _, let targetSym, let addend):
-            // External or cross-section symbols always use long form
-            guard let targetOff = localLabels[targetSym] else { return true }
-            let disp = (targetOff + addend) - (instOffset + Int64(curSize))
-            return disp < -128 || disp > 127
+            guard form == 0 else { return nil }
+            // External or cross-section symbols always use the long form
+            guard let targetOff = localLabels[targetSym] else { return 1 }
+            let disp = (targetOff + addend) - (instOffset + 2)
+            return (disp < -128 || disp > 127) ? 1 : nil
 
         case .a64Branch(let baseInst, let targetSym, let addend):
-            guard let targetOff = localLabels[targetSym] else {
-                // External branches on A64 are 4-byte instructions with relocation
-                return false
-            }
+            guard form == 0, let targetOff = localLabels[targetSym] else { return nil }
             let disp = (targetOff + addend) - instOffset
-            let desc = A64InstructionTable.descriptor(for: baseInst.opcode)
-            switch desc.format {
+            switch A64InstructionTable.descriptor(for: baseInst.opcode).format {
             case .testBranch14:
-                return disp < -(1 << 15) || disp >= (1 << 15)
+                return A64Encoder.pcRelInRange(disp, bits: 14) ? nil : 1
             case .branchCond19, .compareBranch19:
-                return disp < -(1 << 20) || disp >= (1 << 20)
+                return A64Encoder.pcRelInRange(disp, bits: 19) ? nil : 1
             default:
-                return false
+                return nil
             }
 
         case .rvBranch(let baseInst, _, let targetSym, let addend):
-            guard let targetOff = localLabels[targetSym] else { return false }
+            guard let targetOff = localLabels[targetSym] else {
+                // External targets use the 32-bit form with a relocation
+                return form == 0 ? 1 : nil
+            }
             let disp = (targetOff + addend) - instOffset
-            switch baseInst.opcode {
-            case .c_j:
-                return disp < -2048 || disp > 2046 || (disp & 1) != 0
-            case .c_beqz, .c_bnez:
-                return disp < -256 || disp > 254 || (disp & 1) != 0
-            case .beq, .bne, .blt, .bge, .bltu, .bgeu:
-                return disp < -4096 || disp > 4094 || (disp & 1) != 0
+            let isJump = (baseInst.opcode == .c_j || baseInst.opcode == .jal)
+            switch form {
+            case 0:
+                let limit: Int64 = isJump ? 2048 : 256
+                return (disp < -limit || disp >= limit || (disp & 1) != 0) ? 1 : nil
+            case 1:
+                if isJump { return nil }
+                return (disp < -4096 || disp >= 4096 || (disp & 1) != 0) ? 2 : nil
             default:
-                return false
+                return nil
             }
         }
     }
 
+    private static func rvUncompressed(_ inst: RV64Instruction) -> RV64Instruction {
+        switch inst.opcode {
+        case .c_j:    return RV64Instruction(opcode: .jal, rd: RVGPR.zero.rawValue)
+        case .c_beqz: return RV64Instruction(opcode: .beq, rs1: inst.rs1, rs2: RVGPR.zero.rawValue)
+        case .c_bnez: return RV64Instruction(opcode: .bne, rs1: inst.rs1, rs2: RVGPR.zero.rawValue)
+        default:      return inst
+        }
+    }
+
+    private static func rvInvertedBranch(_ op: RV64Opcode) -> RV64Opcode {
+        switch op {
+        case .beq:  return .bne
+        case .bne:  return .beq
+        case .blt:  return .bge
+        case .bge:  return .blt
+        case .bltu: return .bgeu
+        default:    return .bltu
+        }
+    }
+
+    /// Encodes a relaxable branch in its final form. `outOfRange` is set when the target does not fit
+    /// even the largest form; the caller reports a diagnostic instead of emitting a truncated displacement.
     private func encodeRelaxedBranch(
         branch: AsmRelaxableBranch,
-        isLong: Bool,
+        form: Int,
         instOffset: Int64,
-        localLabels: [String: Int64]
+        localLabels: [String: Int64],
+        outOfRange: inout Bool
     ) -> ([UInt8], AsmInstFixup?) {
         switch branch {
         case .x86Branch(let isCond, let cc, let targetSym, let addend):
-            let size = isLong ? (isCond ? 6 : 5) : 2
+            let size = relaxableSize(branch: branch, form: form)
             if let targetOff = localLabels[targetSym] {
                 let disp = (targetOff + addend) - (instOffset + Int64(size))
-                if !isLong {
+                if form == 0 {
                     let opcode: UInt8 = isCond ? (0x70 + (cc & 0x0F)) : 0xEB
                     return ([opcode, UInt8(bitPattern: Int8(truncatingIfNeeded: disp))], nil)
-                } else {
-                    var out: [UInt8] = isCond ? [0x0F, 0x80 + (cc & 0x0F)] : [0xE9]
-                    appendLittleEndian(disp, width: 4, to: &out)
-                    return (out, nil)
                 }
-            } else {
-                // External or cross-section branch -> emit 32-bit PLT32 relocation
-                let out: [UInt8] = isCond ? [0x0F, 0x80 + (cc & 0x0F), 0, 0, 0, 0] : [0xE9, 0, 0, 0, 0]
-                let dispOffset = isCond ? 2 : 1
-                let fixup = AsmInstFixup(
-                    offsetInInst: dispOffset,
-                    kind: .x86_64_plt32,
-                    symbol: targetSym,
-                    addend: addend - 4
-                )
-                return (out, fixup)
+                if disp < Int64(Int32.min) || disp > Int64(Int32.max) { outOfRange = true }
+                var out: [UInt8] = isCond ? [0x0F, 0x80 + (cc & 0x0F)] : [0xE9]
+                appendLittleEndian(disp, width: 4, to: &out)
+                return (out, nil)
             }
+            // External or cross-section branch -> emit 32-bit PLT32 relocation
+            let out: [UInt8] = isCond ? [0x0F, 0x80 + (cc & 0x0F), 0, 0, 0, 0] : [0xE9, 0, 0, 0, 0]
+            let fixup = AsmInstFixup(
+                offsetInInst: isCond ? 2 : 1,
+                kind: .x86_64_plt32,
+                symbol: targetSym,
+                addend: addend - 4
+            )
+            return (out, fixup)
 
         case .a64Branch(var baseInst, let targetSym, let addend):
             if let targetOff = localLabels[targetSym],
                (baseInst.opcode != .bl || (symbolAttrs[targetSym]?.binding ?? .local) == .local) {
                 let disp = (targetOff + addend) - instOffset
-                baseInst.imm = disp
-                if let bytes = A64Encoder.encodeBytes(baseInst) {
-                    return (bytes, nil)
+                if form == 0 {
+                    baseInst.imm = disp
+                    if let bytes = A64Encoder.encodeBytes(baseInst) { return (bytes, nil) }
+                    outOfRange = true
+                    return ([0, 0, 0, 0], nil)
                 }
+                // Inverted conditional branch skipping over an unconditional `B` to the target
+                var skip = baseInst
+                switch baseInst.opcode {
+                case .bCond: skip.cond = baseInst.cond.inverted
+                case .cbz:   skip.opcode = .cbnz
+                case .cbnz:  skip.opcode = .cbz
+                case .tbz:   skip.opcode = .tbnz
+                default:     skip.opcode = .tbz
+                }
+                skip.imm = 8
+                let far = A64Instruction(opcode: .b, imm: disp - 4)
+                guard let b0 = A64Encoder.encodeBytes(skip), let b1 = A64Encoder.encodeBytes(far) else {
+                    outOfRange = true
+                    return ([UInt8](repeating: 0, count: 8), nil)
+                }
+                return (b0 + b1, nil)
             }
             // External symbol -> encode with imm=0 and attach relocation
             baseInst.imm = 0
             let bytes = A64Encoder.encodeBytes(baseInst) ?? [0, 0, 0, 0]
             let rKind: RelocKind
-            let desc = A64InstructionTable.descriptor(for: baseInst.opcode)
-            switch desc.format {
+            switch A64InstructionTable.descriptor(for: baseInst.opcode).format {
             case .branchImm26:
                 rKind = (baseInst.opcode == .bl) ? .aarch64_call26 : .aarch64_jump26
             case .branchCond19, .compareBranch19:
@@ -2854,39 +2937,35 @@ internal final class AsmSession {
             }
             return (bytes, AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: targetSym, addend: addend))
 
-        case .rvBranch(var baseInst, let rvcAllowed, let targetSym, let addend):
+        case .rvBranch(let baseInst, _, let targetSym, let addend):
             if let targetOff = localLabels[targetSym] {
                 let disp = (targetOff + addend) - instOffset
-                if !isLong {
-                    baseInst.imm = disp
-                    return (RV64Encoder.encode(baseInst, rvcEnabled: rvcAllowed), nil)
-                } else {
-                    // Relaxed from compressed `c.j`/`c.beqz`/`c.bnez` to 32-bit `jal`/`beq`/`bne`
-                    if baseInst.opcode == .c_j || baseInst.opcode == .jal {
-                        let jalInst = RV64Instruction(opcode: .jal, rd: RVGPR.zero.rawValue, imm: disp)
-                        return (RV64Encoder.encode(jalInst, rvcEnabled: false), nil)
-                    } else if baseInst.opcode == .c_beqz {
-                        let beqInst = RV64Instruction(opcode: .beq, rs1: baseInst.rs1, rs2: RVGPR.zero.rawValue, imm: disp)
-                        return (RV64Encoder.encode(beqInst, rvcEnabled: false), nil)
-                    } else if baseInst.opcode == .c_bnez {
-                        let bneInst = RV64Instruction(opcode: .bne, rs1: baseInst.rs1, rs2: RVGPR.zero.rawValue, imm: disp)
-                        return (RV64Encoder.encode(bneInst, rvcEnabled: false), nil)
-                    }
-                    baseInst.imm = disp
-                    return (RV64Encoder.encode(baseInst, rvcEnabled: false), nil)
+                switch form {
+                case 0:
+                    var inst = baseInst
+                    inst.imm = disp
+                    return (RV64Encoder.encode(inst, rvcEnabled: true), nil)
+                case 1:
+                    var inst = Self.rvUncompressed(baseInst)
+                    inst.imm = disp
+                    let limit: Int64 = (inst.opcode == .jal) ? (1 << 20) : (1 << 12)
+                    if disp < -limit || disp >= limit || (disp & 1) != 0 { outOfRange = true }
+                    return (RV64Encoder.encode(inst, rvcEnabled: false), nil)
+                default:
+                    // Inverted branch over `jal x0, target`
+                    let wide = Self.rvUncompressed(baseInst)
+                    let skip = RV64Instruction(opcode: Self.rvInvertedBranch(wide.opcode), rs1: wide.rs1, rs2: wide.rs2, imm: 8)
+                    let jalDisp = disp - 4
+                    if jalDisp < -(1 << 20) || jalDisp >= (1 << 20) || (jalDisp & 1) != 0 { outOfRange = true }
+                    let jal = RV64Instruction(opcode: .jal, rd: RVGPR.zero.rawValue, imm: jalDisp)
+                    return (RV64Encoder.encode(skip, rvcEnabled: false) + RV64Encoder.encode(jal, rvcEnabled: false), nil)
                 }
             }
             // External symbol -> emit 32-bit branch/jump with relocation
-            let uncompressedOp: RV64Opcode
-            switch baseInst.opcode {
-            case .c_j:    uncompressedOp = .jal
-            case .c_beqz: uncompressedOp = .beq
-            case .c_bnez: uncompressedOp = .bne
-            default:      uncompressedOp = baseInst.opcode
-            }
-            let extInst = RV64Instruction(opcode: uncompressedOp, rd: baseInst.rd, rs1: baseInst.rs1, rs2: baseInst.rs2, imm: 0)
+            var extInst = Self.rvUncompressed(baseInst)
+            extInst.imm = 0
             let bytes = RV64Encoder.encode(extInst, rvcEnabled: false)
-            let rKind: RelocKind = (uncompressedOp == .jal) ? .riscv_jal : .riscv_branch
+            let rKind: RelocKind = (extInst.opcode == .jal) ? .riscv_jal : .riscv_branch
             return (bytes, AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: targetSym, addend: addend))
         }
     }
@@ -2960,17 +3039,36 @@ internal final class AsmSession {
         }
     }
 
-    private func dataRelocKind(width: Int, isPCRel: Bool) -> RelocKind {
-        switch arch {
-        case .x86_64:
-            if isPCRel { return .x86_64_pc32 }
-            return width == 8 ? .x86_64_64 : (width == 4 ? .x86_64_32 : .x86_64_16)
-        case .aarch64:
-            if isPCRel { return .aarch64_prel32 }
-            return width == 8 ? .aarch64_abs64 : (width == 4 ? .aarch64_abs32 : .aarch64_abs16)
-        case .riscv64:
-            if isPCRel { return .riscv_32_pcrel }
-            return width == 8 ? .riscv_64 : .riscv_32
+    private func dataRelocKind(width: Int, isPCRel: Bool) -> RelocKind? {
+        switch (arch, isPCRel, width) {
+        case (.x86_64, false, 8):  return .x86_64_64
+        case (.x86_64, false, 4):  return .x86_64_32
+        case (.x86_64, false, 2):  return .x86_64_16
+        case (.x86_64, false, 1):  return .x86_64_8
+        case (.x86_64, true, 8):   return .x86_64_pc64
+        case (.x86_64, true, 4):   return .x86_64_pc32
+        case (.x86_64, true, 2):   return .x86_64_pc16
+        case (.x86_64, true, 1):   return .x86_64_pc8
+        case (.aarch64, false, 8): return .aarch64_abs64
+        case (.aarch64, false, 4): return .aarch64_abs32
+        case (.aarch64, false, 2): return .aarch64_abs16
+        case (.aarch64, true, 8):  return .aarch64_prel64
+        case (.aarch64, true, 4):  return .aarch64_prel32
+        case (.aarch64, true, 2):  return .aarch64_prel16
+        case (.riscv64, false, 8): return .riscv_64
+        case (.riscv64, false, 4): return .riscv_32
+        case (.riscv64, true, 4):  return .riscv_32_pcrel
+        default:                   return nil
+        }
+    }
+
+    private func riscvPairKinds(width: Int) -> (add: RelocKind, sub: RelocKind)? {
+        switch width {
+        case 1: return (.riscv_add8, .riscv_sub8)
+        case 2: return (.riscv_add16, .riscv_sub16)
+        case 4: return (.riscv_add32, .riscv_sub32)
+        case 8: return (.riscv_add64, .riscv_sub64)
+        default: return nil
         }
     }
 

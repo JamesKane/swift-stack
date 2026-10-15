@@ -320,23 +320,7 @@ public final class CPreprocessor {
     /// Helper to define an object-like macro from a string expression.
     public func defineMacro(_ name: String, replacement: String) {
         let dummyFileId = sourceManager.addBuffer(bytes: Array(replacement.utf8), path: "<predefined>")
-        let sf = sourceManager[dummyFileId]
-        var tb = TokenBuffer()
-        let lexer = CLexer(fileId: dummyFileId, buffer: sf.buffer, length: sf.length, baseLocation: sf.baseLocation)
-        lexer.lexInto(&tb)
-
-        var tokens: [PPToken] = []
-        for i in 1..<Int(tb.count) {
-            let tid = TokenId(UInt32(i))
-            let k = CTokenKind(rawValue: tb.kind(of: tid)) ?? .errorToken
-            if k == .eof { break }
-            let f = TokenFlags(rawValue: tb.flag(of: tid))
-            let s = tb.start(of: tid)
-            let e = tb.end(of: tid)
-            let txt = String(decoding: UnsafeBufferPointer(start: sf.buffer.baseAddress! + Int(s.rawValue - sf.baseLocation.rawValue), count: Int(e.rawValue - s.rawValue)), as: UTF8.self)
-            tokens.append(PPToken(kind: k, flags: f, location: s, endLocation: e, spelling: txt))
-        }
-
+        let tokens = lexFileToPPTokens(dummyFileId)
         macros[name] = PPMacro(name: name, isFunctionLike: false, replacementTokens: tokens, location: .zero)
     }
 
@@ -357,25 +341,7 @@ public final class CPreprocessor {
         activeInclusions.append(sf.path)
         defer { activeInclusions.removeLast() }
 
-        var rawTB = TokenBuffer()
-        let lexer = CLexer(fileId: fileId, buffer: sf.buffer, length: sf.length, baseLocation: sf.baseLocation)
-        lexer.lexInto(&rawTB)
-
-        var rawTokens: [PPToken] = []
-        rawTokens.reserveCapacity(Int(rawTB.count))
-        for i in 1..<Int(rawTB.count) {
-            let tid = TokenId(UInt32(i))
-            let k = CTokenKind(rawValue: rawTB.kind(of: tid)) ?? .errorToken
-            if k == .eof { break }
-            let f = TokenFlags(rawValue: rawTB.flag(of: tid))
-            let s = rawTB.start(of: tid)
-            let e = rawTB.end(of: tid)
-            let off = Int(s.rawValue - sf.baseLocation.rawValue)
-            let len = Int(e.rawValue - s.rawValue)
-            let txt = (off >= 0 && len >= 0 && off + len <= sf.length) ?
-                String(decoding: UnsafeBufferPointer(start: sf.buffer.baseAddress! + off, count: len), as: UTF8.self) : ""
-            rawTokens.append(PPToken(kind: k, flags: f, location: s, endLocation: e, spelling: txt))
-        }
+        let rawTokens = lexFileToPPTokens(fileId)
 
         var processedTokens: [PPToken] = []
         processTokenStream(rawTokens, currentFilePath: sf.path, into: &processedTokens)
@@ -401,25 +367,7 @@ public final class CPreprocessor {
         activeInclusions.append(sf.path)
         defer { activeInclusions.removeLast() }
 
-        var rawTB = TokenBuffer()
-        let lexer = CLexer(fileId: fileId, buffer: sf.buffer, length: sf.length, baseLocation: sf.baseLocation)
-        lexer.lexInto(&rawTB)
-
-        var rawTokens: [PPToken] = []
-        rawTokens.reserveCapacity(Int(rawTB.count))
-        for i in 1..<Int(rawTB.count) {
-            let tid = TokenId(UInt32(i))
-            let k = CTokenKind(rawValue: rawTB.kind(of: tid)) ?? .errorToken
-            if k == .eof { break }
-            let f = TokenFlags(rawValue: rawTB.flag(of: tid))
-            let s = rawTB.start(of: tid)
-            let e = rawTB.end(of: tid)
-            let off = Int(s.rawValue - sf.baseLocation.rawValue)
-            let len = Int(e.rawValue - s.rawValue)
-            let txt = (off >= 0 && len >= 0 && off + len <= sf.length) ?
-                String(decoding: UnsafeBufferPointer(start: sf.buffer.baseAddress! + off, count: len), as: UTF8.self) : ""
-            rawTokens.append(PPToken(kind: k, flags: f, location: s, endLocation: e, spelling: txt))
-        }
+        let rawTokens = lexFileToPPTokens(fileId)
 
         var processedTokens: [PPToken] = []
         processTokenStream(rawTokens, currentFilePath: sf.path, into: &processedTokens)
@@ -529,6 +477,46 @@ public final class CPreprocessor {
 
     private func isIdentifierOrKeyword(_ kind: CTokenKind) -> Bool {
         kind == .identifier || (kind.rawValue >= 10 && kind.rawValue <= 55)
+    }
+
+    /// Lexes a whole buffer into preprocessing tokens (excluding EOF).
+    private func lexFileToPPTokens(_ fileId: FileId) -> [PPToken] {
+        let sf = sourceManager[fileId]
+        var tb = TokenBuffer()
+        let lexer = CLexer(fileId: fileId, buffer: sf.buffer, length: sf.length, baseLocation: sf.baseLocation)
+        lexer.lexInto(&tb)
+
+        var tokens: [PPToken] = []
+        tokens.reserveCapacity(Int(tb.count))
+        for i in 1..<Int(tb.count) {
+            let tid = TokenId(UInt32(i))
+            let k = CTokenKind(rawValue: tb.kind(of: tid)) ?? .errorToken
+            if k == .eof { break }
+            let f = TokenFlags(rawValue: tb.flag(of: tid))
+            let s = tb.start(of: tid)
+            let e = tb.end(of: tid)
+            let off = Int(s.rawValue - sf.baseLocation.rawValue)
+            let len = Int(e.rawValue - s.rawValue)
+            let txt = (off >= 0 && len >= 0 && off + len <= sf.length) ?
+                String(decoding: UnsafeBufferPointer(start: sf.buffer.baseAddress! + off, count: len), as: UTF8.self) : ""
+            tokens.append(PPToken(kind: k, flags: f, location: s, endLocation: e, spelling: txt))
+        }
+        return tokens
+    }
+
+    /// `lhs ## rhs` (C23 6.10.5.4): the concatenated spelling is re-lexed and must form exactly one
+    /// preprocessing token. An invalid paste is diagnosed and the operands are kept as separate tokens.
+    private func pasteTokens(_ lhs: PPToken, _ rhs: PPToken) -> [PPToken] {
+        let spelling = lhs.spelling + rhs.spelling
+        let fid = sourceManager.addBuffer(bytes: Array(spelling.utf8), path: "<scratch>")
+        let lexed = lexFileToPPTokens(fid)
+        if lexed.count == 1, var tok = lexed.first, tok.spelling == spelling {
+            tok.flags = TokenFlags(rawValue: (tok.flags.rawValue & ~(TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline))
+                | (lhs.flags.rawValue & (TokenFlags.maskLeadingSpace | TokenFlags.maskLeadingNewline)))
+            return [tok]
+        }
+        diagnostics.report(.ppInvalidPaste, at: lhs.location, args: [lhs.spelling, rhs.spelling])
+        return [lhs, rhs]
     }
 
     private func makeSyntheticToken(kind: CTokenKind, flags: TokenFlags, spelling: String) -> PPToken {
@@ -727,9 +715,14 @@ public final class CPreprocessor {
         location: SourceLocation,
         into output: inout [PPToken]
     ) {
-        // Expand macros if line contains computed include e.g. #include HEADER_VAR
+        // C23 6.10.2p4: only a computed include (`#include HEADER_VAR`) is macro-replaced; the `<...>` and
+        // `"..."` forms are taken literally (`#include <errno.h>` must not expand an `errno` macro).
         var resolvedTokens: [PPToken] = []
-        expandAllMacros(tokens, disabled: [], into: &resolvedTokens)
+        if let first = tokens.first, first.kind == .less || first.kind == .stringLiteral {
+            resolvedTokens = tokens
+        } else {
+            expandAllMacros(tokens, disabled: [], into: &resolvedTokens)
+        }
 
         guard let first = resolvedTokens.first else {
             diagnostics.report(.ppInvalidDirective, at: location, args: ["include"])
@@ -774,25 +767,7 @@ public final class CPreprocessor {
             activeInclusions.append(sf.path)
             defer { activeInclusions.removeLast() }
 
-            var rawTB = TokenBuffer()
-            let lexer = CLexer(fileId: fid, buffer: sf.buffer, length: sf.length, baseLocation: sf.baseLocation)
-            lexer.lexInto(&rawTB)
-
-            var rawTokens: [PPToken] = []
-            rawTokens.reserveCapacity(Int(rawTB.count))
-            for i in 1..<Int(rawTB.count) {
-                let tid = TokenId(UInt32(i))
-                let k = CTokenKind(rawValue: rawTB.kind(of: tid)) ?? .errorToken
-                if k == .eof { break }
-                let f = TokenFlags(rawValue: rawTB.flag(of: tid))
-                let s = rawTB.start(of: tid)
-                let e = rawTB.end(of: tid)
-                let off = Int(s.rawValue - sf.baseLocation.rawValue)
-                let len = Int(e.rawValue - s.rawValue)
-                let txt = (off >= 0 && len >= 0 && off + len <= sf.length) ?
-                    String(decoding: UnsafeBufferPointer(start: sf.buffer.baseAddress! + off, count: len), as: UTF8.self) : ""
-                rawTokens.append(PPToken(kind: k, flags: f, location: s, endLocation: e, spelling: txt))
-            }
+            let rawTokens = lexFileToPPTokens(fid)
 
             var includedTokens: [PPToken] = []
             processTokenStream(rawTokens, currentFilePath: sf.path, into: &includedTokens)
@@ -1175,9 +1150,7 @@ public final class CPreprocessor {
                     let nextRep = macro.replacementTokens[repIdx + 1]
                     if let arg = paramToArg[nextRep.spelling] {
                         if let firstArg = arg.first {
-                            let pastedSpelling = prev.spelling + firstArg.spelling
-                            let pastedKind = classifyPastedToken(pastedSpelling)
-                            subst.append(makeSyntheticToken(kind: pastedKind, flags: prev.flags, spelling: pastedSpelling))
+                            subst.append(contentsOf: pasteTokens(prev, firstArg))
                             if arg.count > 1 {
                                 subst.append(contentsOf: arg.dropFirst())
                             }
@@ -1185,9 +1158,7 @@ public final class CPreprocessor {
                             subst.append(prev)
                         }
                     } else {
-                        let pastedSpelling = prev.spelling + nextRep.spelling
-                        let pastedKind = classifyPastedToken(pastedSpelling)
-                        subst.append(makeSyntheticToken(kind: pastedKind, flags: prev.flags, spelling: pastedSpelling))
+                        subst.append(contentsOf: pasteTokens(prev, nextRep))
                     }
                     repIdx += 2
                     continue
@@ -1231,20 +1202,6 @@ public final class CPreprocessor {
         }
         output.append(contentsOf: subst)
         return nextIdx
-    }
-
-    private func classifyPastedToken(_ s: String) -> CTokenKind {
-        guard let first = s.utf8.first else { return .identifier }
-        if first >= 0x30 && first <= 0x39 {
-            return s.contains(".") ? .floatLiteral : .intLiteral
-        }
-        if first == 0x22 { return .stringLiteral }
-        if first == 0x27 { return .charLiteral }
-        let utf8 = Array(s.utf8)
-        let rawKind = utf8.withUnsafeBufferPointer { buf in
-            CLexer.matchCKeyword(ptr: buf.baseAddress!, length: buf.count)
-        }
-        return CTokenKind(rawValue: rawKind) ?? .identifier
     }
 
     // MARK: - Constant Expression Evaluation (#if / #elif)
@@ -1325,8 +1282,8 @@ public final class CPreprocessor {
 
         // Step 4: Evaluate integer expression with Pratt parser
         var pCursor = 0
-        let val = parseConditionalExpr(step3, cursor: &pCursor, minPrec: 0)
-        return val != 0
+        let val = parseConditionalExpr(step3, cursor: &pCursor, minPrec: 0, evaluated: true)
+        return val.bits != 0
     }
 
     private func evaluateQuery(_ query: String, arg: String) -> Int64 {
@@ -1363,11 +1320,21 @@ public final class CPreprocessor {
         }
     }
 
-    private func parseConditionalExpr(_ tokens: [PPToken], cursor: inout Int, minPrec: Int) -> Int64 {
-        guard cursor < tokens.count else { return 0 }
+    /// A `#if` operand: every integer has type `intmax_t` or `uintmax_t` (C23 6.10.1p13).
+    private struct PPValue {
+        var bits: UInt64
+        var isUnsigned: Bool
+        static func signed(_ v: Int64) -> PPValue { PPValue(bits: UInt64(bitPattern: v), isUnsigned: false) }
+        static func bool(_ b: Bool) -> PPValue { .signed(b ? 1 : 0) }
+        var asSigned: Int64 { Int64(bitPattern: bits) }
+    }
 
-        // Primary prefix expression
-        var left = parseConditionalPrimary(tokens, cursor: &cursor)
+    /// Precedence-climbing evaluation. `evaluated` is false inside the unevaluated operand of `&&`, `||`
+    /// and `?:`, where division by zero is not an error (C23 6.6p3).
+    private func parseConditionalExpr(_ tokens: [PPToken], cursor: inout Int, minPrec: Int, evaluated: Bool) -> PPValue {
+        guard cursor < tokens.count else { return .signed(0) }
+
+        var left = parseConditionalPrimary(tokens, cursor: &cursor, evaluated: evaluated)
 
         while cursor < tokens.count {
             let op = tokens[cursor]
@@ -1377,39 +1344,61 @@ public final class CPreprocessor {
             cursor += 1
 
             if op.kind == .question {
-                // Ternary conditional expr: cond ? then : else
-                let thenVal = parseConditionalExpr(tokens, cursor: &cursor, minPrec: 0)
-                var elseVal: Int64 = 0
+                // Right-associative `cond ? a : b`; the result has the usual arithmetic conversions of a and b
+                let cond = left.bits != 0
+                let thenVal = parseConditionalExpr(tokens, cursor: &cursor, minPrec: 0, evaluated: evaluated && cond)
+                var elseVal = PPValue.signed(0)
                 if cursor < tokens.count && tokens[cursor].kind == .colon {
                     cursor += 1
-                    elseVal = parseConditionalExpr(tokens, cursor: &cursor, minPrec: 0)
+                    elseVal = parseConditionalExpr(tokens, cursor: &cursor, minPrec: prec, evaluated: evaluated && !cond)
                 }
-                left = (left != 0) ? thenVal : elseVal
+                left = cond ? thenVal : elseVal
+                left.isUnsigned = thenVal.isUnsigned || elseVal.isUnsigned
                 continue
             }
 
-            let nextMinPrec = prec + 1
-            let right = parseConditionalExpr(tokens, cursor: &cursor, minPrec: nextMinPrec)
-
+            let rightEvaluated: Bool
             switch op.kind {
-            case .pipePipe:           left = ((left != 0) || (right != 0)) ? 1 : 0
-            case .ampAmp:             left = ((left != 0) && (right != 0)) ? 1 : 0
-            case .pipe:               left = left | right
-            case .caret:              left = left ^ right
-            case .amp:                left = left & right
-            case .equalEqual:         left = (left == right) ? 1 : 0
-            case .exclaimEqual:       left = (left != right) ? 1 : 0
-            case .less:               left = (left < right) ? 1 : 0
-            case .lessEqual:          left = (left <= right) ? 1 : 0
-            case .greater:            left = (left > right) ? 1 : 0
-            case .greaterEqual:       left = (left >= right) ? 1 : 0
-            case .lessLess:           left = left << right
-            case .greaterGreater:     left = left >> right
-            case .plus:               left = left &+ right
-            case .minus:              left = left &- right
-            case .star:               left = left &* right
-            case .slash:              left = right != 0 ? left / right : 0
-            case .percent:            left = right != 0 ? left % right : 0
+            case .ampAmp:   rightEvaluated = evaluated && left.bits != 0
+            case .pipePipe: rightEvaluated = evaluated && left.bits == 0
+            default:        rightEvaluated = evaluated
+            }
+            let right = parseConditionalExpr(tokens, cursor: &cursor, minPrec: prec + 1, evaluated: rightEvaluated)
+
+            // Usual arithmetic conversions: if either operand is unsigned, both are (C23 6.3.1.8)
+            let u = left.isUnsigned || right.isUnsigned
+            let l = left.bits, r = right.bits
+            switch op.kind {
+            case .pipePipe:       left = .bool(l != 0 || r != 0)
+            case .ampAmp:         left = .bool(l != 0 && r != 0)
+            case .pipe:           left = PPValue(bits: l | r, isUnsigned: u)
+            case .caret:          left = PPValue(bits: l ^ r, isUnsigned: u)
+            case .amp:            left = PPValue(bits: l & r, isUnsigned: u)
+            case .equalEqual:     left = .bool(l == r)
+            case .exclaimEqual:   left = .bool(l != r)
+            case .less:           left = .bool(u ? l < r : left.asSigned < right.asSigned)
+            case .lessEqual:      left = .bool(u ? l <= r : left.asSigned <= right.asSigned)
+            case .greater:        left = .bool(u ? l > r : left.asSigned > right.asSigned)
+            case .greaterEqual:   left = .bool(u ? l >= r : left.asSigned >= right.asSigned)
+            // Shifts take the type of the (promoted) left operand
+            case .lessLess:       left = PPValue(bits: l &<< r, isUnsigned: left.isUnsigned)
+            case .greaterGreater:
+                left = left.isUnsigned ? PPValue(bits: l &>> r, isUnsigned: true) : .signed(left.asSigned &>> Int64(bitPattern: r))
+            case .plus:           left = PPValue(bits: l &+ r, isUnsigned: u)
+            case .minus:          left = PPValue(bits: l &- r, isUnsigned: u)
+            case .star:           left = PPValue(bits: l &* r, isUnsigned: u)
+            case .slash, .percent:
+                if r == 0 {
+                    if rightEvaluated { diagnostics.report(.ppDivisionByZero, at: op.location, args: []) }
+                    left = PPValue(bits: 0, isUnsigned: u)
+                } else if u {
+                    left = PPValue(bits: op.kind == .slash ? l / r : l % r, isUnsigned: true)
+                } else {
+                    // INT64_MIN / -1 overflows; wrap instead of trapping
+                    let (q, _) = left.asSigned.dividedReportingOverflow(by: right.asSigned)
+                    let (m, _) = left.asSigned.remainderReportingOverflow(dividingBy: right.asSigned)
+                    left = .signed(op.kind == .slash ? q : m)
+                }
             default: break
             }
         }
@@ -1417,52 +1406,37 @@ public final class CPreprocessor {
         return left
     }
 
-    private func parseConditionalPrimary(_ tokens: [PPToken], cursor: inout Int) -> Int64 {
-        guard cursor < tokens.count else { return 0 }
+    private func parseConditionalPrimary(_ tokens: [PPToken], cursor: inout Int, evaluated: Bool) -> PPValue {
+        guard cursor < tokens.count else { return .signed(0) }
         let t = tokens[cursor]
         cursor += 1
 
         switch t.kind {
         case .plus:
-            return parseConditionalPrimary(tokens, cursor: &cursor)
+            return parseConditionalPrimary(tokens, cursor: &cursor, evaluated: evaluated)
         case .minus:
-            return -parseConditionalPrimary(tokens, cursor: &cursor)
+            var v = parseConditionalPrimary(tokens, cursor: &cursor, evaluated: evaluated)
+            v.bits = 0 &- v.bits
+            return v
         case .tilde:
-            return ~parseConditionalPrimary(tokens, cursor: &cursor)
+            var v = parseConditionalPrimary(tokens, cursor: &cursor, evaluated: evaluated)
+            v.bits = ~v.bits
+            return v
         case .exclaim:
-            return (parseConditionalPrimary(tokens, cursor: &cursor) == 0) ? 1 : 0
+            return .bool(parseConditionalPrimary(tokens, cursor: &cursor, evaluated: evaluated).bits == 0)
         case .lParen:
-            let val = parseConditionalExpr(tokens, cursor: &cursor, minPrec: 0)
+            let val = parseConditionalExpr(tokens, cursor: &cursor, minPrec: 0, evaluated: evaluated)
             if cursor < tokens.count && tokens[cursor].kind == .rParen {
                 cursor += 1
             }
             return val
         case .intLiteral:
-            var s = t.spelling.lowercased().filter { $0 != "'" }
-            while let last = s.last, last == "u" || last == "l" || last == "z" {
-                s.removeLast()
-            }
-            if s.hasPrefix("0x") {
-                if let u = UInt64(s.dropFirst(2), radix: 16) { return Int64(bitPattern: u) }
-                return 0
-            } else if s.hasPrefix("0b") {
-                if let u = UInt64(s.dropFirst(2), radix: 2) { return Int64(bitPattern: u) }
-                return 0
-            } else if s.hasPrefix("0") && s.count > 1 {
-                if let u = UInt64(s.dropFirst(1), radix: 8) { return Int64(bitPattern: u) }
-                return 0
-            } else {
-                let digits = s.prefix(while: { $0 >= "0" && $0 <= "9" })
-                if let u = UInt64(digits) { return Int64(bitPattern: u) }
-                return 0
-            }
+            guard let lit = CLiteral.integerValue(t.spelling) else { return .signed(0) }
+            return PPValue(bits: lit.value, isUnsigned: lit.isUnsigned)
         case .charLiteral:
-            if let c = t.spelling.dropFirst().first {
-                return Int64(c.asciiValue ?? 0)
-            }
-            return 0
+            return .signed(CLiteral.characterValue(t.spelling))
         default:
-            return 0
+            return .signed(0)
         }
     }
 

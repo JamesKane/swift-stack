@@ -1718,6 +1718,13 @@ public enum A64InstructionTable {
 
 public enum A64Encoder {
     /// Encodes a structured `A64Instruction` into a 32-bit machine word using `A64InstructionTable`.
+    /// True if a byte displacement is word-aligned and fits a signed `bits`-wide word-offset field.
+    @inline(__always)
+    static func pcRelInRange(_ byteDisp: Int64, bits: Int) -> Bool {
+        let limit = Int64(1) << (bits + 1)
+        return (byteDisp & 3) == 0 && byteDisp >= -limit && byteDisp < limit
+    }
+
     public static func encode(_ instr: A64Instruction) -> UInt32? {
         let desc = A64InstructionTable.descriptor(for: instr.opcode)
         let sf: UInt32 = instr.is64Bit ? (1 << 31) : 0
@@ -1820,17 +1827,20 @@ public enum A64Encoder {
             return sf | desc.opcodeBits | (imm5 << 16) | (c << 12) | (rn << 5) | nzcv
 
         case .branchImm26:
+            guard pcRelInRange(instr.imm, bits: 26) else { return nil }
             let words = instr.imm >> 2
             let imm26 = UInt32(bitPattern: Int32(truncatingIfNeeded: words)) & 0x03FF_FFFF
             return desc.opcodeBits | imm26
 
         case .branchCond19:
+            guard pcRelInRange(instr.imm, bits: 19) else { return nil }
             let words = instr.imm >> 2
             let imm19 = UInt32(bitPattern: Int32(truncatingIfNeeded: words)) & 0x7_FFFF
             let c = UInt32(instr.cond.rawValue) & 0xF
             return desc.opcodeBits | (imm19 << 5) | c
 
         case .compareBranch19:
+            guard pcRelInRange(instr.imm, bits: 19) else { return nil }
             let words = instr.imm >> 2
             let imm19 = UInt32(bitPattern: Int32(truncatingIfNeeded: words)) & 0x7_FFFF
             return sf | desc.opcodeBits | (imm19 << 5) | rd
@@ -1839,6 +1849,7 @@ public enum A64Encoder {
             let bit = UInt32(instr.amount) & 0x3F
             let b5 = (bit >> 5) & 1
             let b40 = bit & 0x1F
+            guard pcRelInRange(instr.imm, bits: 14) else { return nil }
             let words = instr.imm >> 2
             let imm14 = UInt32(bitPattern: Int32(truncatingIfNeeded: words)) & 0x3FFF
             return (b5 << 31) | desc.opcodeBits | (b40 << 19) | (imm14 << 5) | rd
@@ -1922,6 +1933,7 @@ public enum A64Encoder {
             return desc.opcodeBits | sizeBit30 | (rm << 16) | (opt << 13) | sBit | (rn << 5) | rd
 
         case .ldrLiteral:
+            guard pcRelInRange(instr.imm, bits: 19) else { return nil }
             let sizeBit30: UInt32 = instr.is64Bit ? (1 << 30) : 0
             let words = instr.imm >> 2
             let imm19 = UInt32(bitPattern: Int32(truncatingIfNeeded: words)) & 0x7_FFFF

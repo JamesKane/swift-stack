@@ -349,7 +349,7 @@ public enum RVAsm {
             session.currentSection.fragments.append(
                 .relaxable(
                     branch: .rvBranch(baseInst: baseInst, rvcAllowed: rvc, targetSymbol: sym, addend: addend),
-                    isLong: !rvc,
+                    form: rvc ? 0 : 1,
                     lineNumber: lineNumber
                 )
             )
@@ -764,7 +764,7 @@ public enum RVAsm {
             session.currentSection.fragments.append(
                 .relaxable(
                     branch: .rvBranch(baseInst: baseInst, rvcAllowed: useCJ, targetSymbol: sym, addend: addend),
-                    isLong: !useCJ,
+                    form: useCJ ? 0 : 1,
                     lineNumber: lineNumber
                 )
             )
@@ -1044,7 +1044,7 @@ public enum RVAsm {
         session.currentSection.fragments.append(
             .relaxable(
                 branch: .rvBranch(baseInst: baseInst, rvcAllowed: isCompressedOp && rvc, targetSymbol: sym, addend: addend),
-                isLong: !(isCompressedOp && rvc),
+                form: (isCompressedOp && rvc) ? 0 : 1,
                 lineNumber: lineNumber
             )
         )

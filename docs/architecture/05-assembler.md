@@ -237,7 +237,14 @@ Functions with no CFI region (common in entry stubs and context switches) get no
 
 - **Round trip:** every `Encode` table entry is assembled from text, disassembled, and compared with the original statement.
 - **Differential:** each corpus file is assembled with Swift-Stack and with host GNU `as` / `llvm-mc`. The `.text` bytes, symbol tables and relocations are compared (after normalizing for documented differences such as RISC-V relaxation).
-- **Corpus:** Todhchai `system/sys/floor/start.S`, context-switch and trap sources for all three architectures, plus synthetic tests for every directive in §4.4.
+  - Both objects are parsed by an independent test-only ELF reader. Relocations against local symbols are normalized to `section + offset`, since GNU `as` and LLVM MC choose differently between a section symbol and a local label; temporary `.L*` labels and `$x`/`$d` mapping symbols are excluded.
+  - Every allocatable section is compared: bytes, size, flags, alignment. So are all relocations (type, offset, target, addend) and all non-temporary symbols (binding, type, visibility, section, value, size).
+- **Documented intentional differences from GNU `as` (x86-64).** Swift-Stack follows LLVM MC here, and the `clang -c` comparison checks these sections exactly:
+  1. `.text` alignment is 4 (GNU: 1).
+  2. Multi-byte NOP padding uses a single 6-byte `nopw` where GNU emits `nop` + 5-byte `nopl`.
+  3. A memory displacement given by a label difference that is unknown when the instruction is parsed (`lea T_OFF(sym)(%rsi)` with `T_OFF(x) = x - base`) is encoded as `disp32`. GNU `as` later relaxes it to `disp8`, which changes the containing section's size.
+- **Encoder oracle:** every `Encode` table sample is also checked against `llvm-mc`. `llvm-mc` assembles the disassembler's text, and the bytes must match or decode to the same instruction. This catches encoder/disassembler pairs that agree on a wrong encoding, which a self round trip cannot.
+- **Corpus:** Todhchai `system/sys/floor/start.S`, context-switch and trap sources for all three architectures, plus synthetic tests for every directive in §4.4. Regressions live in `Tests/Differential/asm/<arch>/`.
 
 ## 5. Alternatives considered
 

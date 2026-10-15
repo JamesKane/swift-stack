@@ -989,6 +989,11 @@ internal enum A64Asm {
                     }
                     return
                 } else if let exprVal = evalExpr(rhs, session: session),
+                          case .constant(let disp) = exprVal {
+                    // `ldr xN, #disp` -- PC-relative literal with an explicit byte displacement
+                    emitInst(A64Instruction(opcode: .ldrLit, is64Bit: is64, rd: rt, imm: disp), into: sec, lineNumber: lineNumber)
+                    return
+                } else if let exprVal = evalExpr(rhs, session: session),
                           case .symbolOffset(let sym, let addend, _) = exprVal {
                     let base = A64Instruction(opcode: .ldrLit, is64Bit: is64, rd: rt, imm: 0)
                     if let bytes = A64Encoder.encodeBytes(base) {

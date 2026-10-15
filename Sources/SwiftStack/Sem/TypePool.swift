@@ -58,6 +58,7 @@ public struct CTypeInfo: Sendable, Equatable {
 public final class TypePool {
     private var types: [CTypeInfo] = []
     private var pointerCache: [QualType: TypeId] = [:]
+    /// Keyed by name and underlying type: a block-scope typedef may reuse an outer name for another type.
     private var typedefCache: [String: TypeId] = [:]
     private var structCache: [String: TypeId] = [:]
     private var enumCache: [String: TypeId] = [:]
@@ -132,7 +133,10 @@ public final class TypePool {
 
     public func canonical(of id: TypeId) -> TypeId {
         let info = typeInfo(of: id)
-        return info.canonical.isValid ? info.canonical : id
+        if info.canonical.isValid { return info.canonical }
+        // A typedef of the error type (an unmodeled declarator) is itself unmodeled
+        if case .typedef(_, let underlying) = info.kind { return canonical(of: underlying.typeId) }
+        return id
     }
 
     // MARK: - Classification
@@ -185,6 +189,8 @@ public final class TypePool {
             return pointee
         case .array(let element, _):
             return element
+        case .error:
+            return .error  // an unmodeled type stays unmodeled through `*` and `[]`
         default:
             return .void
         }
@@ -338,7 +344,8 @@ public final class TypePool {
     }
 
     public func typedefType(name: String, underlying: QualType) -> TypeId {
-        if let existing = typedefCache[name] {
+        let key = "\(name)#\(underlying.typeId.rawIndex)"
+        if let existing = typedefCache[key] {
             return existing
         }
         let can = canonical(of: underlying.typeId)
@@ -346,7 +353,7 @@ public final class TypePool {
         let al = alignment(of: can)
         let id = TypeId(UInt32(types.count))
         types.append(CTypeInfo(kind: .typedef(name: name, underlying: underlying), size: sz, alignment: al, canonical: can))
-        typedefCache[name] = id
+        typedefCache[key] = id
         return id
     }
 

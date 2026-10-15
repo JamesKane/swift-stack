@@ -257,16 +257,30 @@ public final class SourceManager: @unchecked Sendable {
     public func file(containing location: SourceLocation) -> (file: SourceFile, offset: UInt32)? {
         let loc = location.rawValue
         return lock.withLock {
-            for file in files.compactMap({ $0 }) {
-                guard file.id.isValid else { continue }
-                let start = file.baseLocation.rawValue
-                let end = start + UInt32(file.length)
-                if (loc >= start && loc < end) || (file.length == 0 && loc == start) {
-                    return (file, loc - start)
-                }
+            // Files are appended with strictly increasing base locations, so binary-search for the last
+            // file whose base is <= loc (index 0 is the nil file).
+            var lo = 1, hi = files.count - 1, found = -1
+            while lo <= hi {
+                let mid = (lo + hi) / 2
+                guard let f = files[mid] else { lo = mid + 1; continue }
+                if f.baseLocation.rawValue <= loc { found = mid; lo = mid + 1 } else { hi = mid - 1 }
+            }
+            guard found > 0, let file = files[found], file.id.isValid else { return nil }
+            let start = file.baseLocation.rawValue
+            let end = start + UInt32(file.length)
+            if loc < end || (file.length == 0 && loc == start) {
+                return (file, loc - start)
             }
             return nil
         }
+    }
+
+    /// Source text of the half-open location range `[start, end)`, from whichever buffer contains it.
+    public func text(from start: SourceLocation, to end: SourceLocation) -> String? {
+        guard end.rawValue >= start.rawValue, let (file, off) = file(containing: start) else { return nil }
+        let len = Int(end.rawValue - start.rawValue)
+        guard let base = file.buffer.baseAddress, Int(off) + len <= file.length else { return nil }
+        return String(decoding: UnsafeBufferPointer(start: base + Int(off), count: len), as: UTF8.self)
     }
 
     /// Accesses a source file by FileId. FileId(0) returns the nil file.

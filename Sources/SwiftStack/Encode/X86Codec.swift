@@ -2424,8 +2424,9 @@ public struct X86TableEncoder: Sendable {
             }
             out.append(opcodeByte)
         } else {
-            // Legacy operand-size override prefix (0x66)
-            if !desc.suppressOperandSizePrefix && desc.mandatoryPrefix == .none {
+            // Legacy operand-size override prefix (0x66). It also applies under an F3/F2 mandatory prefix
+            // (16-bit `tzcnt`/`lzcnt`/`popcnt` are `66 F3 0F ..`); only a mandatory 0x66 replaces it.
+            if desc.usesOperandSizeOverride {
                 if (mode == .mode64 || mode == .mode32) && desc.operandSize == .word {
                     out.append(0x66)
                 } else if mode == .mode16 && desc.operandSize == .dword {
@@ -2785,9 +2786,9 @@ public struct X86Disassembler: Sendable {
             case .p66F2:
                 guard has66 && hasF2 && !hasF3 else { return nil }
             case .pF2:
-                guard hasF2 && !has66 && !hasF3 else { return nil }
+                guard hasF2 && !hasF3 else { return nil }
             case .pF3:
-                guard hasF3 && !has66 && !hasF2 else { return nil }
+                guard hasF3 && !hasF2 else { return nil }
             case .p66:
                 guard has66 && !hasF2 && !hasF3 else { return nil }
             case .none:
@@ -2807,7 +2808,7 @@ public struct X86Disassembler: Sendable {
                 guard !rexW else { return nil }
             }
 
-            if desc.mandatoryPrefix == .none && !desc.suppressOperandSizePrefix {
+            if desc.usesOperandSizeOverride {
                 if desc.operandSize == .word {
                     let expects66 = (codeMode != .mode16)
                     guard has66 == expects66 else { return nil }
@@ -3120,7 +3121,7 @@ public struct X86Disassembler: Sendable {
             guard desc.operandSize == .byte || desc.operandSize == .word || desc.operandSize == .dword || desc.operandSize == .qword else {
                 return false
             }
-            if desc.mnemonic.hasSuffix(desc.operandSize.attSuffix) { return false }
+            if desc.mnemonic.hasSuffix(desc.operandSize.attSuffix) || desc.hasImplicitSizeMnemonic { return false }
             let hasGPR = operands.contains { op in
                 if case .reg(let r) = op, r.isGPR { return true }
                 return false
@@ -3209,7 +3210,7 @@ extension X86InstructionTable {
                     ops = [.reg(sampleReg(rc, index: 1))]
                 case .memOnly:
                     ops = [.mem(sampleMem)]
-                    if desc.operandSize == .word || desc.operandSize == .qword {
+                    if (desc.operandSize == .word || desc.operandSize == .qword) && !desc.hasImplicitSizeMnemonic {
                         suffix = desc.operandSize
                     }
                 case .indirectRegOrMem:
@@ -3361,5 +3362,24 @@ extension X86InstructionTable {
         }
 
         return results
+    }
+}
+
+extension X86InstrDesc {
+    /// Mnemonics whose name already fixes the operand size (`cmpxchg16b`, `fxsave64`, `xsave64`, ...);
+    /// AT&T syntax never adds a `b`/`w`/`l`/`q` suffix to them.
+    @inlinable
+    var hasImplicitSizeMnemonic: Bool {
+        mnemonic.hasSuffix("64") || mnemonic == "cmpxchg8b" || mnemonic == "cmpxchg16b"
+    }
+
+    /// True if the operand size is selected with the legacy 0x66 override (rather than a mandatory 0x66 prefix).
+    @inlinable
+    var usesOperandSizeOverride: Bool {
+        guard !suppressOperandSizePrefix else { return false }
+        switch mandatoryPrefix {
+        case .none, .pF3, .pF2: return true
+        case .p66, .p66F2:      return false
+        }
     }
 }

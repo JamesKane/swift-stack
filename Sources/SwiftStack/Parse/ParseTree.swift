@@ -173,6 +173,9 @@ public struct ParseTree: ~Copyable {
     public var kinds: Column<NodeId, UInt8>
     public var tokens: Column<NodeId, UInt32>
     public var subtreeSizes: Column<NodeId, UInt32>
+    /// Number of nodes appended with the error bit. The bit is not propagated to ancestors, so a
+    /// tree is free of syntax errors only when this is zero (not merely when the root is clean).
+    public var errorNodeCount: Int = 0
 
     @usableFromInline
     static let errorMask: UInt32 = 0x8000_0000
@@ -210,6 +213,7 @@ public struct ParseTree: ~Copyable {
         hasError: Bool = false
     ) -> NodeId {
         let sizeValue = (subtreeSize & Self.sizeMask) | (hasError ? Self.errorMask : 0)
+        if hasError { errorNodeCount += 1 }
         _ = kinds.append(kind.rawValue)
         _ = tokens.append(token.rawIndex)
         return subtreeSizes.append(sizeValue)

@@ -24,11 +24,16 @@ public enum SWAR {
         return ge & le
     }
 
-    /// Tests for zero bytes within a 64-bit word.
+    /// Sets the high bit of exactly those bytes of w that are zero.
+    ///
+    /// The shorter `(w - 0x01..) & ~w & 0x80..` only answers "is there any zero byte": its borrow also
+    /// flags a 0x01 byte above a zero byte, which made `horizontalSpaceRun` treat the `!` of `  !=` as a
+    /// space (`' ' ^ ' ' == 0`, `'!' ^ ' ' == 1`). This form cannot carry or borrow between bytes.
     @_noAllocation
     @inline(__always)
     public static func hasZeroByte(_ w: UInt64) -> UInt64 {
-        (w &- loBits) & ~w & hiBits
+        let lo7: UInt64 = 0x7F7F_7F7F_7F7F_7F7F
+        return ~(((w & lo7) &+ lo7) | w | lo7)
     }
 
     /// Number of leading ASCII identifier-continuation bytes in w (0...8), or nil for non-ASCII.

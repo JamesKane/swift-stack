@@ -124,6 +124,8 @@ public final class DiagnosticRegistry: @unchecked Sendable {
         register(DiagnosticInfo(id: .ppEmbedNotFound, name: "preprocessor.embed_not_found", severity: .error, category: .preprocessor, messageTemplate: "#embed resource '%@' not found"))
         register(DiagnosticInfo(id: .ppEmbedInvalidParam, name: "preprocessor.embed_invalid_param", severity: .error, category: .preprocessor, messageTemplate: "unsupported #embed parameter '%@'"))
         register(DiagnosticInfo(id: .ppExtraTokensDirective, name: "preprocessor.extra_tokens_directive", severity: .warning, category: .preprocessor, messageTemplate: "extra tokens at end of #%@ directive"))
+        register(DiagnosticInfo(id: .ppInvalidPaste, name: "preprocessor.invalid_paste", severity: .error, category: .preprocessor, messageTemplate: "pasting \"%@\" and \"%@\" does not give a valid preprocessing token"))
+        register(DiagnosticInfo(id: .ppDivisionByZero, name: "preprocessor.division_by_zero", severity: .error, category: .preprocessor, messageTemplate: "division by zero in preprocessor expression"))
 
         // Lexer diagnostics
         register(DiagnosticInfo(id: .lexUnterminatedString, name: "lex.unterminated_string", severity: .error, category: .lex, messageTemplate: "missing terminating '\"' character"))
@@ -140,6 +142,7 @@ public final class DiagnosticRegistry: @unchecked Sendable {
         register(DiagnosticInfo(id: .parseNestingLimitExceeded, name: "parse.nesting_limit_exceeded", severity: .error, category: .parse, messageTemplate: "maximum nesting depth limit (%@) exceeded"))
 
         // Sema diagnostics
+        register(DiagnosticInfo(id: .semaUnknownTypeName, name: "sema.unknown_type_name", severity: .error, category: .sema, messageTemplate: "unknown type name '%@'"))
         register(DiagnosticInfo(id: .semaUndeclaredIdentifier, name: "sema.undeclared_identifier", severity: .error, category: .sema, messageTemplate: "use of undeclared identifier '%@'"))
         register(DiagnosticInfo(id: .semaRedeclaration, name: "sema.redeclaration", severity: .error, category: .sema, messageTemplate: "redefinition of '%@' with different type"))
         register(DiagnosticInfo(id: .semaTypeMismatch, name: "sema.type_mismatch", severity: .error, category: .sema, messageTemplate: "incompatible types: cannot convert '%@' to '%@'"))
@@ -151,6 +154,17 @@ public final class DiagnosticRegistry: @unchecked Sendable {
         register(DiagnosticInfo(id: .semaConstantExprNotConstant, name: "sema.not_constant_expression", severity: .error, category: .sema, messageTemplate: "expression is not an integer constant expression"))
         register(DiagnosticInfo(id: .semaIncompleteType, name: "sema.incomplete_type", severity: .error, category: .sema, messageTemplate: "variable has incomplete type '%@'"))
         register(DiagnosticInfo(id: .semaInvalidSubscript, name: "sema.invalid_subscript", severity: .error, category: .sema, messageTemplate: "subscripted value is not an array, pointer, or vector"))
+        register(DiagnosticInfo(id: .semaStaticAssertFailed, name: "sema.static_assert_failed", severity: .error, category: .sema, messageTemplate: "static assertion failed%@"))
+        register(DiagnosticInfo(id: .semaJumpOutsideLoop, name: "sema.jump_outside_loop", severity: .error, category: .sema, messageTemplate: "'%@' statement not in %@"))
+        register(DiagnosticInfo(id: .semaDuplicateCase, name: "sema.duplicate_case", severity: .error, category: .sema, messageTemplate: "duplicate %@ in switch"))
+        register(DiagnosticInfo(id: .semaNotAssignable, name: "sema.not_assignable", severity: .error, category: .sema, messageTemplate: "expression is not assignable%@"))
+        register(DiagnosticInfo(id: .semaInvalidOperands, name: "sema.invalid_operands", severity: .error, category: .sema, messageTemplate: "invalid operands to '%@' ('%@' and '%@')"))
+        register(DiagnosticInfo(id: .semaVoidReturnValue, name: "sema.void_return_value", severity: .error, category: .sema, messageTemplate: "void function '%@' should not return a value"))
+        register(DiagnosticInfo(id: .semaUndefinedLabel, name: "sema.undefined_label", severity: .error, category: .sema, messageTemplate: "use of undeclared label '%@'"))
+        register(DiagnosticInfo(id: .semaRedefinition, name: "sema.redefinition", severity: .error, category: .sema, messageTemplate: "redefinition of '%@'"))
+        register(DiagnosticInfo(id: .semaScalarRequired, name: "sema.scalar_required", severity: .error, category: .sema, messageTemplate: "statement requires expression of scalar type ('%@' invalid)"))
+        register(DiagnosticInfo(id: .semaAddressOfRvalue, name: "sema.address_of_rvalue", severity: .error, category: .sema, messageTemplate: "cannot take the address of an rvalue"))
+        register(DiagnosticInfo(id: .semaIndirectionNonPointer, name: "sema.indirection_non_pointer", severity: .error, category: .sema, messageTemplate: "indirection requires pointer operand"))
         register(DiagnosticInfo(id: .semaGlobalNotSupported, name: "sema.global_not_supported", severity: .error, category: .sema, messageTemplate: "global variable '%@' is not supported in this configuration"))
 
         // Driver diagnostics
@@ -162,6 +176,8 @@ public final class DiagnosticRegistry: @unchecked Sendable {
         register(DiagnosticInfo(id: .asmInvalidInstruction, name: "assembler.invalid_instruction", severity: .error, category: .assembler, messageTemplate: "invalid instruction '%@'"))
         register(DiagnosticInfo(id: .asmInvalidExpression, name: "assembler.invalid_expression", severity: .error, category: .assembler, messageTemplate: "invalid assembler expression '%@'"))
         register(DiagnosticInfo(id: .asmUndefinedSymbol, name: "assembler.undefined_symbol", severity: .error, category: .assembler, messageTemplate: "undefined local symbol '%@'"))
+        register(DiagnosticInfo(id: .asmBranchOutOfRange, name: "assembler.branch_out_of_range", severity: .error, category: .assembler, messageTemplate: "branch target out of range"))
+        register(DiagnosticInfo(id: .asmInvalidOperands, name: "assembler.invalid_operands", severity: .error, category: .assembler, messageTemplate: "invalid operands or out-of-range immediate for '%@'"))
     }
 }
 
@@ -177,6 +193,8 @@ extension DiagId {
     public static let ppEmbedNotFound           = DiagId(7)
     public static let ppEmbedInvalidParam       = DiagId(8)
     public static let ppExtraTokensDirective    = DiagId(9)
+    public static let ppInvalidPaste            = DiagId(10)
+    public static let ppDivisionByZero          = DiagId(11)
 
     // Lexer (20..29)
     public static let lexUnterminatedString     = DiagId(20)
@@ -205,6 +223,18 @@ extension DiagId {
     public static let semaIncompleteType        = DiagId(59)
     public static let semaInvalidSubscript      = DiagId(60)
     public static let semaGlobalNotSupported    = DiagId(61)
+    public static let semaUnknownTypeName       = DiagId(62)
+    public static let semaStaticAssertFailed    = DiagId(63)
+    public static let semaJumpOutsideLoop       = DiagId(64)
+    public static let semaDuplicateCase         = DiagId(65)
+    public static let semaNotAssignable         = DiagId(66)
+    public static let semaInvalidOperands       = DiagId(67)
+    public static let semaVoidReturnValue       = DiagId(68)
+    public static let semaUndefinedLabel        = DiagId(69)
+    public static let semaRedefinition          = DiagId(70)
+    public static let semaScalarRequired        = DiagId(71)
+    public static let semaAddressOfRvalue       = DiagId(72)
+    public static let semaIndirectionNonPointer = DiagId(73)
 
     // Driver (80..99)
     public static let driverInputFileNotFound   = DiagId(80)
@@ -215,6 +245,8 @@ extension DiagId {
     public static let asmInvalidInstruction     = DiagId(101)
     public static let asmInvalidExpression      = DiagId(102)
     public static let asmUndefinedSymbol        = DiagId(103)
+    public static let asmBranchOutOfRange       = DiagId(104)
+    public static let asmInvalidOperands        = DiagId(105)
 }
 
 /// A secondary attached note pointing to an auxiliary location.

@@ -9,6 +9,8 @@ public struct AIRLowering {
     private let typePool: TypePool
     private let sourceBuffer: UnsafePointer<UInt8>
     private let sourceLength: Int
+    /// Resolves token spellings in any buffer (included headers, macro expansions, pasted tokens).
+    private let sourceManager: SourceManager?
     public private(set) var hasLoweringError: Bool = false
 
     public init(
@@ -17,8 +19,10 @@ public struct AIRLowering {
         semResult: SemResult,
         typePool: TypePool,
         sourceBuffer: UnsafePointer<UInt8>,
-        sourceLength: Int
+        sourceLength: Int,
+        sourceManager: SourceManager? = nil
     ) {
+        self.sourceManager = sourceManager
         self.tree = tree
         self.tokens = tokens
         self.semResult = semResult
@@ -29,10 +33,32 @@ public struct AIRLowering {
 
     private func spelling(of tok: TokenId) -> String {
         guard tok.isValid else { return "" }
-        let s = Int(tokens.pointee.start(of: tok).rawValue)
-        let e = Int(tokens.pointee.end(of: tok).rawValue)
+        let startLoc = tokens.pointee.start(of: tok)
+        let endLoc = tokens.pointee.end(of: tok)
+        if let sm = sourceManager, let text = sm.text(from: startLoc, to: endLoc) {
+            return text
+        }
+        let s = Int(startLoc.rawValue)
+        let e = Int(endLoc.rawValue)
         guard s >= 0, e >= s, e <= sourceLength else { return "" }
         return String(decoding: UnsafeBufferPointer(start: sourceBuffer + s, count: e - s), as: UTF8.self)
+    }
+
+    /// Arithmetic opcode of a compound assignment (`+=` → `add`), or nil for plain `=`.
+    private static func compoundAssignmentOpcode(_ k: CTokenKind) -> AIROpcode? {
+        switch k {
+        case .plusEqual:           return .add
+        case .minusEqual:          return .sub
+        case .starEqual:           return .mul
+        case .slashEqual:          return .sdiv
+        case .percentEqual:        return .srem
+        case .ampEqual:            return .band
+        case .pipeEqual:           return .bor
+        case .caretEqual:          return .bxor
+        case .lessLessEqual:       return .shl
+        case .greaterGreaterEqual: return .shr
+        default:                   return nil
+        }
     }
 
     public mutating func lower() -> AIRModule {
@@ -271,7 +297,7 @@ public struct AIRLowering {
         case .intLiteral:
             let tok = tree.pointee.token(of: exprNode)
             let txt = spelling(of: tok)
-            let val = parseInteger(txt)
+            let val = CLiteral.integerValue(txt)?.value ?? 0
             if val > UInt64(UInt32.max) {
                 let inst = airFn.appendInstruction(
                     opcode: .iconst64,
@@ -309,11 +335,7 @@ public struct AIRLowering {
 
         case .stringLiteral:
             let tok = tree.pointee.token(of: exprNode)
-            var raw = spelling(of: tok)
-            if raw.hasPrefix("\"") && raw.hasSuffix("\"") && raw.count >= 2 {
-                raw = String(raw.dropFirst().dropLast())
-            }
-            let unescaped = unescapeString(raw)
+            let unescaped = CLiteral.unescapedString(CLiteral.body(of: spelling(of: tok), quote: "\""))
             let idx = semResult.stringLiterals[unescaped] ?? 0
             let inst = airFn.appendInstruction(
                 opcode: .stringConst,
@@ -354,7 +376,24 @@ public struct AIRLowering {
             guard children.count == 2 else { return .nilId }
             let lhs = children[0]
             let rhs = children[1]
-            let rhsVal = lowerExpression(rhs, airFn: &airFn, currentBlock: &currentBlock)
+            var rhsVal = lowerExpression(rhs, airFn: &airFn, currentBlock: &currentBlock)
+            let assignOp = CTokenKind(rawValue: tokens.pointee.kind(of: tree.pointee.token(of: exprNode))) ?? .equal
+            let compoundOp = Self.compoundAssignmentOpcode(assignOp)
+
+            /// For `lhs op= rhs`: loads the current value through `ptr` and combines it with `rhs`.
+            func combine(withValueAt ptr: ValueId, lhsType: TypeId, airFn: inout AIRFunctionSoA, block: BlockId) -> ValueId {
+                guard let op = compoundOp else { return rhsVal }
+                let cur = ValueId.instResult(airFn.appendInstruction(opcode: .load, type: lhsType, op0: ptr, inBlock: block))
+                var r = rhsVal
+                if (op == .add || op == .sub) && typePool.isPointer(type: lhsType) {
+                    let sz = typePool.size(of: typePool.pointeeType(of: lhsType).typeId)
+                    if sz > 1 {
+                        let szVal = ValueId.instResult(airFn.appendInstruction(opcode: .iconst, type: .int, aux: UInt32(sz), inBlock: block))
+                        r = ValueId.instResult(airFn.appendInstruction(opcode: .mul, type: .int, op0: r, op1: szVal, inBlock: block))
+                    }
+                }
+                return ValueId.instResult(airFn.appendInstruction(opcode: op, type: lhsType, op0: cur, op1: r, inBlock: block))
+            }
 
             if tree.pointee.kind(of: lhs) == .identExpr, let sym = semResult.symbolRefs[lhs] {
                 switch sym.storage {
@@ -366,6 +405,7 @@ public struct AIRLowering {
                         aux: absOff,
                         inBlock: currentBlock
                     )
+                    rhsVal = combine(withValueAt: ValueId.instResult(ptrInst), lhsType: sym.type.typeId, airFn: &airFn, block: currentBlock)
                     _ = airFn.appendInstruction(
                         opcode: .store,
                         type: .void,
@@ -383,6 +423,9 @@ public struct AIRLowering {
                 let opKind = CTokenKind(rawValue: tokens.pointee.kind(of: opTok))
                 if opKind == .star, let ptrExpr = tree.pointee.children(of: lhs).first {
                     let ptrVal = lowerExpression(ptrExpr, airFn: &airFn, currentBlock: &currentBlock)
+                    if compoundOp != nil, let lhsType = semResult.nodeTypes[lhs] {
+                        rhsVal = combine(withValueAt: ptrVal, lhsType: lhsType, airFn: &airFn, block: currentBlock)
+                    }
                     _ = airFn.appendInstruction(
                         opcode: .store,
                         type: .void,
@@ -691,44 +734,5 @@ public struct AIRLowering {
             }
         }
         return 0
-    }
-
-    private func unescapeString(_ s: String) -> String {
-        var result = ""
-        let chars = Array(s)
-        var i = 0
-        while i < chars.count {
-            if chars[i] == "\\" && i + 1 < chars.count {
-                i += 1
-                switch chars[i] {
-                case "n": result.append("\n")
-                case "r": result.append("\r")
-                case "t": result.append("\t")
-                case "\\": result.append("\\")
-                case "\"": result.append("\"")
-                case "0": result.append("\0")
-                default: result.append(chars[i])
-                }
-            } else {
-                result.append(chars[i])
-            }
-            i += 1
-        }
-        return result
-    }
-
-    private func parseInteger(_ txt: String) -> UInt64 {
-        var clean = txt.replacingOccurrences(of: "'", with: "")
-        while clean.hasSuffix("u") || clean.hasSuffix("U") || clean.hasSuffix("l") || clean.hasSuffix("L") {
-            clean.removeLast()
-        }
-        if clean.hasPrefix("0x") || clean.hasPrefix("0X") {
-            return UInt64(clean.dropFirst(2), radix: 16) ?? 0
-        } else if clean.hasPrefix("0b") || clean.hasPrefix("0B") {
-            return UInt64(clean.dropFirst(2), radix: 2) ?? 0
-        } else if clean.hasPrefix("0") && clean.count > 1 {
-            return UInt64(clean.dropFirst(1), radix: 8) ?? 0
-        }
-        return UInt64(clean) ?? 0
     }
 }

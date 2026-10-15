@@ -3,9 +3,16 @@
 > A clean-room implementation of Swift 6.x and ISO C23: frontends, semantic analysis, optimizer, code generators, assemblers, linker, debug-info format and runtimes. Every persistent compiler data structure is a flat, index-addressed table (Data-Oriented Design).
 
 **Status:** Milestone M0 (Foundation & Measurement), Milestone M0.5 (Vertical Slice), Milestone M1 (C23 Frontend, Preprocessor, SemIR, and Diagnostics), and Milestone M2 (Encoders, Object Model, and Assemblers) implemented and verified.
-- **Encoders, Object Model & Multi-Arch Assemblers (M2):** Shared table-driven instruction encoders and disassemblers (`Encode/`) for **x86-64** (including 2/3-byte VEX, BMI1/BMI2, SSE4.2, and `.code16`/`.code32`/`.code64`), **AArch64** (including LSE atomics, NEON, and SVE), and **RV64** (RVA23 profile: RV64IMAFDCV, Zicsr, Zba/Zbb/Zbs, Zicbom/Zicboz, Zicond, 16-bit RVC, and RVV 1.0) verified via exhaustive table round-trip (`encode -> disassemble -> re-encode` across 1,064 instruction descriptors). Deterministic (`D6`) ELF64 relocatable (`ET_REL`) object reader and writer (`Object/`), and `.s`/`.S` assemblers (`Asm/`) with C23 preprocessing, `.macro`/`.rept`/`.irp`/`.if` expansion, and branch relaxation — verified **100% byte-for-byte identical** to `clang -c` across all **Todhchai OS** floor entry stubs (`amd64.S`, `arm64.S`, `rv64.S`) and all **21 Croi microkernel** architecture assembly files (`kernel/arch/{amd64,arm64,rv64}/*.S`). See [M2 Report](docs/architecture/milestones/M2-encoders-object-assemblers.md).
-- **C23 Frontend & Real-World Corpora (M1):** Preprocesses, parses into a postorder SoA `ParseTree`, and type-checks into typed `SemIR` (`DeclTable`, `TypePool`, `SemInstBlock`) across the full **SQLite amalgamation** (`sqlite3.c`, 268,827 lines / 9.5 MB / 26,942 declarations), **Lua 5.4** (35/35 `.c` files), **Todhchai OS C sources** (31/31 `.c` files), and **Linux host glibc headers** (`<stdio.h>`, `<stdlib.h>`, `<stdint.h>`, `<string.h>`, `<pthread.h>`, `<sys/mman.h>`, `<elf.h>`).
-- **Vertical Slice & Verification (M0 / M0.5):** Compiles, links, and runs the C subset corpus end-to-end to standalone static Linux x86-64 executables with zero external dependencies, passes all 27 automated tests in release mode (with zero warnings), and enforces all 5 CI verification gates. See [M0.5 Vertical Slice Report](docs/architecture/milestones/M0.5-vertical-slice.md) and [Baselines](Benchmarks/baselines/M0.5-vertical-slice.md).
+- **Encoders, Object Model & Multi-Arch Assemblers (M2):**
+  - **Encoders/disassemblers (`Encode/`)** are table-driven for **x86-64** (VEX, `.code16`/`.code32`/`.code64`), **AArch64** (NEON, SVE) and **RV64** (RVC, RVV 1.0, Zba/Zbb/Zbs, Zicond, Zicbom/Zicboz). Every table sample is round-tripped and checked against `llvm-mc`. ISA coverage is still partial; the [M2 Report](docs/architecture/milestones/M2-encoders-object-assemblers.md) lists the gaps.
+  - **Object files (`Object/`):** a deterministic (`D6`) ELF64 `ET_REL` reader and writer.
+  - **Assemblers (`Asm/`):** `.s`/`.S` with C23 preprocessing, macro and conditional expansion, and branch relaxation.
+  - **Verification:** all Todhchai floor entry stubs and all 21 Croi `kernel/arch/*/*.S` files match `clang -c` in section bytes, relocations and symbols. The x86-64 files match GNU `as` except for the three encoding choices documented in [05 §4.11](docs/architecture/05-assembler.md).
+- **C23 Frontend & Real-World Corpora (M1):** preprocessing, a postorder SoA `ParseTree`, and type-checking into `SemIR`. Accept/reject is compared file by file with `clang -std=c23 -fsyntax-only`:
+  - **Real-world sources:** the **SQLite amalgamation**, **Lua 5.4** (35/35), and every **Todhchai** C source Clang accepts (28/28).
+  - **Headers:** every top-level **glibc** header Clang accepts (176/176).
+  - **c-testsuite:** 211/220 match, with the remaining divergences listed in `M1DifferentialTests.swift`.
+- **Vertical Slice & Verification (M0 / M0.5):** Compiles, links, and runs the C subset corpus end-to-end to standalone static Linux x86-64 executables with zero external dependencies, passes the automated test suite in release mode (with zero warnings), and enforces all 5 CI verification gates. See [M0.5 Vertical Slice Report](docs/architecture/milestones/M0.5-vertical-slice.md) and [Baselines](Benchmarks/baselines/M0.5-vertical-slice.md).
 
 ---
 
@@ -154,8 +161,10 @@ swift build -c release
 
 ### Run the test suite
 ```sh
+bash Scripts/fetch-external.sh   # optional: pinned third-party corpora (c-testsuite) into External/
 swift test
 ```
+Differential tests compare against `clang`, GNU `as` and `llvm-mc` when installed, and against external corpora (SQLite, Lua, Todhchai, Croi) located by `SWIFTSTACK_*` environment variables; anything unavailable is reported as skipped.
 
 ### Run Continuous Integration (all 5 gates)
 ```sh
@@ -165,9 +174,9 @@ bash Scripts/ci-check.sh
 ### Preprocess, parse, type-check, assemble, and compile programs
 ```sh
 # Assemble x86-64, AArch64, or RV64 (.s or C23-preprocessed .S) into ELF64 ET_REL (.o):
-./.build/release/swift-stack -c --target=x86_64 -Iinclude path/to/file.S -o out.o
-./.build/release/swift-stack -c --target=aarch64 -Iinclude path/to/file.S -o out.o
-./.build/release/swift-stack -c --target=riscv64 -Iinclude path/to/file.S -o out.o
+./.build/release/swift-stack -c --arch=x86_64 -Iinclude path/to/file.S -o out.o
+./.build/release/swift-stack -c --arch=aarch64 -Iinclude path/to/file.S -o out.o
+./.build/release/swift-stack -c --arch=riscv64 -Iinclude path/to/file.S -o out.o
 
 # Dump typed SemIR (DeclTable + SemInstBlocks) with include paths and defines:
 ./.build/release/swift-stack -Iinclude -DFOO=1 --dump=sem-ir path/to/file.c

@@ -229,7 +229,7 @@ public final class DriverPipeline {
                 return 0
             }
 
-            if tree.count > 1 && tree.hasError(node: NodeId(tree.count - 1)) {
+            if tree.errorNodeCount > 0 {
                 var detail = ""
                 for i in 1..<Int(tree.count) {
                     let nid = NodeId(UInt32(i))
@@ -301,7 +301,8 @@ public final class DriverPipeline {
                         semResult: semRes,
                         typePool: typePool,
                         sourceBuffer: sourcePtr,
-                        sourceLength: sourceFile.length
+                        sourceLength: sourceFile.length,
+                        sourceManager: sourceManager
                     )
                     airMod = lowering.lower()
                     hasLoweringError = lowering.hasLoweringError
@@ -483,7 +484,7 @@ public final class DriverPipeline {
             if lang == .c, let srcPtr = file.buffer.baseAddress {
                 let parseRes = tester.testKernel(name: "CParser [\(file.path)]", byteCount: file.length) {
                     withUnsafePointer(to: tb) { tokPtr in
-                        let p = CParser(tokens: tokPtr, sourceBuffer: srcPtr, sourceLength: file.length)
+                        let p = CParser(tokens: tokPtr, sourceBuffer: srcPtr, sourceLength: file.length, predeclaredTypedefs: CParser.benchmarkPredeclaredTypedefs)
                         _ = p.parse()
                     }
                 }

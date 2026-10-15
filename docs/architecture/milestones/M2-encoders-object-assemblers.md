@@ -8,31 +8,33 @@ Per [09-roadmap.md](../09-roadmap.md) (§M2) and [05-assembler.md](../05-assembl
 
 ### 1.1 Table-Driven Instruction Encoders & Disassemblers (`Sources/SwiftStack/Encode/`)
 
-All three target architectures use a single static instruction descriptor table shared between encoder and disassembler, verified by exhaustive table round-trip (`encode -> disassemble -> re-encode`):
+All three target architectures use a single static instruction descriptor table shared between encoder and disassembler. Each descriptor is round-tripped (`encode -> disassemble -> re-encode`) from one sample, and every sample is checked against `llvm-mc` (§2):
 
 - **x86-64 (`X86Codec.swift`)**:
   - `X86InstructionTable`, `X86TableEncoder`, and `X86TableDisassembler`.
-  - Covers baseline x86-64 GPR, system/privileged (`syscall`, `sysretq`, `swapgs`, `lgdt`, `lgdtl`, `lidt`, `ltr`, `str`, `invlpg`, `wrmsr`, `rdmsr`, `rdtsc`, `rdtscp`, `cpuid`, `wbinvd`, `fxsave64`, `fxrstor64`, `xsave64`, `xrstor64`, `xsaveopt64`, `xgetbv`, `xsetbv`, `rdpkru`, `wrpkru`, `clac`, `stac`, `monitor`, `mwait`, `%crN`/`%drN`/segment moves, port I/O), BMI1/BMI2/ABM/CRC32 (`lzcnt`, `tzcnt`, `popcnt`, `andn`, `bextr`, `bzhi`, `pdep`, `pext`, `rorx`, `sarx`, `shlx`, `shrx`, `crc32b/w/l/q`), SSE/SSE2/SSSE3/SSE4.1/SSE4.2, and 2-byte (`0xC5`) / 3-byte (`0xC4`) VEX (AVX/AVX2/FMA) instructions.
+  - Covers baseline x86-64 GPR, system/privileged (`syscall`, `sysretq`, `swapgs`, `lgdt`, `lgdtl`, `lidt`, `ltr`, `str`, `invlpg`, `wrmsr`, `rdmsr`, `rdtsc`, `rdtscp`, `cpuid`, `wbinvd`, `fxsave64`, `fxrstor64`, `xsave64`, `xrstor64`, `xsaveopt64`, `xgetbv`, `xsetbv`, `rdpkru`, `wrpkru`, `clac`, `stac`, `monitor`, `mwait`, `%crN`/`%drN`/segment moves, port I/O), ABM/CRC32 (`lzcnt`, `tzcnt`, `popcnt`, `crc32b/w/l/q`), a subset of SSE–SSE4.2, and 2-byte (`0xC5`) / 3-byte (`0xC4`) VEX encodings for a subset of AVX/AVX2. **Not yet covered:** BMI1/BMI2 (`andn`, `bextr`, `pdep`, `pext`, `rorx`, `shlx`, …), FMA, and most SSE/AVX shuffle, blend, shift, convert and compare forms (below the `x86-64-v2` + AVX floor of [17](../17-simd-and-vectorization.md)).
   - Supports `.code64`, `.code32`, and `.code16` real/protected-mode boot transition encodings (including `ljmpl`/`ljmpw` far jumps and 16-bit absolute addressing).
-  - `X86InstructionTable.verifyRoundTrip()` verifies 589 descriptor forms plus special addressing modes (`%rsp` SIB `0x24`, `%rbp` `mod=1 disp8=0`, scaled index without base, `%fs`/`%gs` segment overrides, `%rip`-relative, mandatory REX low-byte registers, high-byte registers, `lock`/`rep` prefixes, and 3-byte VEX extended registers).
+  - `X86InstructionTable.verifyRoundTrip()` round-trips every descriptor plus special addressing modes (`%rsp` SIB `0x24`, `%rbp` `mod=1 disp8=0`, scaled index without base, `%fs`/`%gs` segment overrides, `%rip`-relative, mandatory REX low-byte registers, high-byte registers, `lock`/`rep` prefixes, and 3-byte VEX extended registers).
 
 - **AArch64 (`AArch64Codec.swift`)**:
   - `AArch64InstructionTable`, `AArch64TableEncoder`, and `AArch64TableDisassembler`.
-  - Covers A64 integer, branches, loads/stores (unsigned offset, pre-index, post-index, unscaled `ldur`/`stur`, pairs `ldp`/`stp`, exclusives `ldxr`/`stxr`/`ldaxr`/`stlxr`), LSE atomics (`ldadd`, `ldclr`, `ldset`, `swp`, `cas`), system/barriers (`msr`/`mrs` including `S3_<op1>_<Cn>_<Cm>_<op2>` and architectural sysregs, `svc`, `hvc`, `smc`, `eret`, `wfi`, `wfe`, `sev`, `sevl`, `isb`, `dsb`, `dmb`, `dc`, `ic`, `tlbi`, `at`, `clrex`), scalar FP, Advanced SIMD (NEON `.16b`/`.8b`/`.4s`/`.2d`), and SVE (`z0`–`z31`, `p0`–`p15`, `ffr`, `mul vl` vector-length-scaled addressing, `rdvl`).
-  - `AArch64InstructionTable.verifyRoundTrip()` verifies all 206 descriptor templates.
+  - Covers A64 integer, branches, loads/stores (unsigned offset, pre-index, post-index, unscaled `ldur`/`stur`, pairs `ldp`/`stp`, exclusives `ldxr`/`stxr`/`ldaxr`/`stlxr`), system/barriers (`msr`/`mrs` including `S3_<op1>_<Cn>_<Cm>_<op2>` and architectural sysregs, `svc`, `hvc`, `smc`, `eret`, `wfi`, `wfe`, `sev`, `sevl`, `isb`, `dsb`, `dmb`, `dc`, `ic`, `tlbi`, `at`, `clrex`), scalar FP, Advanced SIMD (NEON `.16b`/`.8b`/`.4s`/`.2d`), and SVE (`z0`–`z31`, `p0`–`p15`, `ffr`, `mul vl` vector-length-scaled addressing, `rdvl`).
+  - `AArch64InstructionTable.verifyRoundTrip()` round-trips every descriptor template.
+  - **Not yet covered:** LSE atomics, much of scalar FP (`fmadd`, `fabs`, `fsqrt`, `frint*`, …) and most Advanced SIMD.
 
 - **RV64 / RVA23 (`RV64Codec.swift`)**:
   - `RV64InstructionTable`, `RV64TableEncoder`, and `RV64TableDisassembler`.
   - Covers RV64I, M, A (`lr.w/d`, `sc.w/d`, `amoswap`, `amoadd`, `amoxor`, `amoand`, `amoor`, `amomin`, `amomax`), F, D, Zicsr (`csrrw`, `csrrs`, `csrrc`, `csrrwi`, `csrrsi`, `csrrci` plus aliases), privileged (`ecall`, `ebreak`, `mret`, `sret`, `wfi`, `sfence.vma`), Zba (`add.uw`, `sh1add`, `sh2add`, `sh3add`, `sh1add.uw`, `sh2add.uw`, `sh3add.uw`, `slli.uw`), Zbb (`andn`, `orn`, `xnor`, `clz`, `clzw`, `ctz`, `ctzw`, `cpop`, `cpopw`, `max`, `maxu`, `min`, `minu`, `sext.b`, `sext.h`, `zext.h`, `rol`, `rolw`, `ror`, `rori`, `roriw`, `rorw`, `orc.b`, `rev8`), Zbs (`bclr`, `bclri`, `bext`, `bexti`, `binv`, `binvi`, `bset`, `bseti`), Zicbom (`cbo.clean`, `cbo.flush`, `cbo.inval`), Zicboz (`cbo.zero`), Zicond (`czero.eqz`, `czero.nez`), C (16-bit compressed quadrant 0/1/2 encodings), and V (RVV 1.0 `vsetvli`, `vsetivli`, `vsetvl`, vector loads/stores, vector ALU/mask ops).
-  - `RV64InstructionTable.verifyRoundTrip()` verifies all 269 descriptor templates (both 32-bit and 16-bit compressed encodings).
+  - `RV64InstructionTable.verifyRoundTrip()` round-trips every descriptor template (both 32-bit and 16-bit compressed encodings).
+  - **Not yet covered (RVA23 mandatory):** Zicbop, Zihintpause, Zihintntl, Zawrs, Zimop/Zcmop, Zvbb, Zvfhmin, Zfhmin converts, most of V (compares, reductions, slides, FMA, strided/indexed/segment memory).
 
 ### 1.2 Relocatable Object Model & ELF64 Reader/Writer (`Sources/SwiftStack/Object/`)
 
 - **`RelocatableObject.swift`**:
-  - `~Copyable` Structure-of-Arrays (`SectionColumn`, `SymbolColumn`, `RelocationColumn`) shared between the native code generator (`Codegen`) and the assembler (`Asm`).
+  - `~Copyable` Structure-of-Arrays (`SectionColumn`, `SymbolColumn`, `RelocationColumn`) produced by the assembler (`Asm`). The M0.5 code generator still emits through `Encode/X86Encoder` and `Linker/StaticELFWriter`; moving `Codegen` onto `X86Codec` and `RelocatableObject` is M3 work.
   - Closed `ObjectArch` (`x86_64`, `aarch64`, `riscv64`) and `ObjectFormat` (`elf64`) enums.
 - **`ELFObjectIO.swift`**:
-  - `ELFObjectWriter`: Deterministic (`D6`) ELF64 `ET_REL` serializer with canonical section ordering, local-before-global `SHT_SYMTAB` partitioning (`sh_info` = first global index), per-code-section `.rela<sec>` tables, architecture `e_flags` (`EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE` on RV64), and `.note.GNU-stack`.
+  - `ELFObjectWriter`: Deterministic (`D6`) ELF64 `ET_REL` serializer with canonical section ordering, local-before-global `SHT_SYMTAB` partitioning (`sh_info` = first global index), per-code-section `.rela<sec>` tables, and architecture `e_flags` (`EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE` on RV64).
   - `ELFObjectReader`: Full ELF64 `ET_REL` parser reconstructing `RelocatableObject` sections, symbols, and `.rela` relocations for round-trip verification and upcoming M3 linker input.
 
 ### 1.3 Multi-Architecture Assemblers & `.S` Preprocessing (`Sources/SwiftStack/Asm/`)
@@ -53,14 +55,22 @@ All three target architectures use a single static instruction descriptor table 
 
 ## 2. Exit Criteria Verification
 
-All exit criteria from [09-roadmap.md](../09-roadmap.md) (§M2) are verified in `Tests/SwiftStackTests/SwiftStackTests.swift` (`M2EncodersObjectAssemblersTests`):
+Per [09-roadmap.md](../09-roadmap.md) (§M2) and [05-assembler.md](../05-assembler.md) §4.11:
 
-1. **Exhaustive Encoder/Disassembler Table Round-Trip**:
-   - `testX86InstructionTableRoundTrip()` — 589 descriptors + special addressing modes: **PASSED**
-   - `testAArch64InstructionTableRoundTrip()` — 206 descriptors: **PASSED**
-   - `testRV64InstructionTableRoundTrip()` — 269 descriptors (32-bit + RVC 16-bit): **PASSED**
-2. **ELF64 `ET_REL` Read/Write & D6 Determinism**:
-   - `testELFRelocatableObjectRoundTrip()` — verifies bit-identical serialization and deserialization across `x86_64`, `aarch64`, and `riscv64`: **PASSED**
-3. **Differential Assembly Against Clang (`-c`)**:
-   - `testTodhchaiDifferentialAssembly()` — assembles Todhchai floor entry stubs (`system/sys/floor/entry/{amd64,arm64,rv64}.S`) and verifies **100% byte-for-byte identical section contents** against `clang -c`: **PASSED**
-   - `testCroiDifferentialAssembly()` — assembles all 21 Croi kernel architecture assembly files (`kernel/arch/{amd64,arm64,rv64}/{cpu,exceptions,smp,start,thread,usercopy,usertest}.S`) and verifies **100% byte-for-byte identical section contents** across every executable and data section against `clang -c`: **PASSED**
+1. **Assembly matches GNU `as` (modulo documented choices).** `M2DifferentialTests.swift`:
+   - Each file is assembled by Swift-Stack and by the oracles. Both objects are parsed by an independent test-only ELF reader, and the comparison covers every allocatable section (bytes, size, flags, alignment), every relocation, and every non-temporary symbol.
+   - **Corpora:** the Todhchai floor entry stubs (3), all 21 Croi `kernel/arch/{amd64,arm64,rv64}/*.S` files, and the in-repo regression corpus `Tests/Differential/asm/<arch>/`.
+   - **Oracles:** `clang -c` for all three architectures, and GNU `as` (via `gcc -c`) for x86-64. No GNU cross-assembler for AArch64/RV64 is installed on the reference machine.
+   - **GNU `as` differences:** the x86-64 differences are the three documented in 05 §4.11 (alignment, NOP padding, `disp32` for a late-resolved label difference). Each is exempted only for the affected section, and the clang comparison still covers it exactly.
+   - A missing corpus or oracle skips the test rather than passing it.
+2. **Encoder/disassembler round trip.** `verifyRoundTrip()` round-trips one sample per descriptor; it is not yet exhaustive over operand forms. `M2EncoderOracleTests.swift` checks every sample against `llvm-mc`, which catches encoder/disassembler pairs that agree on a wrong encoding (it found the 16-bit `tzcnt`/`lzcnt`/`popcnt` prefix bug).
+3. **Behavior without an oracle.** `M2AssemblerRegressionTests.swift` covers out-of-range AArch64/RV64 branch relaxation (clang reports these as errors instead of relaxing), rejected encodings being diagnosed rather than dropped, and `ldr Xt, #imm`.
+
+### Defects fixed after the initial M2 report
+- **`.long sym - .`:** produced an absolute relocation. It now uses `R_X86_64_PC32`/`PC64`, `R_AARCH64_PREL32`/`PREL64`, or an `R_RISCV_ADD`/`SUB` pair.
+- **`.size sym, . - sym`:** produced 0.
+- **`.set` symbols:** were not emitted as `SHN_ABS`.
+- **AArch64/RV64 branches out of range:** were silently truncated. They are now relaxed to an inverted branch over `b`/`jal`, as §4.5 specifies, and diagnosed if out of range even then.
+- **AArch64 encoder rejections:** an instruction the encoder rejected was silently dropped. The encoder now range-checks PC-relative fields.
+- **`.S` target macros:** AArch64/RV64 `.S` files also saw `__x86_64__`.
+- **RISC-V external `j`:** a compressed jump to an external symbol was laid out at 2 bytes but emitted at 4.
