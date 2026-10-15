@@ -186,6 +186,8 @@ public final class DiagnosticRegistry: @unchecked Sendable {
         register(DiagnosticInfo(id: .asmMacroNestedTooDeeply, name: "assembler.macro_nested_too_deeply", severity: .error, category: .assembler, messageTemplate: "macros cannot be nested more than %@ levels deep"))
         register(DiagnosticInfo(id: .asmMacroWarning, name: "assembler.macro_warning", severity: .warning, category: .assembler, messageTemplate: "%@"))
         register(DiagnosticInfo(id: .asmCFIError, name: "assembler.cfi_error", severity: .error, category: .assembler, messageTemplate: "%@"))
+        register(DiagnosticInfo(id: .asmDirectiveError, name: "assembler.directive_error", severity: .error, category: .assembler, messageTemplate: "%@"))
+        register(DiagnosticInfo(id: .asmIncludeNestedTooDeeply, name: "assembler.include_nested_too_deeply", severity: .error, category: .assembler, messageTemplate: "'.include' nested too deeply (more than %@ levels)"))
     }
 }
 
@@ -263,6 +265,8 @@ extension DiagId {
     public static let asmMacroNestedTooDeeply   = DiagId(111)
     public static let asmMacroWarning           = DiagId(112)
     public static let asmCFIError               = DiagId(113)
+    public static let asmDirectiveError         = DiagId(114)
+    public static let asmIncludeNestedTooDeeply = DiagId(115)
 }
 
 /// A secondary attached note pointing to an auxiliary location.

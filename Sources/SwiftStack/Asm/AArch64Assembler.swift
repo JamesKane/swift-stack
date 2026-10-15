@@ -564,7 +564,8 @@ internal enum A64Asm {
             return true
 
         case .symbolOffset(let sym, let addend, let mod):
-            let base = A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: UInt8(shiftAmt), imm: 0)
+            // `:tprel_hi12:` selects the `lsl #12` form even when it is not written (LLVM MC's `getAddSubImmOpValue`)
+            let base = A64Instruction(opcode: opImm, is64Bit: is64, rd: rd, rn: rn, amount: mod == .a64TprelHi12 ? 12 : UInt8(shiftAmt), imm: 0)
             guard let bytes = A64Encoder.encodeBytes(base) else { return false }
             let rKind: RelocKind
             switch mod {

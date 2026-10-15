@@ -19,7 +19,7 @@ The assembler:
 
 ## 2. Goals
 
-- Assemble VectraOS's existing assembly sources (26 `.S` files, about 5,300 lines across the three architectures) without modifying them, with the flags its build passes. This needs GNU `as` dialect compatibility for the directives and syntax those files actually use, with LLVM MC's semantics (§4.11).
+- Assemble VectraOS's existing assembly sources (26 `.S` files, about 5,300 lines across the three architectures) without modifying them, with the flags its build passes, and assemble clang's own `-S` output for every VectraOS C file exactly as `clang -c` does (§4.11). This needs GNU `as` dialect compatibility for the directives and syntax those files actually use, with LLVM MC's semantics (§4.11).
 - Have exactly one encoding source of truth (`Encode`), shared with codegen and the disassembler.
 - Produce deterministic output (D6): the same input and flags give identical bytes.
 - Produce `.eh_frame` from CFI directives, and produce or verify CUD records ([07](07-debugging-and-sdi.md)) from the same information.
@@ -116,17 +116,18 @@ The assembler implements the subset of the GNU assembler language used by the Ve
 
 | Category | Directives / features |
 |---|---|
-| Sections | `.text`, `.data`, `.bss`, `.section name, "flags", @type`, `.pushsection`/`.popsection`, `.previous` (a `.note*` section without `@type` is `SHT_NOTE`, as in LLVM MC, so a hand-written `.note.gnu.property` reaches the linker) |
-| Data | `.byte`, `.short`/`.2byte`, `.long`/`.4byte`, `.quad`/`.8byte`, `.ascii`, `.asciz`/`.string`, `.zero`, `.space`, `.fill` |
+| Sections | `.text`, `.data`, `.bss`, `.section name, "flags", @type[, entsize]` (the entry size of an `M` section is its `sh_entsize`), `.pushsection`/`.popsection`, `.previous` (a `.note*` section without `@type` is `SHT_NOTE`, as in LLVM MC, so a hand-written `.note.gnu.property` reaches the linker) |
+| Data | `.byte`, `.short`/`.2byte`, `.long`/`.4byte`, `.quad`/`.8byte`, `.ascii`, `.asciz`/`.string`, `.zero`, `.space`, `.fill`; target-specific as in LLVM MC: `.xword` (AArch64), `.dword` (AArch64, RISC-V; rejected on x86-64), `.half` (RISC-V) |
 | Symbols | `.globl`/`.global`, `.local`, `.weak`, `.hidden`, `.type sym, @function/@object`, `.size`, `.set`/`.equ`, `=` |
 | Alignment | `.align` (target-specific meaning: bytes on x86, power of two on ARM and RISC-V, as in LLVM MC and GNU `as`), `.balign`, `.p2align` |
 | Macros | `.macro name args` / `.endm`, default, `:req` and `:vararg` parameters, positional and `name=value` arguments, `\arg` substitution, `\()` separator, `\@` counter, `.exitm`, `.purgem` |
-| Repetition | `.rept n` / `.endr`, `.irp sym, values` / `.endr`, `.irpc` |
+| Repetition | `.rept n` / `.endr` (`n` may be a difference of labels already laid out, `.rept (end - start) / 4`), `.irp sym, values` / `.endr`, `.irpc` |
 | Conditionals | `.if expr`, `.ifeq`/`.ifne`/`.ifge`/`.ifgt`/`.ifle`/`.iflt`, `.ifdef`/`.ifndef`, `.ifc`/`.ifnc`, `.ifeqs`/`.ifnes`, `.ifb`/`.ifnb`, `.else`, `.elseif`, `.endif` |
-| Inclusion | `.include "file"`, `.incbin "file"[, skip[, count]]` (shares the `BinaryAssetPool` with `#embed`) |
+| Inclusion | `.include "file"` (nested at most 64 deep), `.incbin "file"[, skip[, count]]` (shares the `BinaryAssetPool` with `#embed`) |
 | Labels | Named labels; numeric local labels `1:` with `1b` (nearest backward) and `1f` (nearest forward) |
 | CFI | `.cfi_startproc`/`.cfi_endproc`, `.cfi_def_cfa`, `.cfi_def_cfa_offset`, `.cfi_def_cfa_register`, `.cfi_offset`, `.cfi_rel_offset`, `.cfi_restore`, `.cfi_undefined`, `.cfi_remember_state`/`.cfi_restore_state`, `.cfi_adjust_cfa_offset`, `.cfi_signal_frame`, `.cfi_val_offset`, `.cfi_same_value`, `.cfi_register`, `.cfi_return_column`, `.cfi_escape`, `.cfi_window_save`/`.cfi_negate_ra_state`, `.cfi_sections`; `.cfi_personality`/`.cfi_lsda` only with encoding `0xff` (omit) |
-| Misc | `.file`, `.loc` (line info), `.ident` (ignored), `.option` (RISC-V; §4.8) |
+| Object metadata | `.file "name"` (an `STT_FILE` symbol), `.ident` (`.comment`, `SHF_MERGE` + `SHF_STRINGS`, entry size 1, starting with a NUL), `.addrsig`/`.addrsig_sym` (`.llvm_addrsig`, `SHF_EXCLUDE`, linked to `.symtab`: the ULEB128 symbol indices; a `.L` symbol is replaced by its section symbol, an undefined one enters `.symtab`), AArch64 `.aeabi_subsection name, optional`/`required, uleb128`/`ntbs` and `.aeabi_attribute tag, value` (`.ARM.attributes`, `SHT_AARCH64_ATTRIBUTES`: format `A`, then per subsection a 4-byte length, the name, optionality, type and the tag/value pairs in first-set order; tag names `Tag_Feature_BTI`/`_PAC`/`_GCS` and `Tag_PAuth_Platform`/`_Schema`; LLVM MC's checks and messages, and its storing of an NTBS value with its quotes), RISC-V `.attribute tag, value` (`.riscv.attributes`: vendor `riscv`, one `Tag_File` group; `arch` also resets the extensions in effect) |
+| Misc | `.loc` (line info, ignored), `.option` (RISC-V; §4.8) |
 
 **`.S` preprocessing.** `.S` files go through the C23 preprocessor ([01](01-frontend.md)) in *assembler-with-cpp* mode:
 
@@ -135,6 +136,10 @@ The assembler implements the subset of the GNU assembler language used by the Ve
 - Token pasting and stringizing behave as in C.
 
 The preprocessor output carries GNU line markers (`# <line> "<file>"`) and keeps each line's original column, and the assembler honours them (and `#line`). Every statement therefore keeps a `file:line:col` location, through `#include`d headers, `.include`, `.rept`/`.irp` and macro expansion; an error inside a macro body also gets a note at each enclosing macro use. Macro, `.rept` and `.irp` expansion is bounded at 20 nested levels, as in LLVM MC (`macros cannot be nested more than 20 levels deep`).
+
+**Streaming.** Statements are assembled as the macro engine produces them, so a `.rept` count is evaluated against the layout so far, like LLVM MC's `parseAbsoluteExpression`: a difference of labels in one run of fixed-size fragments is absolute; across a relaxable branch or an alignment, in another section, forward or undefined it is not, and the error is LLVM MC's `unexpected token in '.rept' directive` at the count (a negative count is `Count is negative`). A file that `.include`s itself recurses forever in LLVM MC; Swift-Stack stops at 64 levels with `'.include' nested too deeply (more than 64 levels)` and an `in file included from here` note for each enclosing `.include`, as clang reports `#include nested too deeply`.
+
+**Mapping symbols** (AArch64 and RISC-V): a local `$x` where code starts and `$d` where data starts (data directives, literal pools, `.comment`, the attribute sections, `.eh_frame`), only where the kind changes in a section, as LLVM MC's ELF streamers emit them. Alignment padding marks nothing. LLVM 22's RISC-V streamer saves the state of the section being left under the stack's previous section, so after a `.popsection` the restored section takes the popped one's state; Swift-Stack reproduces this, since it changes which `$x`/`$d` are emitted. A symbol defined in a TLS section is `STT_TLS`, and an alias without `.type` takes its target's type.
 
 **Macros** follow LLVM MC's `AsmParser`:
 
@@ -167,7 +172,11 @@ Each section is a sequence of fragments:
 
 Fragments **never shrink**, even if another fragment's growth reduces some padding. Each fragment has finitely many forms, so the loop terminates after at most (fragments × forms) iterations; in practice it takes two or three. A single linear pass is not enough, because growing one branch can push others out of range.
 
-Branches to symbols that are undefined, external, or in another section are encoded in their long form immediately and get a relocation. They never take part in relaxation.
+Branches to symbols that are undefined, external, global or weak (which may be preempted, even in the same section), or in another section are encoded in their long form immediately and get a relocation. They never take part in relaxation.
+
+#### 4.5.1 Relocation targets
+
+As in LLVM MC (`ELFObjectWriter::useSectionSymbol`), a relocation against a local symbol defined in a section names that section's `STT_SECTION` symbol, with the symbol's offset added to the addend, on x86-64 and AArch64. A temporary `.L` symbol is in `.symtab` only when a relocation still names it. The symbol is kept for GOT relocations (`@GOTPCREL`, `@GOTTPOFF`, `:got:`, `:gottprel:`), an explicit `@PLT`, a symbol in a TLS section, and a nonzero addend into a mergeable (`M`) section. RISC-V keeps every symbol (LLVM's RISC-V `needsRelocateWithSymbol`, for linker relaxation), so its temporaries carry LLVM's names: `.Ltmp<n>` for numeric local labels in order of creation, `.L0 ` for the labels made for `.` and CFI.
 
 ### 4.6 x86-64
 
@@ -176,7 +185,8 @@ Branches to symbols that are undefined, external, or in another section are enco
 - **Encoding:** through `Encode` tables (legacy prefixes, REX, two- and three-byte VEX, ModR/M, SIB, maps `0F`/`0F38`/`0F3A`). Both legacy SSE and VEX (`v`-prefixed) mnemonics are accepted; AVX is in the baseline and AVX2 is accepted when enabled ([17](17-simd-and-vectorization.md) §5.4). The displacement size (none, 8-bit, or 32-bit) is chosen at encode time when the value is known; symbolic displacements are always 32-bit with a relocation.
 - **Relaxable:** `JMP` and `Jcc` (rel8 → rel32).
 - **Relocations:**
-  - ELF: `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_GOTPCREL(X)`, `R_X86_64_64`, `R_X86_64_32S`, TLS (`R_X86_64_TPOFF32`, `R_X86_64_GOTTPOFF`).
+  - ELF: `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_GOTPCREL(X)`, `R_X86_64_64`, `R_X86_64_32S`, TLS (`R_X86_64_TPOFF32`, `R_X86_64_GOTTPOFF`). As LLVM MC (`-mrelax-relocations`, its default), `sym@GOTPCREL(%rip)` as the memory source of a 32/64-bit `mov` load, `lea`, `test` or ALU instruction, or as an indirect `call`/`jmp` target, is `R_X86_64_REX_GOTPCRELX` with a REX prefix and `R_X86_64_GOTPCRELX` without.
+- **Padding:** code alignment uses LLVM MC's NOPs of up to 10 bytes (`66 2e 0f 1f 84 00 ...`, `nopw %cs:0(%rax,%rax,1)`). `.eh_frame` is `SHT_X86_64_UNWIND`.
   - Mach-O: `X86_64_RELOC_*` equivalents.
 - **Privileged instructions** needed by kernel and stub code: `syscall`/`sysret`, `iretq`, `swapgs`, `lgdt`/`lidt`, `mov %crN`, `rdmsr`/`wrmsr`, `xsave`/`xrstor`, `cpuid`, `rdtsc`, `pause`, `hlt`, `invlpg`.
 
@@ -218,12 +228,13 @@ Branches to symbols that are undefined, external, or in another section are enco
 - **Compressed instructions:** when `.option rvc` is in effect (the default; C and Zcb are part of RVA23), each instruction is emitted in its 16-bit C form if registers and immediates fit (`c.li`, `c.mv`, `c.add`, `c.addi`, `c.addi16sp`, `c.addi4spn`, `c.ld`, `c.sd`, `c.ldsp`, `c.sdsp`, `c.j`, `c.beqz`, `c.bnez`, `c.jr`, `c.jalr`). `.option norvc` disables this. `.option push`/`.option pop` are supported.
 - **Target options.** The driver sets the initial state from the target, as clang does: `-march` gives the C extension (compression) and Zbs (`li` of a single high bit uses `bseti` only with Zbs, as LLVM's `RISCVMatInt` does), `-fPIC`/`-fPIE` makes `la` load through the GOT, and linker relaxation is on unless `-mno-relax` is given. VectraOS's rv64 kernel is assembled for `rv64imac_zicsr_zifencei` PIE with relaxation on, its user code for `rv64gc`. `.option rvc`/`norvc`, `relax`/`norelax`, `pic`/`nopic` and `push`/`pop` change the state in the source.
 - **Linker relaxation (`.option relax`)**, matching LLVM MC byte for byte:
-  - `call`/`tail`, `%hi`/`%lo`, `%pcrel_hi`/`%pcrel_lo` (`lla`, and the `%pcrel_lo` of a GOT `la`) and `%tprel_*` relocations are each followed by an `R_RISCV_RELAX` at the same offset. `%got_pcrel_hi` and branches are not relaxable. A `%pcrel_hi` stays a relocation even for a same-section label.
-  - Alignment in an executable section without a fill value emits the worst-case padding, `align − 2` bytes with C (`align − 4` without), as `c.nop` and `nop`s, and an `R_RISCV_ALIGN` whose addend is that size, whatever the current offset. Data sections are padded with zeros as usual.
-  - A branch, or a label difference in data, whose two ends span a relaxable instruction or a relaxed alignment stays a relocation (`R_RISCV_BRANCH`, `R_RISCV_JAL`, `R_RISCV_RVC_BRANCH`, `R_RISCV_RVC_JUMP`; `R_RISCV_ADD*`/`R_RISCV_SUB*` pairs), keeping the form chosen by distance. One that spans neither is folded, as LLVM MC folds it.
+  - `call`/`tail`, `%hi`/`%lo`, `%pcrel_hi`/`%pcrel_lo` (`lla`, and the `%pcrel_lo` of a GOT `la`), `%got_pcrel_hi`, `%tprel_*` and `R_RISCV_JAL` relocations are each followed by an `R_RISCV_RELAX` at the same offset (LLVM MC 22). Conditional branches are not relaxable. A `%pcrel_hi` stays a relocation even for a same-section label.
+  - Alignment in an executable section without a fill value, once a branch or relaxable instruction has been emitted in that section, emits the worst-case padding, `align − 2` bytes with C (`align − 4` without), as `c.nop` and `nop`s, and an `R_RISCV_ALIGN` whose addend is that size, whatever the current offset. An alignment before any of them is padded exactly. Data sections are padded with zeros as usual.
+  - LLVM MC 22 lays out each branch in a fragment of its own whose size is not final, so a branch emitted under relaxation to a local label in its section stays a relocation (`R_RISCV_BRANCH`, `R_RISCV_JAL`, `R_RISCV_RVC_BRANCH`, `R_RISCV_RVC_JUMP`), keeping the form chosen by distance, when the target is ahead of it or when another branch, a relaxable instruction or a relaxed alignment lies between. A backward branch with nothing of the kind in between is folded. A label difference in data that spans a branch, a relaxable instruction or a relaxed alignment stays an `R_RISCV_ADD*`/`R_RISCV_SUB*` pair; one that spans none is folded.
   - Not implemented yet: `.eh_frame` advance relocations (`R_RISCV_SET6`/`SUB6`, …) for CFI that spans relaxable code, and `.uleb128` label differences (`R_RISCV_SET_ULEB128`/`R_RISCV_SUB_ULEB128`). VectraOS's assembly needs neither.
 - **Without relaxation** (`-mno-relax`, `.option norelax`), alignment padding is exact, same-section `%pcrel_hi` targets are resolved, and `%pcrel_lo` refers to the label of its paired `auipc`, as in GNU `as`.
-- **Relaxable branches (assembler-local):** `c.beqz`/`c.bnez` → `beq`/`bne` → inverted branch over `jal`; `c.j` → `jal`.
+- **Relaxable branches (assembler-local):** `c.beqz`/`c.bnez` → `beq`/`bne` → inverted branch over `jal` (`c.bnez`/`c.beqz` over 6 bytes when compressible, as LLVM MC's `expandLongCondBr`); `c.j` → `jal`. A branch whose target is undefined, global, weak or in another section takes the longest form at once: `jal` with `R_RISCV_JAL`, or an inverted branch over it.
+- **Build attributes and `e_flags`:** `.attribute` writes `.riscv.attributes`. As clang's driver does, a target given as `-march` adds `Tag_RISCV_arch` with the normalized ISA string first; a `.attribute arch` in the source replaces the value in place. `e_flags` has `EF_RISCV_RVC` from `-march` and the float ABI from `-mabi` (clang's default without it).
 - **Relocations (ELF only; there is no RISC-V Mach-O):** `R_RISCV_PCREL_HI20`, `R_RISCV_PCREL_LO12_I/S`, `R_RISCV_HI20`, `R_RISCV_LO12_I/S`, `R_RISCV_CALL_PLT`, `R_RISCV_JAL`, `R_RISCV_BRANCH`, `R_RISCV_RVC_JUMP`, `R_RISCV_RVC_BRANCH`, `R_RISCV_GOT_HI20`, `R_RISCV_64`, `R_RISCV_32`, and TLS LE (`R_RISCV_TPREL_HI20`/`LO12_I`/`LO12_S`/`ADD`).
 
 ### 4.9 CFI, `.eh_frame`, and CUD
@@ -248,10 +259,11 @@ Functions with no CFI region (common in entry stubs and context switches; Vectra
 
 ### 4.11 Verification
 
-- **Reference assembler: LLVM MC.** Swift-Stack replaces LLVM in the stack, so LLVM MC (`llvm-mc`, and the integrated assembler of `clang -c`) is the reference. Wherever GNU `as` and LLVM MC disagree, Swift-Stack matches LLVM MC exactly; the GNU `as` behavior is documented below, not matched.
+- **Reference assembler: LLVM MC 22.** Swift-Stack replaces LLVM in the stack, so LLVM MC (`llvm-mc`, and the integrated assembler of `clang -c`) is the reference; the tests run `clang-22` when it is installed, since a toolchain's older `clang` may come first on `PATH` (LLVM 21 and 22 differ, for one, in RISC-V relaxation). Wherever GNU `as` and LLVM MC disagree, Swift-Stack matches LLVM MC exactly; the GNU `as` behavior is documented below, not matched.
+- **clang's own output:** `M2ClangRoundTripTests` compiles every VectraOS C file with `clang -S` for each architecture with its CMake flags (arm64 with `-mbranch-protection=bti`), at -O0 and -O2, and assembles the `.s` with Swift-Stack and with `clang -c`. The objects must be identical under `ExactObjectComparison`: every section, non-allocatable ones (`.comment`, `.llvm_addrsig`, the build attributes) and empty ones included, with type, flags, alignment, entry size and bytes; every relocation with the symbol it names; every symbol, `.L*`, mapping, file and section symbols included; `e_flags`. The in-repo corpus and the VectraOS `.S` files are compared the same way, besides the normalized comparison below. Files that use instructions the `Encode` tables lack (x86-64 `shld`/`shrd`/`xadd`, the SVE of `usertest.c`'s inline assembly) are recorded as known issues.
 - **Round trip:** every `Encode` table entry is assembled from text, disassembled, and compared with the original statement.
 - **Differential:** each corpus file is assembled with Swift-Stack, with `clang -c` for all three architectures, and with host GNU `as` for x86-64. The `clang -c` comparison is exact. The GNU `as` comparison exempts only the documented differences below, each for the affected section or file only. The section bytes, symbol tables and relocations are compared, RISC-V relaxation relocations included.
-  - Both objects are parsed by an independent test-only ELF reader. Relocations against local symbols are normalized to `section + offset`, since GNU `as` and LLVM MC choose differently between a section symbol and a local label; temporary `.L*` labels and `$x`/`$d` mapping symbols are excluded.
+  - Both objects are parsed by an independent test-only ELF reader. For the comparison that includes GNU `as`, relocations against local symbols are normalized to `section + offset`, since GNU `as` and LLVM MC choose differently between a section symbol and a local label, and temporary `.L*` labels and `$x`/`$d` mapping symbols are excluded; the exact comparison with clang checks them as they are.
   - Every allocatable section is compared: bytes, size, flags, alignment. So are all relocations (type, offset, target, addend) and all non-temporary symbols (binding, type, visibility, section, value, size).
 - **Documented differences from GNU `as` (x86-64 encoding).** Swift-Stack matches LLVM MC, and the `clang -c` comparison checks these sections exactly:
   1. `.text` alignment is 4 (GNU: 1).

@@ -183,6 +183,14 @@ public enum AsmExprEvaluator {
         return result
     }
 
+    /// True if `expr` parses as an expression, whatever its symbols stand for (each is taken as 1, `.` as 0):
+    /// tells a malformed expression from one that is merely not absolute.
+    static func isWellFormed(_ expr: String) -> Bool {
+        var ones: [String: Int64] = [:]
+        for case .symbol(let name, _) in tokenizeExpr(expr) { ones[name] = 1 }
+        return evaluate(expr, constants: ones, dotOffset: 0) != nil
+    }
+
     private static func parseA64ModifierPrefix(_ str: String) -> (AsmRelocModifier, String)? {
         let prefixes: [(String, AsmRelocModifier)] = [
             (":got_lo12:", .a64GotLo12),
@@ -681,6 +689,11 @@ public enum AsmMacroEngine {
         var macroDepth = 0
         /// Set by `.exitm`; unwinds the enclosing `.if`/`.rept` blocks up to the macro boundary.
         var exitRequested = false
+        /// Receives each expanded statement, in order.
+        var sink: (AsmStatement) -> Void
+        /// Evaluates an absolute expression against the statements the sink has received, for `.rept` counts that
+        /// are label differences.
+        var evaluateAbsolute: (String) -> Int64?
     }
 
     private static let maxIncludeDepth = 64
@@ -688,7 +701,9 @@ public enum AsmMacroEngine {
 
     /// Splits `text` into statements (`physicalFile` is the `SourceManager` buffer holding `text`, or nil for
     /// preprocessor output whose locations come from line markers), expands includes, macros, repetitions and
-    /// conditionals, and rewrites numeric local labels (`1:`, `1b`, `1f`) into unique synthetic labels.
+    /// conditionals, rewrites numeric local labels (`1:`, `1b`, `1f`) into unique synthetic labels, and passes each
+    /// statement to `sink` as it is produced, so a later `.rept` count can depend on the layout of earlier ones
+    /// (`evaluateAbsolute`).
     static func expandStatements(
         text: String,
         physicalFile: FileId?,
@@ -696,16 +711,19 @@ public enum AsmMacroEngine {
         sourceMap: AsmSourceMap,
         includePaths: [String],
         initialConstants: [String: Int64] = [:],
-        diagnostics: inout DiagnosticBag
-    ) -> [AsmStatement] {
-        var ctx = Context(arch: arch, sourceMap: sourceMap, includePaths: includePaths)
+        evaluateAbsolute: @escaping (String) -> Int64? = { _ in nil },
+        numericLabels labels: NumericLocalLabels = NumericLocalLabels(),
+        diagnostics: inout DiagnosticBag,
+        sink: @escaping (AsmStatement) -> Void
+    ) {
+        var ctx = Context(arch: arch, sourceMap: sourceMap, includePaths: includePaths,
+                          sink: { stmt in labels.rewrite(stmt).forEach(sink) }, evaluateAbsolute: evaluateAbsolute)
         ctx.constants = initialConstants
         ctx.definedSymbols = Set(initialConstants.keys)
 
         var cleaned: [AsmStatement] = []
-        splitLines(Array(text.utf8), physicalFile: physicalFile, depth: 0, ctx: ctx, into: &cleaned, diagnostics: &diagnostics)
-        let expanded = expandBlock(cleaned, ctx: &ctx, diagnostics: &diagnostics)
-        return rewriteNumericLocalLabels(expanded)
+        splitLines(Array(text.utf8), physicalFile: physicalFile, depth: 0, includeChain: [], ctx: ctx, into: &cleaned, diagnostics: &diagnostics)
+        expandBlock(cleaned, ctx: &ctx, diagnostics: &diagnostics)
     }
 
     // MARK: Line splitting, line markers and `.include`
@@ -716,6 +734,7 @@ public enum AsmMacroEngine {
         _ bytes: [UInt8],
         physicalFile: FileId?,
         depth: Int,
+        includeChain: [SourceLocation],
         ctx: Context,
         into out: inout [AsmStatement],
         diagnostics: inout DiagnosticBag
@@ -753,7 +772,7 @@ public enum AsmMacroEngine {
                     let loc = AsmLoc(location)
                     let (first, rest) = splitFirstWord(text)
                     if first.lowercased() == ".include" {
-                        includeFile(rest, loc: loc, depth: depth, ctx: ctx, into: &out, diagnostics: &diagnostics)
+                        includeFile(rest, loc: loc, depth: depth, includeChain: includeChain, ctx: ctx, into: &out, diagnostics: &diagnostics)
                     } else {
                         out.append(AsmStatement(text: text, loc: loc))
                     }
@@ -764,10 +783,14 @@ public enum AsmMacroEngine {
         }
     }
 
+    /// `.include "file"`. Nesting is bounded (a file that includes itself would otherwise recurse forever, as it does
+    /// in LLVM MC); past the bound the error names the limit and carries one note per enclosing `.include`,
+    /// innermost first, like clang's `#include nested too deeply` and its include stack.
     private static func includeFile(
         _ operand: String,
         loc: AsmLoc,
         depth: Int,
+        includeChain: [SourceLocation],
         ctx: Context,
         into out: inout [AsmStatement],
         diagnostics: inout DiagnosticBag
@@ -777,13 +800,20 @@ public enum AsmMacroEngine {
             return
         }
         let name = String(decoding: nameBytes, as: UTF8.self)
-        guard depth < maxIncludeDepth,
-              let path = ctx.sourceMap.resolve(name, from: loc.location, includePaths: ctx.includePaths),
+        guard depth < maxIncludeDepth else {
+            let notes = includeChain.reversed().map {
+                DiagNote(message: "in file included from here", location: GlobalLocation(unitId: UnitId(0), location: $0))
+            }
+            diagnostics.report(.asmIncludeNestedTooDeeply, at: AsmLoc(loc.location, notes: notes), args: [String(maxIncludeDepth)])
+            return
+        }
+        guard let path = ctx.sourceMap.resolve(name, from: loc.location, includePaths: ctx.includePaths),
               let fileId = ctx.sourceMap.fileId(forPath: path) else {
             diagnostics.report(.asmFileNotFound, at: loc, args: [name])
             return
         }
-        splitLines(ctx.sourceMap.bytes(of: fileId), physicalFile: fileId, depth: depth + 1, ctx: ctx, into: &out, diagnostics: &diagnostics)
+        splitLines(ctx.sourceMap.bytes(of: fileId), physicalFile: fileId, depth: depth + 1, includeChain: includeChain + [loc.location],
+                   ctx: ctx, into: &out, diagnostics: &diagnostics)
     }
 
     /// Recognizes a GNU line marker `# <line> ["<file>" [flags]]` or `#line <line> ["<file>"]` (as emitted by
@@ -926,8 +956,8 @@ public enum AsmMacroEngine {
 
     private static let repeatOpeners: Set<String> = [".rept", ".irp", ".irpc"]
 
-    private static func expandBlock(_ stmts: [AsmStatement], ctx: inout Context, diagnostics: inout DiagnosticBag) -> [AsmStatement] {
-        var out: [AsmStatement] = []
+    /// Expands `stmts`, passing each resulting statement to `ctx.sink` in order.
+    private static func expandBlock(_ stmts: [AsmStatement], ctx: inout Context, diagnostics: inout DiagnosticBag) {
         var i = 0
         while i < stmts.count {
             let rawStmt = stmts[i]
@@ -936,7 +966,7 @@ public enum AsmMacroEngine {
                 if !label.allSatisfy({ $0.isNumber }) {
                     ctx.definedSymbols.insert(label)
                 }
-                out.append(AsmStatement(text: "\(label):", loc: rawStmt.loc))
+                ctx.sink(AsmStatement(text: "\(label):", loc: rawStmt.loc))
                 lineAfterLabels = remainder
             }
             if lineAfterLabels.isEmpty {
@@ -951,7 +981,7 @@ public enum AsmMacroEngine {
             case ".macro":
                 guard let end = blockEnd(stmts, from: i + 1, opens: [".macro"], close: ".endm") else {
                     diagnostics.report(.asmUnterminatedBlock, at: stmt.loc, args: [".endm", ".macro"])
-                    return out
+                    return
                 }
                 if let (name, params) = parseMacroHeader(restText, loc: stmt.loc, diagnostics: &diagnostics) {
                     if ctx.macros[name] != nil {
@@ -973,22 +1003,38 @@ public enum AsmMacroEngine {
 
             case ".exitm":
                 ctx.exitRequested = true
-                return out
+                return
 
             case ".rept", ".irp", ".irpc":
                 guard let end = blockEnd(stmts, from: i + 1, opens: repeatOpeners, close: ".endr") else {
                     diagnostics.report(.asmUnterminatedBlock, at: stmt.loc, args: [".endr", lowerFirst])
-                    return out
+                    return
                 }
                 let body = Array(stmts[(i + 1)..<end])
                 i = end + 1
                 var iterations: [[String: String]] = []
                 if lowerFirst == ".rept" {
-                    guard let count = AsmExprEvaluator.evaluate(restText, constants: ctx.constants)?.constantValue else {
-                        diagnostics.report(.asmInvalidExpression, at: stmt.loc, args: [restText])
+                    // The count is an absolute expression, which may be a difference of labels already laid out in one
+                    // run of fixed-size fragments (`.rept (end - start) / 4`), as LLVM MC's `parseAbsoluteExpression`
+                    // folds it. Diagnostics point at the count, with LLVM MC's wording.
+                    var countLoc = stmt.loc
+                    if countLoc.location.isValid, let r = stmt.text.range(of: restText, options: .backwards) {
+                        countLoc.location = SourceLocation(countLoc.location.rawValue + UInt32(stmt.text.utf8.distance(from: stmt.text.startIndex, to: r.lowerBound)))
+                    }
+                    guard AsmExprEvaluator.isWellFormed(restText) else {
+                        diagnostics.report(.asmInvalidExpression, at: countLoc, args: [restText])
                         continue
                     }
-                    iterations = Array(repeating: [:], count: Int(max(0, min(count, 1 << 20))))
+                    guard let count = AsmExprEvaluator.evaluate(restText, constants: ctx.constants)?.constantValue
+                            ?? ctx.evaluateAbsolute(restText) else {
+                        diagnostics.report(.asmDirectiveError, at: countLoc, args: ["unexpected token in '.rept' directive"])
+                        continue
+                    }
+                    guard count >= 0 else {
+                        diagnostics.report(.asmDirectiveError, at: countLoc, args: ["Count is negative"])
+                        continue
+                    }
+                    iterations = Array(repeating: [:], count: Int(min(count, 1 << 20)))
                 } else {
                     guard let (param, values) = parseRepeatList(lowerFirst, restText, loc: stmt.loc, diagnostics: &diagnostics) else { continue }
                     iterations = values.map { [param: $0] }
@@ -999,8 +1045,8 @@ public enum AsmMacroEngine {
                     let substituted = bindings.isEmpty ? body : body.map {
                         AsmStatement(text: substituteMacroParams(in: $0.text, bindings: bindings, counter: ctx.macroCounter), loc: $0.loc)
                     }
-                    out.append(contentsOf: expandBlock(substituted, ctx: &ctx, diagnostics: &diagnostics))
-                    if ctx.exitRequested { return out }
+                    expandBlock(substituted, ctx: &ctx, diagnostics: &diagnostics)
+                    if ctx.exitRequested { return }
                 }
                 continue
 
@@ -1033,15 +1079,15 @@ public enum AsmMacroEngine {
                 }
                 guard closed else {
                     diagnostics.report(.asmUnterminatedBlock, at: stmt.loc, args: [".endif", lowerFirst])
-                    return out
+                    return
                 }
                 branches.append((kind, arg, body))
                 i = j + 1
                 for branch in branches where evaluateConditional(kind: branch.kind, arg: branch.arg, ctx: ctx) {
-                    out.append(contentsOf: expandBlock(branch.body, ctx: &ctx, diagnostics: &diagnostics))
+                    expandBlock(branch.body, ctx: &ctx, diagnostics: &diagnostics)
                     break
                 }
-                if ctx.exitRequested { return out }
+                if ctx.exitRequested { return }
                 continue
 
             case ".equ", ".set":
@@ -1068,7 +1114,7 @@ public enum AsmMacroEngine {
                     let body = instantiateMacro(macro, arch: ctx.arch, argsText: restText, invocation: stmt, counter: ctx.macroCounter, diagnostics: &diagnostics)
                     ctx.macroCounter += 1
                     ctx.macroDepth += 1
-                    out.append(contentsOf: expandBlock(body, ctx: &ctx, diagnostics: &diagnostics))
+                    expandBlock(body, ctx: &ctx, diagnostics: &diagnostics)
                     ctx.macroDepth -= 1
                     ctx.exitRequested = false
                     i += 1
@@ -1076,10 +1122,9 @@ public enum AsmMacroEngine {
                 }
             }
 
-            out.append(stmt)
+            ctx.sink(stmt)
             i += 1
         }
-        return out
     }
 
     private static let conditionalKinds: Set<String> = [
@@ -1494,12 +1539,33 @@ public enum AsmMacroEngine {
 
     // MARK: Numeric local labels
 
-    private static func rewriteNumericLocalLabels(_ stmts: [AsmStatement]) -> [AsmStatement] {
-        // First pass: split out any inline labels (`1: in %dx, %al`) into separate label statements.
-        var normalized: [AsmStatement] = []
-        normalized.reserveCapacity(stmts.count + 16)
+    /// Rewrites numeric local labels statement by statement. `currentInstance[N]` is the number of definitions of
+    /// `N` seen so far (1..k), so `Nb` refers to `.L_local_N_<currentInstance[N]>` and `Nf` to
+    /// `.L_local_N_<currentInstance[N] + 1>`. Each instance also gets the name LLVM MC gives it, `.Ltmp<n>` in order of
+    /// creation (its definition or first forward reference), which a RISC-V relocation keeps in `.symtab`.
+    final class NumericLocalLabels {
+        private var currentInstance: [Int: Int] = [:]
+        /// `.L_local_N_K` -> `.Ltmp<n>`.
+        private(set) var outputNames: [String: String] = [:]
 
-        for stmt in stmts {
+        private func noteCreated(_ name: String) {
+            if outputNames[name] == nil { outputNames[name] = ".Ltmp\(outputNames.count)" }
+        }
+
+        /// Records, in order, the instances a rewritten line refers to.
+        private func noteReferences(in text: String) {
+            var rest = Substring(text)
+            while let r = rest.range(of: ".L_local_") {
+                var end = r.upperBound
+                while end < rest.endIndex, rest[end].isNumber || rest[end] == "_" { end = rest.index(after: end) }
+                noteCreated(String(rest[r.lowerBound..<end]))
+                rest = rest[end...]
+            }
+        }
+
+        /// `stmt` with inline labels (`1: in %dx, %al`) split into label statements, and numeric labels rewritten.
+        func rewrite(_ stmt: AsmStatement) -> [AsmStatement] {
+            var normalized: [AsmStatement] = []
             var text = stmt.text
             while let (lbl, rest) = extractLeadingLabel(text) {
                 normalized.append(AsmStatement(text: "\(lbl):", loc: stmt.loc))
@@ -1508,32 +1574,25 @@ public enum AsmMacroEngine {
             if !text.isEmpty && !text.hasSuffix(":") {
                 normalized.append(AsmStatement(text: text, loc: stmt.loc))
             }
-        }
-
-        // Second pass: assign instance numbers to each numeric label definition `N:`.
-        // `currentInstance[N]` = number of definitions of `N` seen so far (1..k), so at statement `i`,
-        // `Nb` refers to `.L_local_N_<currentInstance[N]>` and `Nf` to `.L_local_N_<currentInstance[N] + 1>`.
-        var currentInstance: [Int: Int] = [:]
-        var out: [AsmStatement] = []
-        out.reserveCapacity(normalized.count)
-
-        for stmt in normalized {
-            let text = stmt.text
-            if text.hasSuffix(":") {
-                let lblName = String(text.dropLast()).trimmingCharacters(in: .whitespaces)
-                if let num = Int(lblName), lblName.allSatisfy({ $0.isNumber }) {
-                    let nextInst = (currentInstance[num] ?? 0) + 1
-                    currentInstance[num] = nextInst
-                    out.append(AsmStatement(text: ".L_local_\(num)_\(nextInst):", loc: stmt.loc))
-                    continue
+            return normalized.map { stmt in
+                let text = stmt.text
+                if text.hasSuffix(":") {
+                    let lblName = String(text.dropLast()).trimmingCharacters(in: .whitespaces)
+                    if let num = Int(lblName), lblName.allSatisfy({ $0.isNumber }) {
+                        let nextInst = (currentInstance[num] ?? 0) + 1
+                        currentInstance[num] = nextInst
+                        noteCreated(".L_local_\(num)_\(nextInst)")
+                        return AsmStatement(text: ".L_local_\(num)_\(nextInst):", loc: stmt.loc)
+                    }
                 }
+                let rewritten = AsmMacroEngine.rewriteNumericRefsInLine(text, currentInstance: currentInstance)
+                if rewritten != text { noteReferences(in: rewritten) }
+                return AsmStatement(text: rewritten, loc: stmt.loc)
             }
-            out.append(AsmStatement(text: rewriteNumericRefsInLine(text, currentInstance: currentInstance), loc: stmt.loc))
         }
-        return out
     }
 
-    private static func rewriteNumericRefsInLine(_ line: String, currentInstance: [Int: Int]) -> String {
+    fileprivate static func rewriteNumericRefsInLine(_ line: String, currentInstance: [Int: Int]) -> String {
         // Don't rewrite inside string literals
         var out = ""
         let chars = Array(line)
@@ -1759,6 +1818,8 @@ public struct AsmInstFixup: Sendable {
     public let width: Int
     /// True if a same-section target can be resolved at assembly time without emitting an ELF relocation.
     public let resolveIfSameSection: Bool
+    /// The relocation must name the symbol even when it is local (x86-64 `sym@PLT`), instead of the section symbol.
+    public var keepsSymbol = false
 
     public init(
         offsetInInst: Int,
@@ -1788,8 +1849,9 @@ public enum AsmRelaxableBranch: Sendable {
     /// AArch64 conditional branch (`b.cond`, `cbz`/`cbnz`, `tbz`/`tbnz`) or unconditional `b`/`bl`.
     case a64Branch(baseInst: A64Instruction, targetSymbol: String, addend: Int64)
 
-    /// RV64 branch or jump (`c.j`/`jal` or `c.beqz`/`c.bnez`/`beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu`).
-    case rvBranch(baseInst: RV64Instruction, rvcAllowed: Bool, targetSymbol: String, addend: Int64)
+    /// RV64 branch or jump (`c.j`/`jal` or `c.beqz`/`c.bnez`/`beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu`). `relax`: emitted
+    /// under `.option relax`, so its `R_RISCV_JAL` (to another section, or in the long form) is linker-relaxable.
+    case rvBranch(baseInst: RV64Instruction, rvcAllowed: Bool, targetSymbol: String, addend: Int64, relax: Bool)
 }
 
 /// Fragment inside an assembling section (`05-assembler.md` §4.5).
@@ -1814,6 +1876,11 @@ public final class AsmSectionBuilder {
     public var kind: SectionKind
     public var flags: SectionFlags
     public var alignLog2: UInt8
+    /// `sh_entsize` from `.section name, "aM", @progbits, <entsize>`.
+    public var entsize: UInt32 = 0
+    /// RISC-V under linker relaxation: a branch or a linker-relaxable instruction has been emitted here, so code
+    /// alignment from now on is relaxed (worst-case NOPs plus `R_RISCV_ALIGN`), as in LLVM MC.
+    public var rvLinkerRelaxable = false
     public var fragments: [AsmFragment] = []
     /// Literal pool entries for AArch64 `ldr xN, =expr` (`(labelName, exprString)`).
     public var literalPool: [(label: String, expr: String)] = []
@@ -2336,17 +2403,31 @@ public enum Assembler {
         riscvOptions: RVAsmOptions,
         diagnostics: inout DiagnosticBag
     ) -> RelocatableObject {
-        let statements = AsmMacroEngine.expandStatements(
+        let session = AsmSession(arch: arch, sourceMap: sourceMap, includePaths: includePaths)
+        session.rvOptions = riscvOptions
+        if arch == .riscv64 { session.elfFlags = riscvOptions.elfFlags }
+        if arch == .riscv64, let archAttribute = riscvOptions.targetArchAttribute {
+            session.rvAttributes = [(5, .string(Array(archAttribute.utf8)))]
+        }
+        // Statements are assembled as the macro engine produces them, so a `.rept` count can be a difference of
+        // labels already laid out. The session's diagnostics are collected apart and merged in order of production.
+        var sessionDiagnostics = DiagnosticBag()
+        let numericLabels = AsmMacroEngine.NumericLocalLabels()
+        AsmMacroEngine.expandStatements(
             text: text,
             physicalFile: physicalFile,
             arch: arch,
             sourceMap: sourceMap,
             includePaths: includePaths,
+            evaluateAbsolute: { session.evaluateWithFixedLayout(session.bindLocationCounter(in: $0)) },
+            numericLabels: numericLabels,
             diagnostics: &diagnostics
-        )
-        let session = AsmSession(arch: arch, sourceMap: sourceMap, includePaths: includePaths)
-        session.rvOptions = riscvOptions
-        session.processStatements(statements, diagnostics: &diagnostics)
+        ) { stmt in
+            session.processOneStatement(stmt, diagnostics: &sessionDiagnostics)
+        }
+        diagnostics.absorb(sessionDiagnostics)
+        session.numericLabelNames = numericLabels.outputNames
+        session.finishStatements()
         return session.buildRelocatableObject(diagnostics: &diagnostics)
     }
 }
@@ -2361,6 +2442,20 @@ internal struct AsmSymbolAttrs {
     var sizeLoc: AsmLoc = .unknown
 }
 
+/// A build-attribute value: a ULEB128 integer or a NUL-terminated string.
+internal enum AsmBuildAttributeValue {
+    case int(UInt64)
+    case string([UInt8])
+}
+
+/// One AArch64 build-attributes subsection (`.aeabi_subsection name, optional|required, uleb128|ntbs`).
+internal struct A64AttributeSubsection {
+    let name: String
+    let optional: Bool
+    let ntbs: Bool
+    var attributes: [(tag: UInt64, value: AsmBuildAttributeValue)] = []
+}
+
 internal final class AsmSession {
     let arch: AssemblerArch
 
@@ -2368,8 +2463,11 @@ internal final class AsmSession {
     var sections: [AsmSectionBuilder] = []
     var sectionByName: [String: Int] = [:]
     var currentSectionIndex: Int = 0
-    var sectionStack: [Int] = []
-    var previousSectionIndex: Int = 0
+    /// `.pushsection` stack of (current, previous) pairs, as LLVM MC's `SectionStack`.
+    var sectionStack: [(current: Int, previous: Int?)] = []
+    var previousSectionIndex: Int? = nil
+    /// RISC-V mapping-symbol state saved per section on a section change (see `changeSection`).
+    var rvSavedMapping: [Int: Bool] = [:]
 
     // Constants (`.equ` / `.set` / `=`) known at parse time, plus label-dependent assignments
     // (`.equ len, end - start`, forward references) that are resolved after layout.
@@ -2393,6 +2491,42 @@ internal final class AsmSession {
     var rvOptionStack: [RVAsmOptions] = []
     var pcrelHiCounter: Int = 0
     var literalPoolCounter: Int = 0
+
+    // Object metadata directives
+    /// `.file "name"` operands, each an `STT_FILE` symbol.
+    var fileSymbols: [String] = []
+    /// `.ident` was seen, so `.comment` already starts with its NUL byte.
+    var seenIdent = false
+    /// `.addrsig` was seen (`.llvm_addrsig` is emitted), and the `.addrsig_sym` operands in order.
+    var addrsigEnabled = false
+    var addrsigSymbols: [String] = []
+
+    /// AArch64 and RISC-V mapping symbols (`$x` code, `$d` data): the kind last marked in each section, and the
+    /// output name of each mapping label. Every mapping symbol is a separate local symbol, so their labels get
+    /// unique internal names (`$x@3`) that assembly source cannot spell.
+    var mappingState: [Int: Bool] = [:]
+    var mappingLabels: [String: String] = [:]
+
+    /// AArch64 build attributes (`.aeabi_subsection`, `.aeabi_attribute`) and the active subsection.
+    var a64AttributeSubsections: [A64AttributeSubsection] = []
+    var activeA64AttributeSubsection: Int? = nil
+    /// RISC-V `.attribute` tags in first-set order (a later value replaces an earlier one in place).
+    var rvAttributes: [(tag: UInt64, value: AsmBuildAttributeValue)] = []
+
+    /// ELF `e_flags` for the object (RISC-V: from the target options the assembly started with).
+    var elfFlags: UInt32? = nil
+    /// LLVM MC's names for numeric local label instances (`.L_local_1_2` -> `.Ltmp3`).
+    var numericLabelNames: [String: String] = [:]
+
+    /// The `.symtab` name of `symbol`. RISC-V keeps temporary symbols that relocations name, so they get LLVM MC's
+    /// names: `.Ltmp<n>` for a numeric local label, and `.L0 ` (the name LLVM MC gives every unnamed temporary) for
+    /// the labels Swift-Stack makes for `.` and CFI.
+    func outputName(_ symbol: String) -> String {
+        guard arch == .riscv64, symbol.hasPrefix(".L") else { return symbol }
+        if let name = numericLabelNames[symbol] { return name }
+        if symbol.hasPrefix(".Ldot_") || symbol.hasPrefix(".Lloc_") || symbol.hasPrefix(".Lcfi_") { return ".L0 " }
+        return symbol
+    }
 
     // CFI state
     let cfiBuilder: AsmCFIBuilder
@@ -2443,9 +2577,34 @@ internal final class AsmSession {
         return idx
     }
 
+    /// LLVM MC's `switchSection`: the current section becomes the previous one (even when it is `idx`).
     func switchSection(to idx: Int) {
         previousSectionIndex = currentSectionIndex
+        guard idx != currentSectionIndex else { return }
+        changeSection(to: idx)
         currentSectionIndex = idx
+    }
+
+    func pushSection() {
+        sectionStack.append((currentSectionIndex, previousSectionIndex))
+    }
+
+    func popSection() {
+        guard let (current, previous) = sectionStack.popLast() else { return }
+        if current != currentSectionIndex { changeSection(to: current) }
+        currentSectionIndex = current
+        previousSectionIndex = previous
+    }
+
+    /// The mapping-symbol bookkeeping of LLVM MC's `changeSection`, called before the switch. AArch64 keeps each
+    /// section's state (`mappingState`). LLVM 22's `RISCVELFStreamer::changeSection` saves the state under the
+    /// previous section of the section stack, which `switchSection` has just made the current one but which
+    /// `popSection` leaves as the section active when the `.pushsection` switched: after a `.popsection` the
+    /// popped section's state is saved for the restored one, which can repeat mapping symbols. This reproduces it.
+    private func changeSection(to idx: Int) {
+        guard arch == .riscv64 else { return }
+        if let previous = previousSectionIndex { rvSavedMapping[previous] = mappingState[currentSectionIndex] }
+        mappingState[idx] = rvSavedMapping[idx]
     }
 
     func flushLiteralPoolIfNeeded(in sec: AsmSectionBuilder) {
@@ -2454,6 +2613,7 @@ internal final class AsmSession {
         sec.literalPool.removeAll()
         sec.fragments.append(.align(alignBytes: 8, fillByte: 0, maxBytes: 0))
         sec.recordAlignment(alignBytes: 8)
+        if let idx = sectionByName[sec.name] { noteMapping(code: false, section: idx) }
         for entry in entries {
             sec.fragments.append(.label(name: entry.label))
             sec.fragments.append(.dataExpr(width: 8, expr: entry.expr, loc: .unknown))
@@ -2466,12 +2626,18 @@ internal final class AsmSession {
         for stmt in statements {
             processOneStatement(stmt, diagnostics: &diagnostics)
         }
+        finishStatements()
+    }
+
+    /// After the last statement: flushes literal pools and emits the build-attribute sections.
+    func finishStatements() {
         for sec in sections {
             flushLiteralPoolIfNeeded(in: sec)
         }
+        emitAttributeSections()
     }
 
-    private func processOneStatement(_ stmt: AsmStatement, diagnostics: inout DiagnosticBag) {
+    func processOneStatement(_ stmt: AsmStatement, diagnostics: inout DiagnosticBag) {
         let text = stmt.text.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
 
@@ -2503,6 +2669,7 @@ internal final class AsmSession {
         }
 
         // 4. Architecture-specific instruction dispatch (closed enum switch per 05-assembler.md §4.3)
+        noteMapping(code: true)
         let sectionBefore = currentSectionIndex
         let fragmentsBefore = currentSection.fragments.count
         let errorsBefore = diagnostics.errorCount
@@ -2546,24 +2713,25 @@ internal final class AsmSession {
 
         case ".section", ".pushsection":
             if dir == ".pushsection" {
-                sectionStack.append(currentSectionIndex)
+                pushSection()
             }
             let parts = splitCommaSeparated(args)
             guard let rawName = parts.first else { return }
             let secName = rawName.trimmingCharacters(in: CharacterSet(charactersIn: " \t\""))
             let (kind, flags, alignLog2) = inferSectionProperties(name: secName, parts: parts)
             let idx = getOrCreateSection(name: secName, kind: kind, flags: flags, alignLog2: alignLog2)
+            // `.section name, "aM", @progbits, <entsize>`: the element size of a mergeable section
+            if flags.contains(.merge), parts.count >= 4,
+               let entsize = AsmExprEvaluator.evaluate(parts[3], constants: constants)?.constantValue, entsize > 0 {
+                sections[idx].entsize = UInt32(truncatingIfNeeded: entsize)
+            }
             switchSection(to: idx)
 
         case ".popsection":
-            if let prev = sectionStack.popLast() {
-                currentSectionIndex = prev
-            }
+            popSection()
 
         case ".previous":
-            let tmp = currentSectionIndex
-            currentSectionIndex = previousSectionIndex
-            previousSectionIndex = tmp
+            if let previous = previousSectionIndex { switchSection(to: previous) }
 
         case ".globl", ".global":
             for sym in splitCommaSeparated(args) where !sym.isEmpty {
@@ -2678,13 +2846,21 @@ internal final class AsmSession {
         case ".long", ".int", ".4byte":
             emitData(args, width: 4, loc: loc)
 
-        case ".quad", ".dword", ".8byte":
+        case ".quad", ".8byte":
             emitData(args, width: 8, loc: loc)
+
+        // Target-specific 8-byte data, as LLVM MC accepts it: `.dword` on AArch64 and RISC-V, `.xword` on AArch64.
+        case ".dword" where arch != .x86_64, ".xword" where arch == .aarch64:
+            emitData(args, width: 8, loc: loc)
+
+        case ".half" where arch == .riscv64:
+            emitData(args, width: 2, loc: loc)
 
         case ".incbin":
             emitIncbin(args, loc: loc, diagnostics: &diagnostics)
 
         case ".ascii":
+            noteMapping(code: false)
             for item in splitCommaSeparated(args) {
                 if let bytes = parseAsmStringLiteral(item) {
                     currentSection.emitBytes(bytes, loc: loc)
@@ -2692,6 +2868,7 @@ internal final class AsmSession {
             }
 
         case ".asciz", ".string":
+            noteMapping(code: false)
             for item in splitCommaSeparated(args) {
                 if var bytes = parseAsmStringLiteral(item) {
                     bytes.append(0)
@@ -2702,6 +2879,7 @@ internal final class AsmSession {
         case ".zero", ".space", ".skip":
             let parts = splitCommaSeparated(args)
             if let countExpr = parts.first {
+                noteMapping(code: false)
                 let fillVal: Int64 = (parts.count >= 2) ? (AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue ?? 0) : 0
                 currentSection.fragments.append(.fill(countExpr: countExpr, unitSize: 1, fillValue: fillVal, loc: loc))
             }
@@ -2709,6 +2887,7 @@ internal final class AsmSession {
         case ".fill":
             let parts = splitCommaSeparated(args)
             if let repeatExpr = parts.first {
+                noteMapping(code: false)
                 let unitSize = (parts.count >= 2) ? Int(AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue ?? 1) : 1
                 let fillVal: Int64 = (parts.count >= 3) ? (AsmExprEvaluator.evaluate(parts[2], constants: constants)?.constantValue ?? 0) : 0
                 currentSection.fragments.append(.fill(countExpr: repeatExpr, unitSize: max(1, unitSize), fillValue: fillVal, loc: loc))
@@ -2766,13 +2945,42 @@ internal final class AsmSession {
             }
 
         case ".inst":
+            noteMapping(code: true)
             for expr in splitCommaSeparated(args) {
                 currentSection.fragments.append(.dataExpr(width: 4, expr: expr, loc: loc))
             }
 
-        case ".arch", ".arch_extension", ".cpu", ".fpu", ".file", ".loc", ".ident", ".addrsig", ".addrsig_sym", ".attribute", ".insn":
-            // Metadata / target attribute directives accepted as no-ops in v1 (`.insn` for RV64 is handled in `RVAsm` if needed)
+        case ".file":
+            // `.file "name"` is an `STT_FILE` symbol; the DWARF form (`.file 1 "dir" "name"`) has no symbol.
+            let parts = splitCommaSeparated(args)
+            if parts.count == 1, let name = parseAsmStringLiteral(parts[0]) {
+                fileSymbols.append(String(decoding: name, as: UTF8.self))
+            }
+
+        case ".ident":
+            emitIdent(args, loc: loc, diagnostics: &diagnostics)
+
+        case ".addrsig":
+            addrsigEnabled = true
+
+        case ".addrsig_sym":
+            let sym = args.trimmingCharacters(in: .whitespaces)
+            noteSymbol(sym)
+            addrsigSymbols.append(sym)
+
+        case ".aeabi_subsection" where arch == .aarch64:
+            parseA64AttributeSubsection(args, loc: loc, diagnostics: &diagnostics)
+
+        case ".aeabi_attribute" where arch == .aarch64:
+            parseA64Attribute(args, loc: loc, diagnostics: &diagnostics)
+
+        case ".attribute" where arch == .riscv64:
+            parseRVAttribute(args, loc: loc, diagnostics: &diagnostics)
+
+        case ".arch", ".arch_extension", ".cpu", ".fpu", ".loc", ".attribute", ".insn":
+            // Target attribute directives accepted as no-ops in v1 (`.insn` for RV64 is handled in `RVAsm`)
             if dir == ".insn" && arch == .riscv64 {
+                noteMapping(code: true)
                 RVAsm.parseInsnDirective(args: args, loc: loc, session: self, diagnostics: &diagnostics)
             }
 
@@ -2784,6 +2992,7 @@ internal final class AsmSession {
     /// Emits `.byte`/`.short`/`.long`/`.quad` operands. Values already constant are encoded now, as LLVM MC
     /// inlines an absolute `.set` symbol at its use (so a later `.set` of the same symbol does not change them); the rest are resolved after layout.
     private func emitData(_ args: String, width: Int, loc: AsmLoc) {
+        noteMapping(code: false)
         for expr in splitCommaSeparated(args) {
             if let v = AsmExprEvaluator.evaluate(expr, constants: constants)?.constantValue {
                 var bytes: [UInt8] = []
@@ -2816,7 +3025,228 @@ internal final class AsmSession {
             return
         }
         let end = Int(min(Int64(data.count), skip + count))
+        noteMapping(code: false)
         currentSection.emitBytes([UInt8](data[Int(skip)..<end]), loc: loc)
+    }
+
+    // MARK: Mapping symbols and object metadata
+
+    /// Marks code (`$x`) or data (`$d`) at the current position of `section` (default: the current one) on AArch64
+    /// and RISC-V, as LLVM MC's ELF streamers do: a mapping symbol only where the kind changes, the first one in
+    /// each section included. Alignment padding marks nothing.
+    func noteMapping(code: Bool, section: Int? = nil) {
+        guard arch != .x86_64 else { return }
+        let idx = section ?? currentSectionIndex
+        guard mappingState[idx] != code else { return }
+        mappingState[idx] = code
+        let name = (code ? "$x" : "$d") + "@\(mappingLabels.count)"
+        mappingLabels[name] = code ? "$x" : "$d"
+        sections[idx].fragments.append(.label(name: name))
+    }
+
+    /// `.ident "string"`: appended to `.comment` (`SHF_MERGE | SHF_STRINGS`, entry size 1), which starts with a NUL
+    /// byte, as LLVM MC's `emitIdent` writes it.
+    private func emitIdent(_ args: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) {
+        guard let text = parseAsmStringLiteral(args) else {
+            diagnostics.report(.asmInvalidExpression, at: loc, args: [args])
+            return
+        }
+        let idx = getOrCreateSection(name: ".comment", kind: .customProgbits, flags: [.merge, .strings], alignLog2: 0)
+        sections[idx].entsize = 1
+        pushSection()
+        switchSection(to: idx)
+        noteMapping(code: false)
+        sections[idx].emitBytes((seenIdent ? [] : [0]) + text + [0], loc: loc)
+        popSection()
+        seenIdent = true
+    }
+
+    /// `.aeabi_subsection name[, optional|required, uleb128|ntbs]`: creates an AArch64 build-attributes subsection
+    /// or, with the name alone, re-activates one, with LLVM MC's checks and diagnostics.
+    private func parseA64AttributeSubsection(_ args: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) {
+        func fail(_ message: String) { diagnostics.report(.asmDirectiveError, at: loc, args: [message]) }
+        let parts = splitCommaSeparated(args)
+        guard let name = parts.first, let first = name.first, first.isLetter || first == "_" || first == "." else {
+            return fail("subsection name not found")
+        }
+        let existing = a64AttributeSubsections.firstIndex { $0.name == name }
+        if parts.count == 1 {
+            guard let existing else {
+                return fail("Could not switch to subsection '\(name)' using subsection name, subsection has not been defined")
+            }
+            activeA64AttributeSubsection = existing
+            return
+        }
+        guard parts.count >= 3 else { return fail("expected comma") }
+        guard parts.count == 3 else { return fail("unexpected token for AArch64 build attributes subsection header directive") }
+        let optional: Bool
+        switch parts[1] {
+        case "optional": optional = true
+        case "required": optional = false
+        default: return fail("unknown AArch64 build attributes optionality, expected required|optional")
+        }
+        let ntbs: Bool
+        switch parts[2].lowercased() {
+        case "uleb128": ntbs = false
+        case "ntbs": ntbs = true
+        default: return fail("unknown AArch64 build attributes type, expected uleb128|ntbs")
+        }
+        // The public subsections have fixed properties
+        if name == "aeabi_feature_and_bits" || name == "aeabi_pauthabi" {
+            let wantOptional = name == "aeabi_feature_and_bits"
+            if optional != wantOptional { return fail("\(name) must be marked as \(wantOptional ? "optional" : "required")") }
+            if ntbs { return fail("\(name) must be marked as ULEB128") }
+        }
+        if let existing {
+            let sub = a64AttributeSubsections[existing]
+            if sub.optional != optional {
+                return fail("optionality mismatch! subsection '\(name)' already exists with optionality defined as '\(sub.optional ? "optional" : "required")' and not '\(optional ? "optional" : "required")'")
+            }
+            if sub.ntbs != ntbs {
+                return fail("type mismatch! subsection '\(name)' already exists with type defined as '\(sub.ntbs ? "ntbs" : "uleb128")' and not '\(ntbs ? "ntbs" : "uleb128")'")
+            }
+            activeA64AttributeSubsection = existing
+            return
+        }
+        a64AttributeSubsections.append(A64AttributeSubsection(name: name, optional: optional, ntbs: ntbs))
+        activeA64AttributeSubsection = a64AttributeSubsections.count - 1
+    }
+
+    /// `.aeabi_attribute tag, value` in the active subsection. The tag is a number or, in a public subsection, one of
+    /// its tag names; the value is an integer (`uleb128`) or a string (`ntbs`, stored with its quotes and without
+    /// escape processing, as LLVM MC 22 stores it). Setting a tag again replaces its value in place.
+    private func parseA64Attribute(_ args: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) {
+        func fail(_ message: String) { diagnostics.report(.asmDirectiveError, at: loc, args: [message]) }
+        guard let active = activeA64AttributeSubsection else { return fail("no active subsection, build attribute can not be added") }
+        let sub = a64AttributeSubsections[active]
+        let parts = splitCommaSeparated(args)
+        guard let tagText = parts.first, !tagText.isEmpty else { return fail("AArch64 build attributes tag not found") }
+        guard parts.count >= 2 else { return fail("expected comma") }
+        guard parts.count == 2 else { return fail("unexpected token for AArch64 build attributes tag and value attribute directive") }
+        let tagNames: [String: UInt64]
+        switch sub.name {
+        case "aeabi_feature_and_bits": tagNames = ["Tag_Feature_BTI": 0, "Tag_Feature_PAC": 1, "Tag_Feature_GCS": 2]
+        case "aeabi_pauthabi": tagNames = ["Tag_PAuth_Platform": 1, "Tag_PAuth_Schema": 2]
+        default: tagNames = [:]
+        }
+        let tag: UInt64
+        if let n = AsmExprEvaluator.parseIntegerLiteral(tagText), n >= 0 {
+            tag = UInt64(n)
+        } else if let first = tagText.first, first.isLetter || first == "_" {
+            guard let named = tagNames[tagText] else {
+                return fail(tagNames.isEmpty
+                    ? "unrecognized Tag: '\(tagText)' \nExcept for public subsections, tags have to be an unsigned int."
+                    : "unknown AArch64 build attribute '\(tagText)' for subsection '\(sub.name)'")
+            }
+            tag = named
+        } else {
+            return fail("AArch64 build attributes tag not found")
+        }
+        let valueText = parts[1]
+        let value: AsmBuildAttributeValue
+        if valueText.hasPrefix("\"") {
+            guard sub.ntbs else { return fail("active subsection type is ULEB128 (unsigned), found NTBS (string)") }
+            value = .string(Array(valueText.utf8))
+        } else if let n = AsmExprEvaluator.parseIntegerLiteral(valueText), n >= 0 {
+            guard !sub.ntbs else { return fail("active subsection type is NTBS (string), found ULEB128 (unsigned)") }
+            if sub.name == "aeabi_feature_and_bits" && n > 1 {
+                let name = tagNames.first { $0.value == tag && tagText == $0.key }?.key ?? ""
+                return fail("unknown AArch64 build attributes Value for Tag '\(name)' options are 0|1")
+            }
+            value = .int(UInt64(n))
+        } else {
+            return fail("unexpected token for AArch64 build attributes tag and value attribute directive")
+        }
+        if let i = a64AttributeSubsections[active].attributes.firstIndex(where: { $0.tag == tag }) {
+            a64AttributeSubsections[active].attributes[i].value = value
+        } else {
+            a64AttributeSubsections[active].attributes.append((tag, value))
+        }
+    }
+
+    /// RISC-V `.attribute tag, value`: the tag is a number or a name (`arch`, `stack_align`, ...); even tags take an
+    /// integer and odd tags a string. `arch` also resets the extensions in effect, as in LLVM MC.
+    private func parseRVAttribute(_ args: String, loc: AsmLoc, diagnostics: inout DiagnosticBag) {
+        func fail(_ message: String) { diagnostics.report(.asmDirectiveError, at: loc, args: [message]) }
+        let names: [String: UInt64] = [
+            "stack_align": 4, "arch": 5, "unaligned_access": 6, "priv_spec": 8, "priv_spec_minor": 10,
+            "priv_spec_revision": 12, "atomic_abi": 14, "x3_reg_usage": 16,
+        ]
+        let parts = splitCommaSeparated(args)
+        guard parts.count == 2 else { return fail("expected comma") }
+        let tag: UInt64
+        if let named = names[parts[0]] {
+            tag = named
+        } else if let n = AsmExprEvaluator.evaluate(parts[0], constants: constants)?.constantValue, n >= 0 {
+            tag = UInt64(n)
+        } else {
+            return fail("attribute name not recognised: \(parts[0])")
+        }
+        let value: AsmBuildAttributeValue
+        if tag % 2 == 1 {
+            guard let text = parseAsmStringLiteral(parts[1]) else { return fail("expected string constant") }
+            value = .string(text)
+            if tag == 5 { rvOptions.applyArchAttribute(String(decoding: text, as: UTF8.self)) }
+        } else {
+            guard let n = AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue else {
+                return fail("expected numeric constant")
+            }
+            value = .int(UInt64(bitPattern: n))
+        }
+        if let i = rvAttributes.firstIndex(where: { $0.tag == tag }) {
+            rvAttributes[i].value = value
+        } else {
+            rvAttributes.append((tag, value))
+        }
+    }
+
+    /// Emits the attribute sections at the end of assembly: AArch64 `.ARM.attributes` (format `A`, then one
+    /// length-prefixed subsection per `.aeabi_subsection`) and RISC-V `.riscv.attributes` (format `A`, vendor
+    /// `riscv`, one `Tag_File` group), each with a `$d` mapping symbol.
+    private func emitAttributeSections() {
+        func uleb(_ value: UInt64, into out: inout [UInt8]) {
+            var v = value
+            repeat {
+                let byte = UInt8(v & 0x7F)
+                v >>= 7
+                out.append(v != 0 ? byte | 0x80 : byte)
+            } while v != 0
+        }
+        func le32(_ v: Int) -> [UInt8] { (0..<4).map { UInt8(truncatingIfNeeded: v >> (8 * $0)) } }
+        func encode(_ attrs: [(tag: UInt64, value: AsmBuildAttributeValue)]) -> [UInt8] {
+            var out: [UInt8] = []
+            for (tag, value) in attrs {
+                uleb(tag, into: &out)
+                switch value {
+                case .int(let v): uleb(v, into: &out)
+                case .string(let s): out += s + [0]
+                }
+            }
+            return out
+        }
+        var bytes: [UInt8] = []
+        let name: String
+        let kind: SectionKind
+        if arch == .aarch64 && !a64AttributeSubsections.isEmpty {
+            name = ".ARM.attributes"
+            kind = .aarch64Attributes
+            bytes = [UInt8(ascii: "A")]
+            for sub in a64AttributeSubsections {
+                let body = Array(sub.name.utf8) + [0, sub.optional ? 1 : 0, sub.ntbs ? 1 : 0] + encode(sub.attributes)
+                bytes += le32(4 + body.count) + body
+            }
+        } else if arch == .riscv64 && !rvAttributes.isEmpty {
+            name = ".riscv.attributes"
+            kind = .riscvAttributes
+            let contents = encode(rvAttributes)
+            let vendor = Array("riscv".utf8) + [0, 1] + le32(5 + contents.count) + contents
+            bytes = [UInt8(ascii: "A")] + le32(4 + vendor.count) + vendor
+        } else {
+            return
+        }
+        let idx = getOrCreateSection(name: name, kind: kind, flags: [], alignLog2: 0)
+        noteMapping(code: false, section: idx)
+        sections[idx].emitBytes(bytes)
     }
 
     /// `.equ`/`.set`/`=`. A value known now becomes a constant for the statements that follow (as in LLVM MC);
@@ -2840,7 +3270,7 @@ internal final class AsmSession {
     /// Evaluates `expr` to a constant using label offsets that are already final: within a run of fixed-size
     /// fragments of one section (no alignment or relaxable branch in between) label differences cannot change,
     /// which is when LLVM MC (and GNU `as`) fold them at once, whichever section is current.
-    private func evaluateWithFixedLayout(_ expr: String) -> Int64? {
+    func evaluateWithFixedLayout(_ expr: String) -> Int64? {
         if let v = AsmExprEvaluator.evaluate(expr, constants: constants)?.constantValue { return v }
         var runs: [[String: Int64]] = []
         var offset: Int64 = 0
@@ -2985,14 +3415,16 @@ internal final class AsmSession {
     }
 
     /// Appends an alignment directive. RISC-V code alignment under linker relaxation (no fill value, an executable
-    /// section) is LLVM MC's `shouldInsertExtraNopBytesForCodeAlign`: the worst-case padding, `align` minus the
-    /// smallest instruction, as NOPs plus an `R_RISCV_ALIGN` whose addend is that size, so the linker can trim it
-    /// after relaxing. The padding is emitted even where the offset is already aligned.
+    /// section, and a branch or linker-relaxable instruction earlier in the section, as LLVM MC 22 requires) is
+    /// LLVM MC's `shouldInsertExtraNopBytesForCodeAlign`: the worst-case padding, `align` minus the smallest
+    /// instruction, as NOPs plus an `R_RISCV_ALIGN` whose addend is that size, so the linker can trim it after
+    /// relaxing. The padding is emitted even where the offset is already aligned.
     func appendAlignment(alignBytes: Int, fillByte: UInt8?, maxBytes: Int) {
         let sec = currentSection
         sec.recordAlignment(alignBytes: alignBytes)
         let minNop = rvOptions.rvcEnabled ? 2 : 4
-        if arch == .riscv64 && rvOptions.relaxEnabled && fillByte == nil && sec.flags.contains(.execInstr) && alignBytes > minNop {
+        if arch == .riscv64 && rvOptions.relaxEnabled && sec.rvLinkerRelaxable && fillByte == nil && sec.flags.contains(.execInstr)
+            && alignBytes > minNop {
             let pad = alignBytes - minNop
             var nops: [UInt8] = []
             appendRISCVNops(&nops, count: pad, rvc: rvOptions.rvcEnabled)
@@ -3020,15 +3452,21 @@ internal final class AsmSession {
         }
     }
 
-    /// Fragment indices of RISC-V linker-relaxation barriers in `sec`: instructions with an `R_RISCV_RELAX` marker
-    /// and relaxed code alignments. A PC-relative difference spanning one cannot be folded at assembly time (LLVM
-    /// MC `attemptToFoldSymbolOffsetDifference`), since the linker may change the distance.
+    /// Fragment indices of RISC-V linker-relaxation barriers in `sec`: instructions with an `R_RISCV_RELAX` marker,
+    /// relaxed code alignments and, in a section with either, every branch (LLVM MC 22 lays each out in a fragment of
+    /// its own whose size is not final). A PC-relative difference spanning one cannot be folded at assembly time
+    /// (LLVM MC `attemptToFoldSymbolOffsetDifference`), since the linker may change the distance.
     func relaxBarriers(_ sec: AsmSectionBuilder) -> [Int] {
         guard arch == .riscv64 else { return [] }
         var out: [Int] = []
         for (i, frag) in sec.fragments.enumerated() {
-            if case .inst(_, let fixups, _) = frag, fixups.contains(where: { $0.kind == .riscv_relax || $0.kind == .riscv_align }) {
+            switch frag {
+            case .inst(_, let fixups, _) where fixups.contains(where: { $0.kind == .riscv_relax || $0.kind == .riscv_align }):
                 out.append(i)
+            case .relaxable where sec.rvLinkerRelaxable:
+                out.append(i)
+            default:
+                break
             }
         }
         return out
@@ -3129,7 +3567,8 @@ internal final class AsmSession {
                 name: sec.name,
                 kind: sec.kind,
                 flags: sec.flags,
-                alignLog2: sec.alignLog2
+                alignLog2: sec.alignLog2,
+                entsize: sec.entsize
             )
             objSectionIndices.append(sHandle)
         }
@@ -3141,6 +3580,7 @@ internal final class AsmSession {
             let kind: RelocKind
             let symbol: String
             let addend: Int64
+            var keepsSymbol = false
         }
         var pendingRelocs: [PendingReloc] = []
 
@@ -3264,7 +3704,8 @@ internal final class AsmSession {
                                     offset: UInt64(fragOffset + fix.offsetInInst),
                                     kind: fix.kind,
                                     symbol: fix.symbol,
-                                    addend: fix.addend
+                                    addend: fix.addend,
+                                    keepsSymbol: fix.keepsSymbol
                                 )
                             )
                         }
@@ -3272,12 +3713,19 @@ internal final class AsmSession {
                     bytes.append(contentsOf: patched)
 
                 case .relaxable(let branch, let form, let loc):
-                    if case .rvBranch(let baseInst, _, let targetSym, let addend) = branch,
-                       spansRelaxBarrier(secIdx, fragIndex, labelIndex[targetSym]) {
-                        // The linker may change the distance: keep the form chosen by distance, with a relocation.
-                        let (instBytes, r) = encodeUnresolvedRVBranch(baseInst: baseInst, form: form, targetSymbol: targetSym, addend: addend)
+                    // RISC-V, a branch emitted under linker relaxation (LLVM MC 22's `isPCRelFixupResolved`): a forward
+                    // branch, or a backward one across a barrier, keeps the form chosen by distance and gets a
+                    // relocation, since the linker may change the distance.
+                    if case .rvBranch(let baseInst, let rvcAllowed, let targetSym, let addend, let relax) = branch, relax,
+                       let target = labelIndex[targetSym], isLocalSymbol(targetSym),
+                       target > fragIndex || spansRelaxBarrier(secIdx, target, fragIndex) {
+                        let (instBytes, r) = encodeUnresolvedRVBranch(baseInst: baseInst, compressible: rvcAllowed, form: form,
+                                                                      targetSymbol: targetSym, addend: addend)
                         noteSymbol(targetSym)
                         pendingRelocs.append(PendingReloc(sectionIndex: secIdx, offset: UInt64(fragOffset + r.offsetInInst), kind: r.kind, symbol: targetSym, addend: addend))
+                        if relax && r.kind == .riscv_jal {
+                            pendingRelocs.append(PendingReloc(sectionIndex: secIdx, offset: UInt64(fragOffset + r.offsetInInst), kind: .riscv_relax, symbol: "", addend: 0))
+                        }
                         bytes.append(contentsOf: instBytes)
                         break
                     }
@@ -3303,6 +3751,10 @@ internal final class AsmSession {
                                 addend: r.addend
                             )
                         )
+                        // LLVM MC 22 marks `R_RISCV_JAL` linker-relaxable (`jal` can become `c.j`)
+                        if case .rvBranch(_, _, _, _, true) = branch, r.kind == .riscv_jal {
+                            pendingRelocs.append(PendingReloc(sectionIndex: secIdx, offset: UInt64(fragOffset + r.offsetInInst), kind: .riscv_relax, symbol: "", addend: 0))
+                        }
                     }
                     bytes.append(contentsOf: instBytes)
 
@@ -3403,15 +3855,42 @@ internal final class AsmSession {
             pendingRelocs = pendingRelocs.map { r in
                 guard let alias = externalAliases[r.symbol] else { return r }
                 noteSymbol(alias.symbol)
-                return PendingReloc(sectionIndex: r.sectionIndex, offset: r.offset, kind: r.kind, symbol: alias.symbol, addend: r.addend &+ alias.addend)
+                return PendingReloc(sectionIndex: r.sectionIndex, offset: r.offset, kind: r.kind, symbol: alias.symbol,
+                                    addend: r.addend &+ alias.addend, keepsSymbol: r.keepsSymbol)
             }
         }
 
-        // 4. Populate Symbol Table
-        // Note: temporary `.L*` labels are omitted from `.symtab` UNLESS they are referenced by a relocation
-        // (such as `.Lpcrel_hi0` on RV64!).
-        let relocReferencedSymbols = Set(pendingRelocs.map { $0.symbol })
+        // 4. Relocation targets. As in LLVM MC (`ELFObjectWriter::useSectionSymbol`), a relocation against a local
+        //    symbol defined in a section refers to the section symbol, with the symbol's offset added to the addend.
+        //    The symbol is kept on RISC-V (LLVM keeps every symbol there, for linker relaxation), in TLS sections, in
+        //    mergeable sections when the addend is not zero, for GOT relocations, and for an explicit `@PLT`.
+        func sectionSymbolTarget(_ r: PendingReloc) -> (section: Int, offset: Int64)? {
+            guard arch != .riscv64, !r.symbol.isEmpty, !r.keepsSymbol, constants[r.symbol] == nil,
+                  let def = definedLabels[r.symbol], (symbolAttrs[r.symbol]?.binding ?? .local) == .local else { return nil }
+            let flags = sections[def.sectionIndex].flags
+            if flags.contains(.tls) || (flags.contains(.merge) && r.addend != 0) || relocationNeedsSymbol(r.kind) { return nil }
+            return (def.sectionIndex, def.offset)
+        }
+        let relocTargets = pendingRelocs.map(sectionSymbolTarget)
+        // `.addrsig_sym` symbols are in `.symtab` as if referenced by a relocation; a `.L` one is replaced by its
+        // section symbol (LLVM MC `executePostLayoutBinding`).
+        let addrsigTargets: [(name: String, section: Int?)] = addrsigEnabled ? addrsigSymbols.map { sym in
+            (sym, sym.hasPrefix(".L") && constants[sym] == nil ? definedLabels[sym]?.sectionIndex : nil)
+        } : []
+
+        // 5. Populate Symbol Table: `STT_FILE` symbols first, then named symbols (temporary `.L*` labels only when
+        //    a relocation names them, such as `.Lpcrel_hi0` on RISC-V), section symbols, and mapping symbols.
+        var relocReferencedSymbols = Set(zip(pendingRelocs, relocTargets).filter { $0.1 == nil }.map { $0.0.symbol })
+        relocReferencedSymbols.formUnion(addrsigTargets.filter { $0.section == nil }.map(\.name))
         var symHandleByName: [String: SymbolIndex] = [:]
+        for file in fileSymbols {
+            obj.addSymbol(name: file, section: .absolute, value: 0, kind: .file)
+        }
+        /// Symbols defined in a TLS section are `STT_TLS` even without `.type` (LLVM MC does the same).
+        func symbolKind(_ kind: SymbolKind, in section: Int?) -> SymbolKind {
+            guard kind == .notype, let section, sections[section].flags.contains(.tls) else { return kind }
+            return .tls
+        }
 
         // If any relocation references a local symbol in another section (like `.bss.no_percpu` or `boot_stack`),
         // make sure it's in `symbolMentionOrder`.
@@ -3460,31 +3939,73 @@ internal final class AsmSession {
             }
 
             let handle = obj.addSymbol(
-                name: symName,
+                name: outputName(symName),
                 section: symSec,
                 value: symVal,
                 size: symSize,
                 binding: effectiveBinding,
                 visibility: attrs.visibility,
-                kind: attrs.kind
+                kind: symbolKind(attrs.kind, in: definedLabels[symName]?.sectionIndex)
             )
             symHandleByName[symName] = handle
         }
+        var sectionSymbols: [Int: SymbolIndex] = [:]
+        for section in relocTargets.compactMap({ $0?.section }) + addrsigTargets.compactMap(\.section)
+        where sectionSymbols[section] == nil {
+            sectionSymbols[section] = obj.addSymbol(name: "", section: objSectionIndices[section], value: 0, kind: .section)
+        }
+        for (label, name) in mappingLabels.sorted(by: { $0.key < $1.key }) {
+            guard let def = definedLabels[label] else { continue }
+            obj.addSymbol(name: name, section: objSectionIndices[def.sectionIndex], value: UInt64(bitPattern: def.offset),
+                          kind: symbolKind(.notype, in: def.sectionIndex))
+        }
 
-        // 5. Attach Relocations to Sections (`R_RISCV_RELAX`/`R_RISCV_ALIGN` have no symbol)
-        for pr in pendingRelocs {
-            guard let symHandle = pr.symbol.isEmpty ? SymbolIndex.nilId : symHandleByName[pr.symbol] else { continue }
-            let sHandle = objSectionIndices[pr.sectionIndex]
+        // 6. Attach Relocations to Sections (`R_RISCV_RELAX`/`R_RISCV_ALIGN` have no symbol)
+        for (pr, target) in zip(pendingRelocs, relocTargets) {
+            let symHandle: SymbolIndex
+            var addend = pr.addend
+            if let target, let handle = sectionSymbols[target.section] {
+                symHandle = handle
+                addend &+= target.offset
+            } else if let handle = pr.symbol.isEmpty ? SymbolIndex.nilId : symHandleByName[pr.symbol] {
+                symHandle = handle
+            } else {
+                continue
+            }
             obj.addRelocation(
-                to: sHandle,
+                to: objSectionIndices[pr.sectionIndex],
                 offset: pr.offset,
                 symbol: symHandle,
                 kind: pr.kind,
-                addend: pr.addend
+                addend: addend
             )
         }
 
+        // 7. `.llvm_addrsig`: the address-significant symbols (`.addrsig_sym`), as `SymbolIndex` values the ELF
+        //    writer turns into `.symtab` indices.
+        if addrsigEnabled {
+            var data: [UInt8] = []
+            for (name, section) in addrsigTargets {
+                guard let handle = section.flatMap({ sectionSymbols[$0] }) ?? symHandleByName[name] else { continue }
+                data += (0..<4).map { UInt8(truncatingIfNeeded: handle.rawIndex >> (8 * UInt32($0))) }
+            }
+            obj.addSection(name: ".llvm_addrsig", kind: .llvmAddrsig, flags: [.exclude], bytes: data)
+        }
+        obj.elfFlags = elfFlags
         return obj
+    }
+
+    /// Relocation kinds whose symbol must stay named (LLVM MC's `needsRelocateWithSymbol`): GOT and TLS-GOT
+    /// relocations on x86-64 and AArch64.
+    private func relocationNeedsSymbol(_ kind: RelocKind) -> Bool {
+        switch kind {
+        case .x86_64_got32, .x86_64_gotpcrel, .x86_64_gotpcrelx, .x86_64_rexGotpcrelx, .x86_64_gottpoff, .x86_64_tlsgd,
+             .x86_64_tlsld, .aarch64_adrGotPage, .aarch64_ld64GotLo12Nc, .aarch64_tlsieAdrGottprelPage21,
+             .aarch64_tlsieLd64GottprelLo12Nc:
+            return true
+        default:
+            return false
+        }
     }
 
     // MARK: - Deferred `.equ`/`.set` Resolution
@@ -3526,6 +4047,10 @@ internal final class AsmSession {
                     if pending[target] != nil && target != sym { continue }
                     if let def = definedLabels[target] {
                         definedLabels[sym] = (sectionIndex: def.sectionIndex, offset: def.offset + addend)
+                        // An alias without `.type` takes its target's type (LLVM MC `ELFObjectWriter`)
+                        if symbolAttrs[sym]?.kind == .notype, let kind = symbolAttrs[target]?.kind {
+                            symbolAttrs[sym]?.kind = kind
+                        }
                     } else if let alias = externalAliases[target] {
                         externalAliases[sym] = (alias.symbol, alias.addend + addend)
                     } else {
@@ -3586,9 +4111,10 @@ internal final class AsmSession {
                 bytes.append(contentsOf: repeatElement(UInt8(0x90), count: count))
                 return
             }
+            // LLVM MC's `X86AsmBackend::writeNopData`: NOPs of up to 10 bytes (the generic CPU's maximum)
             var rem = count
             while rem > 0 {
-                let chunk = min(rem, 9)
+                let chunk = min(rem, 10)
                 switch chunk {
                 case 1: bytes.append(0x90)
                 case 2: bytes.append(contentsOf: [0x66, 0x90])
@@ -3598,7 +4124,8 @@ internal final class AsmSession {
                 case 6: bytes.append(contentsOf: [0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00])
                 case 7: bytes.append(contentsOf: [0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00])
                 case 8: bytes.append(contentsOf: [0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00])
-                default: bytes.append(contentsOf: [0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00])
+                case 9: bytes.append(contentsOf: [0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00])
+                default: bytes.append(contentsOf: [0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00])
                 }
                 rem -= chunk
             }
@@ -3627,11 +4154,11 @@ internal final class AsmSession {
             return isCond ? 6 : 5
         case .a64Branch:
             return form == 0 ? 4 : 8
-        case .rvBranch:
+        case .rvBranch(let baseInst, let rvcAllowed, _, _, _):
             switch form {
             case 0: return 2
             case 1: return 4
-            default: return 8
+            default: return Self.rvCompressibleBranch(baseInst, rvcAllowed) ? 6 : 8
             }
         }
     }
@@ -3647,13 +4174,13 @@ internal final class AsmSession {
         switch branch {
         case .x86Branch(_, _, let targetSym, let addend):
             guard form == 0 else { return nil }
-            // External or cross-section symbols always use the long form
-            guard let targetOff = localLabels[targetSym] else { return 1 }
+            // External, cross-section and global (preemptible) symbols always use the long form
+            guard let targetOff = localLabels[targetSym], isLocalSymbol(targetSym) else { return 1 }
             let disp = (targetOff + addend) - (instOffset + 2)
             return (disp < -128 || disp > 127) ? 1 : nil
 
         case .a64Branch(let baseInst, let targetSym, let addend):
-            guard form == 0, let targetOff = localLabels[targetSym] else { return nil }
+            guard form == 0, let targetOff = localLabels[targetSym], isLocalSymbol(targetSym) else { return nil }
             let disp = (targetOff + addend) - instOffset
             switch A64InstructionTable.descriptor(for: baseInst.opcode).format {
             case .testBranch14:
@@ -3664,13 +4191,15 @@ internal final class AsmSession {
                 return nil
             }
 
-        case .rvBranch(let baseInst, _, let targetSym, let addend):
-            guard let targetOff = localLabels[targetSym] else {
-                // External targets use the 32-bit form with a relocation
-                return form == 0 ? 1 : nil
+        case .rvBranch(let baseInst, _, let targetSym, let addend, _):
+            let isJump = (baseInst.opcode == .c_j || baseInst.opcode == .jal)
+            guard let targetOff = localLabels[targetSym], isLocalSymbol(targetSym) else {
+                // External, cross-section and global targets: `jal`, or an inverted branch over `jal` (LLVM MC relaxes
+                // a branch whose target is unresolved to its longest form)
+                let longest = isJump ? 1 : 2
+                return form < longest ? longest : nil
             }
             let disp = (targetOff + addend) - instOffset
-            let isJump = (baseInst.opcode == .c_j || baseInst.opcode == .jal)
             switch form {
             case 0:
                 let limit: Int64 = isJump ? 2048 : 256
@@ -3716,7 +4245,7 @@ internal final class AsmSession {
         switch branch {
         case .x86Branch(let isCond, let cc, let targetSym, let addend):
             let size = relaxableSize(branch: branch, form: form)
-            if let targetOff = localLabels[targetSym] {
+            if let targetOff = localLabels[targetSym], isLocalSymbol(targetSym) {
                 let disp = (targetOff + addend) - (instOffset + Int64(size))
                 if form == 0 {
                     let opcode: UInt8 = isCond ? (0x70 + (cc & 0x0F)) : 0xEB
@@ -3738,8 +4267,7 @@ internal final class AsmSession {
             return (out, fixup)
 
         case .a64Branch(var baseInst, let targetSym, let addend):
-            if let targetOff = localLabels[targetSym],
-               (baseInst.opcode != .bl || (symbolAttrs[targetSym]?.binding ?? .local) == .local) {
+            if let targetOff = localLabels[targetSym], isLocalSymbol(targetSym) {
                 let disp = (targetOff + addend) - instOffset
                 if form == 0 {
                     baseInst.imm = disp
@@ -3780,8 +4308,8 @@ internal final class AsmSession {
             }
             return (bytes, AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: targetSym, addend: addend))
 
-        case .rvBranch(let baseInst, _, let targetSym, let addend):
-            if let targetOff = localLabels[targetSym] {
+        case .rvBranch(let baseInst, let rvcAllowed, let targetSym, let addend, _):
+            if let targetOff = localLabels[targetSym], isLocalSymbol(targetSym) {
                 let disp = (targetOff + addend) - instOffset
                 switch form {
                 case 0:
@@ -3796,26 +4324,47 @@ internal final class AsmSession {
                     return (RV64Encoder.encode(inst, rvcEnabled: false), nil)
                 default:
                     // Inverted branch over `jal x0, target`
-                    let wide = Self.rvUncompressed(baseInst)
-                    let skip = RV64Instruction(opcode: Self.rvInvertedBranch(wide.opcode), rs1: wide.rs1, rs2: wide.rs2, imm: 8)
-                    let jalDisp = disp - 4
+                    let skip = Self.rvSkipBranch(baseInst, rvcAllowed)
+                    let jalDisp = disp - Int64(skip.count)
                     if jalDisp < -(1 << 20) || jalDisp >= (1 << 20) || (jalDisp & 1) != 0 { outOfRange = true }
                     let jal = RV64Instruction(opcode: .jal, rd: RVGPR.zero.rawValue, imm: jalDisp)
-                    return (RV64Encoder.encode(skip, rvcEnabled: false) + RV64Encoder.encode(jal, rvcEnabled: false), nil)
+                    return (skip + RV64Encoder.encode(jal, rvcEnabled: false), nil)
                 }
             }
-            // External symbol -> emit 32-bit branch/jump with relocation
-            var extInst = Self.rvUncompressed(baseInst)
-            extInst.imm = 0
-            let bytes = RV64Encoder.encode(extInst, rvcEnabled: false)
-            let rKind: RelocKind = (extInst.opcode == .jal) ? .riscv_jal : .riscv_branch
-            return (bytes, AsmInstFixup(offsetInInst: 0, kind: rKind, symbol: targetSym, addend: addend))
+            // External, cross-section or global symbol: `jal` (`R_RISCV_JAL`), or a branch in the long form
+            let (bytes, fixup) = encodeUnresolvedRVBranch(baseInst: baseInst, compressible: rvcAllowed, form: max(form, 1),
+                                                          targetSymbol: targetSym, addend: addend)
+            return (bytes, fixup)
         }
+    }
+
+    /// True if `symbol` binds locally, so a reference to it from its own section can be resolved at assembly time.
+    /// A global or weak symbol may be preempted: LLVM MC always relocates a PC-relative reference to one.
+    private func isLocalSymbol(_ symbol: String) -> Bool {
+        (symbolAttrs[symbol]?.binding ?? .local) == .local
+    }
+
+    /// A conditional branch LLVM MC can invert into a compressed `c.beqz`/`c.bnez` (`rs1` in `x8`-`x15`, `rs2` zero,
+    /// compression enabled) when relaxing it to the long form.
+    private static func rvCompressibleBranch(_ inst: RV64Instruction, _ rvcAllowed: Bool) -> Bool {
+        rvcAllowed && (inst.opcode == .c_beqz || inst.opcode == .c_bnez)
+    }
+
+    /// The inverted branch that skips the `jal` of a long-form branch: `c.bnez`/`c.beqz` over 6 bytes when compressible
+    /// (LLVM MC's `expandLongCondBr`), else the 32-bit inverse over 8.
+    private static func rvSkipBranch(_ baseInst: RV64Instruction, _ rvcAllowed: Bool) -> [UInt8] {
+        if rvCompressibleBranch(baseInst, rvcAllowed) {
+            let inverse: RV64Opcode = baseInst.opcode == .c_beqz ? .c_bnez : .c_beqz
+            return RV64Encoder.encode(RV64Instruction(opcode: inverse, rs1: baseInst.rs1, imm: 6), rvcEnabled: true)
+        }
+        let wide = rvUncompressed(baseInst)
+        let skip = RV64Instruction(opcode: rvInvertedBranch(wide.opcode), rs1: wide.rs1, rs2: wide.rs2, imm: 8)
+        return RV64Encoder.encode(skip, rvcEnabled: false)
     }
 
     /// A RISC-V branch or jump whose target is in the same section but across a linker-relaxation barrier: the
     /// form already chosen by distance (LLVM MC keeps `c.j`/`c.beqz` with `R_RISCV_RVC_*`), with a zero immediate.
-    private func encodeUnresolvedRVBranch(baseInst: RV64Instruction, form: Int, targetSymbol: String, addend: Int64) -> ([UInt8], AsmInstFixup) {
+    private func encodeUnresolvedRVBranch(baseInst: RV64Instruction, compressible: Bool, form: Int, targetSymbol: String, addend: Int64) -> ([UInt8], AsmInstFixup) {
         switch form {
         case 0:
             var inst = baseInst
@@ -3828,11 +4377,10 @@ internal final class AsmSession {
             let kind: RelocKind = inst.opcode == .jal ? .riscv_jal : .riscv_branch
             return (RV64Encoder.encode(inst, rvcEnabled: false), AsmInstFixup(offsetInInst: 0, kind: kind, symbol: targetSymbol, addend: addend))
         default:
-            let wide = Self.rvUncompressed(baseInst)
-            let skip = RV64Instruction(opcode: Self.rvInvertedBranch(wide.opcode), rs1: wide.rs1, rs2: wide.rs2, imm: 8)
+            let skip = Self.rvSkipBranch(baseInst, compressible)
             let jal = RV64Instruction(opcode: .jal, rd: RVGPR.zero.rawValue, imm: 0)
-            return (RV64Encoder.encode(skip, rvcEnabled: false) + RV64Encoder.encode(jal, rvcEnabled: false),
-                    AsmInstFixup(offsetInInst: 4, kind: .riscv_jal, symbol: targetSymbol, addend: addend))
+            return (skip + RV64Encoder.encode(jal, rvcEnabled: false),
+                    AsmInstFixup(offsetInInst: skip.count, kind: .riscv_jal, symbol: targetSymbol, addend: addend))
         }
     }
 
@@ -3956,6 +4504,12 @@ internal final class AsmSession {
 
         let ehIdx = getOrCreateSection(name: ".eh_frame", kind: .ehFrame, flags: [.alloc], alignLog2: 3)
         let ehSec = sections[ehIdx]
+        // `.eh_frame` is data: its `$d` mapping symbol (laid out already, so defined directly)
+        if arch != .x86_64 && ehSec.fragments.isEmpty {
+            let name = "$d@\(mappingLabels.count)"
+            mappingLabels[name] = "$d"
+            definedLabels[name] = (sectionIndex: ehIdx, offset: 0)
+        }
         let pcRel32: RelocKind
         switch arch {
         case .x86_64:  pcRel32 = .x86_64_pc32
@@ -3991,19 +4545,139 @@ public struct RVAsmOptions: Sendable {
     /// Zbs is available, so `li` may materialize a single high bit with `bseti` (LLVM `RISCVMatInt`).
     public var zbsEnabled: Bool = true
 
+    /// ELF `e_flags` (`EF_RISCV_RVC` and the float ABI) when the target was given (`-march`/`-mabi`); nil keeps the
+    /// writer's default.
+    public var elfFlags: UInt32? = nil
+    /// The `Tag_RISCV_arch` value clang's driver adds to every object it assembles for `-march` (LLVM's
+    /// `-riscv-add-build-attributes`): a `.attribute arch` in the source replaces the value but keeps its place,
+    /// first in `.riscv.attributes`. nil without a target.
+    public var targetArchAttribute: String? = nil
+
     public init() {}
 
-    /// Options for `-march=<isa>` (e.g. `rv64imac_zicsr_zifencei`, `rv64gc`, `rv64gcb_zbs`): the C extension enables
-    /// compression and Zbs (or B) enables `bseti` in `li`. `pic` and `relax` give the initial `.option` state.
-    public init(march: String, pic: Bool = false, relax: Bool = false) {
-        let isa = march.lowercased()
-        var parts = isa.split(separator: "_").map(String.init)
-        let base = parts.isEmpty ? "" : parts.removeFirst()
-        // Single-letter extensions follow `rv64`; `g` is `imafd_zicsr_zifencei`.
-        let letters = base.hasPrefix("rv64") ? Set(base.dropFirst(4)) : []
-        rvcEnabled = letters.contains("c") || parts.contains("zca")
-        zbsEnabled = letters.contains("b") || parts.contains("zbs")
+    /// Options for `-march=<isa>` (e.g. `rv64imac_zicsr_zifencei`, `rv64gc`, `rv64gcb_zbs`) and `-mabi`: the C
+    /// extension enables compression and Zbs (or B) enables `bseti` in `li`. `pic` and `relax` give the initial
+    /// `.option` state. The ABI defaults as in clang (`lp64d` with D, `lp64f` with F, else `lp64`).
+    public init(march: String, pic: Bool = false, relax: Bool = false, abi: String? = nil) {
+        let isa = RVISAString(march)
+        rvcEnabled = isa.has("c") || isa.has("zca")
+        zbsEnabled = isa.has("b") || isa.has("zbs")
         picEnabled = pic
         relaxEnabled = relax
+        let floatABI: UInt32
+        switch abi?.lowercased() {
+        case "lp64d"?: floatABI = 0x4
+        case "lp64f"?: floatABI = 0x2
+        case "lp64q"?: floatABI = 0x6
+        case nil:      floatABI = isa.has("d") ? 0x4 : (isa.has("f") ? 0x2 : 0)
+        default:       floatABI = 0
+        }
+        elfFlags = (rvcEnabled ? 0x1 : 0) | floatABI
+        targetArchAttribute = isa.normalized ?? march.lowercased()
+    }
+
+    /// Applies a `.attribute arch` ISA string: as in LLVM MC, it resets the extensions in effect (compression, Zbs).
+    mutating func applyArchAttribute(_ arch: String) {
+        let isa = RVISAString(arch)
+        rvcEnabled = isa.has("c") || isa.has("zca")
+        zbsEnabled = isa.has("b") || isa.has("zbs")
+    }
+}
+
+/// A RISC-V ISA string (`rv64gc_zba`, or the normalized `rv64i2p1_m2p0_..._zca1p0` of a `.attribute arch`) as a set
+/// of extensions, with the implied extensions added (`g` = `imafd_zicsr_zifencei`, `m` → `zmmul`, `c` → `zca`, ...).
+struct RVISAString {
+    private(set) var extensions: Set<String> = []
+    private var xlen = ""
+    /// False when the string names an extension outside `versions` (no normalized form is produced then).
+    private var known = true
+
+    /// Ratified versions LLVM 22 writes in `Tag_RISCV_arch`, for the extensions VectraOS's and Swift-Stack's
+    /// targets use.
+    private static let versions: [String: String] = [
+        "i": "2p1", "e": "2p0", "m": "2p0", "a": "2p1", "f": "2p2", "d": "2p2", "q": "2p2", "c": "2p0", "b": "1p0",
+        "v": "1p0", "h": "1p0", "zicsr": "2p0", "zifencei": "2p0", "zicond": "1p0", "zihintpause": "2p0",
+        "zmmul": "1p0", "zaamo": "1p0", "zalrsc": "1p0", "zfa": "1p0", "zfh": "1p0", "zfhmin": "1p0",
+        "zca": "1p0", "zcb": "1p0", "zcd": "1p0", "zcf": "1p0", "zba": "1p0", "zbb": "1p0", "zbs": "1p0",
+        "zve32f": "1p0", "zve32x": "1p0", "zve64d": "1p0", "zve64f": "1p0", "zve64x": "1p0",
+        "zvl128b": "1p0", "zvl32b": "1p0", "zvl64b": "1p0",
+    ]
+    /// Canonical order of single-letter extensions, which also orders `z*` extensions by their second letter.
+    private static let canonicalOrder = Array("imafdqlcbkjtpvnh")
+
+    init(_ raw: String) {
+        let isa = raw.lowercased()
+        guard isa.hasPrefix("rv32") || isa.hasPrefix("rv64") else { known = false; return }
+        xlen = String(isa.prefix(4))
+        var parts = isa.dropFirst(4).split(separator: "_").map(String.init)
+        guard !parts.isEmpty else { return }
+        // Single letters (each possibly with a version, `i2p1`) come first; `g` expands.
+        let singles = parts.removeFirst()
+        var i = singles.startIndex
+        while i < singles.endIndex {
+            let c = singles[i]
+            i = singles.index(after: i)
+            while i < singles.endIndex, singles[i].isNumber || (singles[i] == "p" && singles.index(after: i) < singles.endIndex
+                                                                && singles[singles.index(after: i)].isNumber) {
+                i = singles.index(after: i)
+            }
+            if c == "g" {
+                extensions.formUnion(["i", "m", "a", "f", "d", "zicsr", "zifencei"])
+            } else {
+                extensions.insert(String(c))
+            }
+        }
+        for p in parts {
+            // Strip a trailing version (`zicsr2p0`)
+            var name = Substring(p)
+            while let last = name.last, last.isNumber || last == "p" { name = name.dropLast() }
+            extensions.insert(String(name))
+        }
+        addImplied()
+        if !extensions.allSatisfy({ Self.versions[$0] != nil }) { known = false }
+    }
+
+    func has(_ ext: String) -> Bool { extensions.contains(ext) }
+
+    private mutating func addImplied() {
+        var changed = true
+        while changed {
+            let before = extensions.count
+            if has("m") { extensions.insert("zmmul") }
+            if has("a") { extensions.formUnion(["zaamo", "zalrsc"]) }
+            if has("d") { extensions.insert("f") }
+            if has("f") { extensions.insert("zicsr") }
+            if has("c") {
+                extensions.insert("zca")
+                if has("d") { extensions.insert("zcd") }
+                if has("f") && xlen == "rv32" { extensions.insert("zcf") }
+            }
+            if has("zcb") { extensions.insert("zca") }
+            if has("b") { extensions.formUnion(["zba", "zbb", "zbs"]) }
+            if has("zba") && has("zbb") && has("zbs") { extensions.insert("b") }
+            if has("v") { extensions.formUnion(["zve64d", "zvl128b"]) }
+            if has("zve64d") { extensions.formUnion(["d", "zve64f"]) }
+            if has("zve64f") { extensions.formUnion(["zve32f", "zve64x"]) }
+            if has("zve32f") { extensions.formUnion(["f", "zve32x"]) }
+            if has("zve64x") { extensions.formUnion(["zve32x", "zvl64b"]) }
+            if has("zve32x") { extensions.formUnion(["zicsr", "zvl32b"]) }
+            if has("zvl128b") { extensions.insert("zvl64b") }
+            if has("zvl64b") { extensions.insert("zvl32b") }
+            if has("zfh") { extensions.insert("zfhmin") }
+            if has("zfhmin") || has("zfa") { extensions.insert("f") }
+            changed = extensions.count != before
+        }
+    }
+
+    /// The normalized string LLVM writes (`rv64i2p1_m2p0_..._zca1p0`), or nil if an extension is not in the table.
+    var normalized: String? {
+        guard known, has("i") || has("e") else { return nil }
+        func rank(_ e: String) -> (Int, Int, String) {
+            if e.count == 1 { return (0, Self.canonicalOrder.firstIndex(of: Character(e)) ?? 99, e) }
+            let category = e.dropFirst().first.flatMap { Self.canonicalOrder.firstIndex(of: $0) } ?? 99
+            return (1, category, e)
+        }
+        let ordered = extensions.sorted { rank($0) < rank($1) }
+        return xlen + ordered.map { "\($0)\(Self.versions[$0]!)" }.joined(separator: "_")
     }
 }

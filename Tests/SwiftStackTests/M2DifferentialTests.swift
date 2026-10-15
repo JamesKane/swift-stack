@@ -114,7 +114,7 @@ enum AsmCorpora {
         return files
     }
 
-    static var hasClang: Bool { ExternalTool.find("clang") != nil }
+    static var hasClang: Bool { ExternalTool.referenceClang != nil }
     static var hasGNUAs: Bool { ExternalTool.find("gcc") != nil && ExternalTool.find("as") != nil }
 }
 
@@ -140,8 +140,11 @@ func gnuDocumentedDifferences(for file: AsmCorpusFile) -> DiffOptions {
 }
 
 /// In-repo files GNU `as` cannot assemble, compared with clang only: `macro_args.s` uses macro arguments that
-/// LLVM MC splits at operators after a blank and GNU `as` splits differently or rejects (05-assembler.md §4.11).
-let gnuIncompatibleFiles: Set<String> = ["macro_args.s"]
+/// LLVM MC splits at operators after a blank and GNU `as` splits differently or rejects, and `local_relocs.s`
+/// pins LLVM MC's relocation choices (a local `call` as `R_X86_64_PLT32` against the section symbol, branches to a
+/// global symbol in the same section relocated, relaxable GOT loads), where GNU `as` emits `R_X86_64_PC32`, resolves
+/// the branches and adds `_GLOBAL_OFFSET_TABLE_` (05-assembler.md §4.11).
+let gnuIncompatibleFiles: Set<String> = ["macro_args.s", "local_relocs.s"]
 
 @Suite("M2 — Differential assembly against clang and GNU as")
 struct M2DifferentialAssemblyTests {
@@ -158,11 +161,25 @@ struct M2DifferentialAssemblyTests {
         try Self.check(file, oracle: DifferentialAssembly.assembleWithClang(path: file.path, target: file.target, includePaths: file.includePaths), oracleName: "clang")
     }
 
+    @Test("In-repo corpus matches clang exactly (every section, relocation symbol and symbol, e_flags)",
+          .enabled(if: AsmCorpora.hasClang), arguments: AsmCorpora.inRepo)
+    func inRepoVsClangExact(_ file: AsmCorpusFile) throws {
+        let (ours, errors) = try DifferentialAssembly.assembleOurs(path: file.path, target: file.target, includePaths: file.includePaths)
+        #expect(errors == 0)
+        let oracle = try DifferentialAssembly.assembleWithClang(path: file.path, target: file.target, includePaths: file.includePaths)
+        let diffs = ExactObjectComparison.differences(ours: ours, oracle: oracle)
+        #expect(diffs.isEmpty, Comment(rawValue: "\(file.testDescription):\n  " + diffs.prefix(25).joined(separator: "\n  ")))
+    }
+
     @Test("VectraOS assembly matches clang (all 26 .S files, per architecture)",
           .enabled(if: AsmCorpora.hasClang && AsmCorpora.vectraOS.count == 30), arguments: AsmCorpora.vectraOS)
     func vectraOSVsClang(_ file: AsmCorpusFile) throws {
         try AsmCorpora.prepareIncbinStandIns()
-        try Self.check(file, oracle: DifferentialAssembly.assembleWithClang(path: file.path, target: file.target, includePaths: file.includePaths), oracleName: "clang")
+        let oracle = try DifferentialAssembly.assembleWithClang(path: file.path, target: file.target, includePaths: file.includePaths)
+        try Self.check(file, oracle: oracle, oracleName: "clang")
+        let (ours, _) = try DifferentialAssembly.assembleOurs(path: file.path, target: file.target, includePaths: file.includePaths)
+        let exact = ExactObjectComparison.differences(ours: ours, oracle: oracle)
+        #expect(exact.isEmpty, Comment(rawValue: "\(file.testDescription) (exact):\n  " + exact.prefix(25).joined(separator: "\n  ")))
     }
 
     @Test(

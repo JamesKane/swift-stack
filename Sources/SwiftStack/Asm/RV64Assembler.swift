@@ -39,11 +39,11 @@ public enum RVAsm {
         }
     }
 
-    /// Fixup kinds LLVM MC (`RISCVMCCodeEmitter`) pairs with `R_RISCV_RELAX` under linker relaxation. GOT and TLS
-    /// GOT/GD `%*_hi` and branches/jumps are not relaxable.
+    /// Fixup kinds LLVM MC 22 (`RISCVMCCodeEmitter`) pairs with `R_RISCV_RELAX` under linker relaxation, `%got_pcrel_hi`
+    /// included. TLS GOT/GD `%*_hi` and branches are not relaxable (`R_RISCV_JAL` is marked by the layout).
     private static func isLinkerRelaxable(_ kind: RelocKind) -> Bool {
         switch kind {
-        case .riscv_call, .riscv_call_plt, .riscv_pcrel_hi20, .riscv_pcrel_lo12_i, .riscv_pcrel_lo12_s,
+        case .riscv_call, .riscv_call_plt, .riscv_pcrel_hi20, .riscv_gotHi20, .riscv_pcrel_lo12_i, .riscv_pcrel_lo12_s,
              .riscv_hi20, .riscv_lo12_i, .riscv_lo12_s, .riscv_tprel_hi20, .riscv_tprel_lo12_i, .riscv_tprel_lo12_s,
              .riscv_tprel_add:
             return true
@@ -72,6 +72,7 @@ public enum RVAsm {
                 }
             }
             section.fragments[i] = .inst(bytes: bytes, fixups: marked, loc: loc)
+            section.rvLinkerRelaxable = true
         }
     }
 
@@ -753,6 +754,13 @@ public enum RVAsm {
             emitChecked(.gpr(opcode, rd: rd, rs1: base, imm: imm), rvc: allowCompress, diagnostics: &diagnostics)
 
         case .iFPLoad:
+            if ops.count == 2, let fd = parseFPR(ops[0]), let (mod, base) = parseRelocMemOperand(ops[1], session: session) {
+                // `fld fd, %pcrel_lo(sym)(rs1)` and the other modifiers, as for integer loads
+                let bytes = RV64Encoder.encode(.fp(opcode, rd: fd.rawValue, rs1: base.rawValue, imm: 0), rvcEnabled: false)
+                let fixup = AsmInstFixup(offsetInInst: 0, kind: mod.kind, symbol: mod.symbol, addend: mod.addend, width: 4)
+                session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
+                return
+            }
             guard ops.count == 2,
                   let fd = parseFPR(ops[0]),
                   let (imm, base) = parseMemOperand(ops[1], session: session) else {
@@ -789,6 +797,19 @@ public enum RVAsm {
             emitChecked(.gpr(opcode, rs1: base, rs2: rs2, imm: imm), rvc: allowCompress, diagnostics: &diagnostics)
 
         case .sFP:
+            if ops.count == 2, let fs2 = parseFPR(ops[0]), let (mod, base) = parseRelocMemOperand(ops[1], session: session) {
+                let sKind: RelocKind
+                switch mod.kind {
+                case .riscv_pcrel_lo12_i: sKind = .riscv_pcrel_lo12_s
+                case .riscv_lo12_i:       sKind = .riscv_lo12_s
+                case .riscv_tprel_lo12_i: sKind = .riscv_tprel_lo12_s
+                default:                  sKind = mod.kind
+                }
+                let bytes = RV64Encoder.encode(.fp(opcode, rs1: base.rawValue, rs2: fs2.rawValue, imm: 0), rvcEnabled: false)
+                let fixup = AsmInstFixup(offsetInInst: 0, kind: sKind, symbol: mod.symbol, addend: mod.addend, width: 4)
+                session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)
+                return
+            }
             guard ops.count == 2,
                   let fs2 = parseFPR(ops[0]),
                   let (imm, base) = parseMemOperand(ops[1], session: session) else {
@@ -850,9 +871,11 @@ public enum RVAsm {
             let (sym, addend) = parseSymbolTarget(targetStr, session: session)
             let useCJ = rvc && rd == .zero
             let baseInst = RV64Instruction(opcode: useCJ ? .c_j : .jal, rd: rd.rawValue)
+            let relax = session.rvOptions.relaxEnabled
+            if relax { session.currentSection.rvLinkerRelaxable = true }
             session.currentSection.fragments.append(
                 .relaxable(
-                    branch: .rvBranch(baseInst: baseInst, rvcAllowed: useCJ, targetSymbol: sym, addend: addend),
+                    branch: .rvBranch(baseInst: baseInst, rvcAllowed: useCJ, targetSymbol: sym, addend: addend, relax: relax),
                     form: useCJ ? 0 : 1,
                     loc: loc
                 )
@@ -1323,9 +1346,11 @@ public enum RVAsm {
         let (sym, addend) = parseSymbolTarget(targetExpr, session: session)
         let isCompressedOp = (opcode == .c_beqz || opcode == .c_bnez || opcode == .c_j)
         let baseInst = RV64Instruction(opcode: opcode, rs1: rs1.rawValue, rs2: rs2.rawValue)
+        let relax = session.rvOptions.relaxEnabled
+        if relax { session.currentSection.rvLinkerRelaxable = true }
         session.currentSection.fragments.append(
             .relaxable(
-                branch: .rvBranch(baseInst: baseInst, rvcAllowed: isCompressedOp && rvc, targetSymbol: sym, addend: addend),
+                branch: .rvBranch(baseInst: baseInst, rvcAllowed: isCompressedOp && rvc, targetSymbol: sym, addend: addend, relax: relax),
                 form: (isCompressedOp && rvc) ? 0 : 1,
                 loc: loc
             )

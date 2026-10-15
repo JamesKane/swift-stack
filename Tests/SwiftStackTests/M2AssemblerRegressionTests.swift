@@ -3,7 +3,7 @@ import Testing
 @testable import SwiftStack
 
 // Regressions for M2 assembler defects. Some behavior has no clang/GNU oracle (clang reports out-of-range
-// AArch64/RISC-V branches as errors, whereas 05-assembler.md §4.5 requires relaxing them; diagnostics and
+// AArch64 branches and RISC-V `jal` as errors, whereas 05-assembler.md §4.5 requires relaxing them; diagnostics and
 // malformed-ELF handling are ours alone). The rest pin LLVM MC output (`llvm-mc`/`clang -c`, the reference
 // assembler; 05-assembler.md §4.11), so they hold even where no oracle is installed;
 // `Tests/Differential/asm/` compares the same features live.
@@ -96,9 +96,10 @@ struct M2AssemblerRegressionTests {
         far: nop
         """, .riscv64)
         #expect(errors == 0)
-        // bnez a0,+8 ; j far | bne a1,a2,+8 ; j far | c.j near
-        #expect(Self.words(text, count: 4) == [0x0005_1463, 0x3980_106F, 0x00C5_9463, 0x3900_106F])
-        #expect(Array(text[16..<18]) == [0x09, 0xA0])
+        // c.bnez a0,+6 ; j far | bne a1,a2,+8 ; j far | c.j near (llvm-mc 22: a compressible branch inverts to `c.bnez`)
+        #expect(Array(text[0..<2]) == [0x19, 0xE1])
+        #expect(Self.words(Array(text[2...]), count: 3) == [0x3980_106F, 0x00C5_9463, 0x3900_106F])
+        #expect(Array(text[14..<16]) == [0x09, 0xA0])
 
         let (_, rangeErrors, _) = Self.assemble("j far\n.space 1100000\nfar: nop\n", .riscv64)
         #expect(rangeErrors == 1)
@@ -593,5 +594,265 @@ struct M2AssemblerRegressionTests {
             }
         }
         #expect(rejected > 0)
+    }
+
+    // MARK: clang -S directives, local-symbol relocations, RISC-V relaxation, `.rept`, `.include` (LLVM MC 22)
+
+    /// Assembles `src` and parses the serialized object with the test-only ELF reader.
+    private static func elf(_ src: String, _ arch: AssemblerArch, riscv: RVAsmOptions = RVAsmOptions()) throws -> (elf: TestELF, errors: Int, rendered: String) {
+        var diags = DiagnosticBag()
+        let sm = SourceManager()
+        let obj = Assembler.assemble(source: src, arch: arch, fileName: "t.s", riscvOptions: riscv, sourceManager: sm, diagnostics: &diags)
+        return (try TestELF(bytes: ELFObjectWriter.write(obj)), diags.errorCount, DiagnosticRenderer.render(diagnostics: diags, sourceManager: sm))
+    }
+
+    /// The relocations of `section` as `offset type target+addend`, a section symbol written `[sec name]`.
+    private static func relocs(_ e: TestELF, _ section: String) -> [String] {
+        e.relas.filter { e.sections[$0.targetSection].name == section }.map { r in
+            let sym = e.symbols[r.symbol]
+            let target = r.symbol == 0 ? "-" : (sym.type == TestELF.STT_SECTION ? "[sec \(e.sections[Int(sym.shndx)].name)]" : sym.name)
+            return "\(r.offset) \(r.type) \(target)\(r.addend >= 0 ? "+" : "")\(r.addend)"
+        }
+    }
+
+    private static func section(_ e: TestELF, _ name: String) -> TestELF.Section? { e.sections.first { $0.name == name } }
+
+    @Test("AArch64 `.aeabi_subsection`/`.aeabi_attribute` build `.ARM.attributes` byte for byte as llvm-mc 22")
+    func a64BuildAttributes() throws {
+        let (e, errors, _) = try Self.elf("""
+            .aeabi_subsection aeabi_pauthabi, required, uleb128
+            .aeabi_attribute Tag_PAuth_Platform, 5
+            .aeabi_attribute 2, 7
+            .aeabi_subsection aeabi_feature_and_bits, optional, ULEB128
+            .aeabi_attribute Tag_Feature_BTI, 1
+            .aeabi_attribute Tag_Feature_BTI, 0
+            .aeabi_subsection private_x, required, ntbs
+            .aeabi_attribute 7, "hello"
+            .aeabi_subsection aeabi_pauthabi
+            .aeabi_attribute 1, 3
+            nop
+        """, .aarch64)
+        #expect(errors == 0)
+        let attributes = try #require(Self.section(e, ".ARM.attributes"))
+        #expect(attributes.type == 0x7000_0003 && attributes.flags == 0 && attributes.align == 1)
+        // llvm-mc 22 (`llvm-readelf -x .ARM.attributes`): a later value replaces a tag in place; an NTBS value keeps
+        // its quotes
+        let expected: [UInt8] = [0x41, 0x19, 0, 0, 0] + Array("aeabi_pauthabi".utf8) + [0, 0, 0, 1, 3, 2, 7]
+            + [0x1F, 0, 0, 0] + Array("aeabi_feature_and_bits".utf8) + [0, 1, 0, 0, 0]
+            + [0x19, 0, 0, 0] + Array("private_x".utf8) + [0, 0, 1, 7] + Array("\"hello\"".utf8) + [0]
+        #expect(attributes.data == expected)
+        #expect(e.symbols.contains { $0.name == "$d" && e.sections[Int($0.shndx)].name == ".ARM.attributes" })
+    }
+
+    @Test("AArch64 build-attribute directives are diagnosed with LLVM MC's messages")
+    func a64BuildAttributeDiagnostics() throws {
+        let cases: [(String, String)] = [
+            (".aeabi_attribute 1, 1", "no active subsection, build attribute can not be added"),
+            (".aeabi_subsection aeabi_feature_and_bits, required, uleb128", "aeabi_feature_and_bits must be marked as optional"),
+            (".aeabi_subsection aeabi_pauthabi, required, ntbs", "aeabi_pauthabi must be marked as ULEB128"),
+            (".aeabi_subsection foo", "Could not switch to subsection 'foo' using subsection name, subsection has not been defined"),
+            (".aeabi_subsection f, Optional, uleb128", "unknown AArch64 build attributes optionality, expected required|optional"),
+            (".aeabi_subsection f, optional, uleb128\n.aeabi_subsection f, optional, ntbs",
+             "type mismatch! subsection 'f' already exists with type defined as 'uleb128' and not 'ntbs'"),
+            (".aeabi_subsection aeabi_feature_and_bits, optional, uleb128\n.aeabi_attribute Tag_Feature_GCS, 2",
+             "unknown AArch64 build attributes Value for Tag 'Tag_Feature_GCS' options are 0|1"),
+            (".aeabi_subsection aeabi_feature_and_bits, optional, uleb128\n.aeabi_attribute Tag_PAuth_Platform, 1",
+             "unknown AArch64 build attribute 'Tag_PAuth_Platform' for subsection 'aeabi_feature_and_bits'"),
+            (".aeabi_subsection f, optional, ntbs\n.aeabi_attribute 0, 1", "active subsection type is NTBS (string), found ULEB128 (unsigned)"),
+        ]
+        for (src, message) in cases {
+            let (_, errors, rendered) = try Self.elf(src + "\n", .aarch64)
+            #expect(errors == 1, "\(src)")
+            #expect(rendered.contains(message), "\(src): \(rendered)")
+        }
+    }
+
+    @Test("`.xword` (AArch64) and `.dword` (AArch64, RISC-V) are 8-byte data; x86-64 rejects both, as llvm-mc does")
+    func eightByteDataDirectives() throws {
+        #expect(Self.assemble(".xword 1, 0x123456789\n.dword -1\n", .aarch64).text == Self.le64([1, 0x1_2345_6789, -1]))
+        #expect(Self.assemble(".dword 2\n.half 3\n", .riscv64).text == Self.le64([2]) + [3, 0])
+        #expect(Self.assemble(".xword 1\n", .riscv64).errors == 1)
+        #expect(Self.assemble(".xword 1\n", .x86_64).errors == 1)
+        #expect(Self.assemble(".dword 1\n", .x86_64).errors == 1)
+    }
+
+    @Test("`.file`, `.ident` and `.addrsig` give the STT_FILE symbol, `.comment` and `.llvm_addrsig` of LLVM MC")
+    func objectMetadataDirectives() throws {
+        let (e, errors, _) = try Self.elf("""
+            .file "t.c"
+            .text
+        f:  nop
+        .Ll: nop
+            .ident "one"
+            .ident "two"
+            .addrsig
+            .addrsig_sym f
+            .addrsig_sym .Ll
+            .addrsig_sym undef
+        """, .aarch64)
+        #expect(errors == 0)
+        #expect(e.symbols.contains { $0.name == "t.c" && $0.type == TestELF.STT_FILE && $0.shndx == TestELF.SHN_ABS })
+        let comment = try #require(Self.section(e, ".comment"))
+        #expect(comment.data == [0] + Array("one".utf8) + [0] + Array("two".utf8) + [0])
+        #expect(comment.flags == TestELF.SHF_MERGE | TestELF.SHF_STRINGS && comment.entsize == 1)
+        let addrsig = try #require(Self.section(e, ".llvm_addrsig"))
+        #expect(addrsig.type == 0x6FFF_4C03 && addrsig.flags == 0x8000_0000)
+        // ULEB128 `.symtab` indices: `f`, the section symbol standing for `.Ll`, and `undef` (now in `.symtab`)
+        let listed = addrsig.data.map { Int($0) }.map { e.symbols[$0].type == TestELF.STT_SECTION ? "[sec]" : e.symbols[$0].name }
+        #expect(listed == ["f", "[sec]", "undef"])
+        #expect(!e.symbols.contains { $0.name == ".Ll" })
+        // Mapping symbols: `$x` in .text, `$d` in .comment
+        #expect(e.symbols.filter { $0.name == "$x" }.count == 1 && e.symbols.filter { $0.name == "$d" }.count == 1)
+    }
+
+    @Test("AArch64 mapping symbols mark each change between code and data; a TLS section's are STT_TLS")
+    func a64MappingSymbols() throws {
+        let (e, errors, _) = try Self.elf("""
+            nop
+            .word 1
+            .word 2
+            nop
+            .section .tbss,"awT",@nobits
+            .zero 8
+            .text
+            nop
+        """, .aarch64)
+        #expect(errors == 0)
+        let mapping = e.symbols.filter { $0.name.hasPrefix("$") }.map { "\($0.name)@\(e.sections[Int($0.shndx)].name)+\($0.value) type=\($0.type)" }
+        #expect(mapping.sorted() == ["$d@.tbss+0 type=6", "$d@.text+4 type=0", "$x@.text+0 type=0", "$x@.text+12 type=0"])
+    }
+
+    @Test("Relocations against local symbols use the section symbol plus offset (x86-64, AArch64), as LLVM MC does")
+    func localSymbolRelocations() throws {
+        let (e, errors, _) = try Self.elf("""
+            .text
+            call loc
+            call loc@PLT
+            leaq .Lstr(%rip), %rax
+            movl $.Lstr, %eax
+            movq loc@GOTPCREL(%rip), %rax
+            .section .text.o,"ax",@progbits
+            nop
+        loc: nop
+            .section .rodata.str1.1,"aMS",@progbits,1
+        .Lstr: .asciz "hi"
+            .data
+            .quad .Ld
+        .Ld: .quad loc+3
+        """, .x86_64)
+        #expect(errors == 0)
+        // llvm-mc 22: `call loc` and `movl $.Lstr` take the section symbol; `@PLT`, a mergeable section with a nonzero
+        // addend and GOT loads keep the symbol (`R_X86_64_REX_GOTPCRELX` for the relaxable `movq` load)
+        #expect(Self.relocs(e, ".text") == ["1 4 [sec .text.o]-3", "6 4 loc-4", "13 2 .Lstr-4", "18 10 [sec .rodata.str1.1]+0", "25 42 loc-4"])
+        #expect(Self.relocs(e, ".data") == ["0 1 [sec .data]+8", "8 1 [sec .text.o]+4"])
+        #expect(!e.symbols.contains { $0.name == ".Ld" })
+        #expect(e.symbols.contains { $0.name == ".Lstr" })
+        #expect(Self.section(e, ".rodata.str1.1")?.entsize == 1)
+    }
+
+    @Test("RISC-V relocations keep local and `.L` symbols (LLVM MC's RISC-V `needsRelocateWithSymbol`)")
+    func riscvLocalSymbolRelocations() throws {
+        let (e, errors, _) = try Self.elf("""
+            .text
+            .dword .Ldat
+            .dword dat+4
+            .data
+        dat: .dword 1
+        .Ldat: .dword 2
+        """, .riscv64)
+        #expect(errors == 0)
+        #expect(Self.relocs(e, ".text") == ["0 2 .Ldat+0", "8 2 dat+4"])
+    }
+
+    @Test("A branch to a global symbol in its own section is relocated, never resolved (the symbol may be preempted)")
+    func branchToGlobalSymbol() throws {
+        let x86 = try Self.elf(".globl g\njmp g\njne g\ng: nop\n", .x86_64)
+        #expect(x86.errors == 0)
+        #expect(Self.relocs(x86.elf, ".text") == ["1 4 g-4", "7 4 g-4"])
+        let a64 = try Self.elf(".globl g\nb g\ncbz x0, g\ng: nop\n", .aarch64)
+        #expect(Self.relocs(a64.elf, ".text") == ["0 282 g+0", "4 280 g+0"])
+        // RISC-V: relaxed to an inverted branch over `jal` (`c.bnez a0, +6`), as for an undefined target
+        let rv = try Self.elf(".globl g\nbeqz a0, g\nbeq a1, a2, g\ng: nop\n", .riscv64)
+        #expect(Self.relocs(rv.elf, ".text") == ["2 17 g+0", "10 17 g+0"])
+        #expect(Array(rv.elf.sections.first { $0.name == ".text" }!.data.prefix(2)) == [0x19, 0xE1])
+    }
+
+    @Test("RISC-V under relaxation (llvm-mc 22): forward branches keep relocations, `jal` gets R_RISCV_RELAX, and code alignment is relaxed only after a branch or relaxable instruction")
+    func riscvRelaxationRules() throws {
+        let relax = RVAsmOptions(march: "rv64gc", relax: true)
+        let (e, errors, _) = try Self.elf("""
+            .p2align 3
+            nop
+            beqz a0, 1f
+            nop
+        1:  nop
+            beqz a0, 1b
+            j ext
+            .p2align 3
+            nop
+        """, .riscv64, riscv: relax)
+        #expect(errors == 0)
+        // llvm-mc -mattr=+c,+relax: the first `.p2align` pads nothing (nothing relaxable before it), the forward
+        // `c.beqz` gets R_RISCV_RVC_BRANCH, the backward one is folded, `j ext` is `jal` + R_RISCV_JAL + R_RISCV_RELAX,
+        // the second `.p2align` emits 6 bytes of NOPs + R_RISCV_ALIGN
+        #expect(Self.relocs(e, ".text") == ["2 44 .Ltmp0+0", "10 17 ext+0", "10 51 -+0", "14 43 -+6"])
+        #expect(Self.section(e, ".text")?.size == 22)
+    }
+
+    @Test("RISC-V `.attribute` builds `.riscv.attributes`; `arch` resets compression; e_flags follow -march/-mabi")
+    func riscvAttributes() throws {
+        let (e, errors, _) = try Self.elf("""
+            .attribute 4, 16
+            .attribute arch, "rv64i2p1_m2p0"
+            .attribute unaligned_access, 1
+            nop
+        """, .riscv64, riscv: RVAsmOptions(march: "rv64gc", abi: "lp64"))
+        #expect(errors == 0)
+        // clang-22 -march=rv64gc -mabi=lp64 -c: Tag_RISCV_arch (from -march) first, replaced in place
+        let contents: [UInt8] = [5] + Array("rv64i2p1_m2p0".utf8) + [0, 4, 16, 6, 1]
+        let vendor: [UInt8] = Array("riscv".utf8) + [0, 1] + [UInt8(5 + contents.count), 0, 0, 0] + contents
+        #expect(Self.section(e, ".riscv.attributes")?.data == [0x41, UInt8(4 + vendor.count), 0, 0, 0] + vendor)
+        #expect(Self.section(e, ".text")?.data == [0x13, 0, 0, 0])   // no C after `.attribute arch`
+        #expect(e.flags == 0x1)                                      // EF_RISCV_RVC (from -march), soft-float ABI
+        #expect(RVAsmOptions(march: "rv64gc_zba_zbb_zbs_v").targetArchAttribute == "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_b1p0_v1p0_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0_zca1p0_zcd1p0_zba1p0_zbb1p0_zbs1p0_zve32f1p0_zve32x1p0_zve64d1p0_zve64f1p0_zve64x1p0_zvl128b1p0_zvl32b1p0_zvl64b1p0")
+    }
+
+    @Test("x86-64 NOP padding uses LLVM MC's 10-byte `nopw %cs:` form")
+    func x86TenByteNop() {
+        let (text, errors, _) = Self.assemble("ret\n.p2align 4\nret\n", .x86_64)
+        #expect(errors == 0)
+        #expect(Array(text[1..<16]) == [0x66, 0x2E, 0x0F, 0x1F, 0x84, 0, 0, 0, 0, 0, 0x0F, 0x1F, 0x44, 0, 0])
+    }
+
+    @Test("`.rept` takes a label difference already laid out; otherwise LLVM MC's diagnostics")
+    func reptLabelDifference() throws {
+        let (text, errors, _) = Self.assemble("start: .long 1, 2, 3\nend:\n.rept (end - start) / 4\n.byte 0xaa\n.endr\n", .x86_64)
+        #expect(errors == 0)
+        #expect(Array(text.suffix(3)) == [0xAA, 0xAA, 0xAA])
+        // Not absolute yet: across a relaxable branch, a forward reference, another section, an undefined symbol
+        for src in ["a1: jmp a1\na2: .rept a2 - a1\nnop\n.endr\n", ".rept fwd - x\nnop\n.endr\nx: nop\nfwd:\n",
+                    "x: nop\n.data\ny: .byte 0\n.text\n.rept y - x\n.endr\n", ".rept ext\n.endr\n"] {
+            let a = Self.assembleObject(src, .x86_64)
+            #expect(a.errors == 1, "\(src)")
+            #expect(a.rendered.contains("t.s:") && a.rendered.contains("unexpected token in '.rept' directive"), "\(a.rendered)")
+        }
+        let negative = Self.assembleObject("a: .byte 0\nb:\n.rept a - b\nnop\n.endr\n", .x86_64)
+        #expect(negative.errors == 1 && negative.rendered.contains("Count is negative"))
+    }
+
+    @Test("A self-including `.include` stops at 64 levels with an include-depth error and the include chain")
+    func includeRecursion() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ss_include_\(UUID().uuidString)").path
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try ".include \"self.s\"\n".write(toFile: "\(dir)/self.s", atomically: true, encoding: .utf8)
+        var diags = DiagnosticBag()
+        let sm = SourceManager()
+        _ = try Assembler.assembleFile(path: "\(dir)/self.s", arch: .x86_64, sourceManager: sm, diagnostics: &diags)
+        let rendered = DiagnosticRenderer.render(diagnostics: diags, sourceManager: sm)
+        #expect(diags.errorCount == 1)
+        #expect(rendered.contains("'.include' nested too deeply (more than 64 levels)"))
+        #expect(!rendered.contains("cannot open"))
+        #expect(rendered.components(separatedBy: "in file included from here").count - 1 == 64)
     }
 }

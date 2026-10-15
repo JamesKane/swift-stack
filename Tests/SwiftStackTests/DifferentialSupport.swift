@@ -21,6 +21,10 @@ enum ExternalTool {
         return nil
     }
 
+    /// The `clang` whose integrated assembler is the reference (LLVM MC 22, 05-assembler.md §4.11): `clang-22` when
+    /// installed (a toolchain's `clang` earlier on `PATH` may be another release), else `clang`.
+    static var referenceClang: String? { find("clang-22") ?? find("clang") }
+
     struct Result {
         let status: Int32
         let stdout: String
@@ -119,6 +123,8 @@ struct TestELF {
     static let SHN_COMMON: UInt16 = 0xFFF2
 
     let machine: UInt16
+    /// `e_flags` (RISC-V: `EF_RISCV_RVC` and the float ABI).
+    let flags: UInt32
     let sections: [Section]
     let symbols: [Symbol]
     let relas: [Rela]
@@ -151,6 +157,7 @@ struct TestELF {
             throw FormatError(description: "not a little-endian ELF64 file")
         }
         machine = try u16(18)
+        flags = try u32(48)
         let shoff = Int(try u64(40))
         let shentsize = Int(try u16(58))
         let shnum = Int(try u16(60))
@@ -362,6 +369,102 @@ struct NormalizedObject {
     }
 }
 
+// MARK: - Exact comparison
+
+/// An exact comparison of two relocatable objects, for assembly that both assemblers must turn into the same
+/// object (clang's own `-S` output): every section but the symbol, string and relocation tables (non-allocatable
+/// and empty ones included) with its type, flags, alignment, entry size and bytes; every relocation with the
+/// symbol it names (a section symbol as `[sec name]`, so a relocation against a local label instead of its section
+/// symbol is a difference); every symbol, temporary `.L*`, mapping, file and section symbols included; `e_flags`.
+/// `.llvm_addrsig` is compared as the names of the symbols it lists (its size depends on the `.symtab` order).
+enum ExactObjectComparison {
+    static func differences(ours: TestELF, oracle: TestELF) -> [String] {
+        var out: [String] = []
+        if ours.flags != oracle.flags {
+            out.append("e_flags ours=0x\(String(ours.flags, radix: 16)) oracle=0x\(String(oracle.flags, radix: 16))")
+        }
+        func sectionName(_ elf: TestELF, _ shndx: UInt16) -> String {
+            switch shndx {
+            case TestELF.SHN_UNDEF: return "*UND*"
+            case TestELF.SHN_ABS: return "*ABS*"
+            case TestELF.SHN_COMMON: return "*COM*"
+            default: return Int(shndx) < elf.sections.count ? elf.sections[Int(shndx)].name : "?"
+            }
+        }
+        func symbolName(_ elf: TestELF, _ index: Int) -> String {
+            guard index > 0, index < elf.symbols.count else { return index == 0 ? "-" : "?" }
+            let sym = elf.symbols[index]
+            return sym.type == TestELF.STT_SECTION ? "[sec \(sectionName(elf, sym.shndx))]" : sym.name
+        }
+        func contents(_ elf: TestELF) -> [String: TestELF.Section] {
+            var map: [String: TestELF.Section] = [:]
+            for s in elf.sections.dropFirst() where ![TestELF.SHT_SYMTAB, 3, TestELF.SHT_RELA].contains(s.type) {
+                map[s.name] = s
+            }
+            return map
+        }
+        /// `.llvm_addrsig`: ULEB128 symbol indices, as names.
+        func addrsig(_ elf: TestELF, _ data: [UInt8]) -> [String] {
+            var names: [String] = []
+            var value = 0, shift = 0
+            for b in data {
+                value |= Int(b & 0x7F) << shift
+                shift += 7
+                if b & 0x80 == 0 {
+                    names.append(symbolName(elf, value))
+                    value = 0
+                    shift = 0
+                }
+            }
+            return names
+        }
+        let a = contents(ours), b = contents(oracle)
+        for name in Set(a.keys).union(b.keys).sorted() {
+            guard let x = a[name] else { out.append("missing section \(name)"); continue }
+            guard let y = b[name] else { out.append("extra section \(name)"); continue }
+            for (field, l, r) in [("type", UInt64(x.type), UInt64(y.type)), ("flags", x.flags, y.flags), ("align", x.align, y.align),
+                                  ("entsize", x.entsize, y.entsize), ("size", x.size, y.size)]
+            where l != r && !(field == "size" && name == ".llvm_addrsig") {
+                out.append("\(name): \(field) ours=0x\(String(l, radix: 16)) oracle=0x\(String(r, radix: 16))")
+            }
+            if name == ".llvm_addrsig" {
+                let l = addrsig(ours, x.data), r = addrsig(oracle, y.data)
+                if l != r { out.append(".llvm_addrsig: ours=\(l) oracle=\(r)") }
+            } else if x.size == y.size && x.data != y.data {
+                let i = x.data.indices.first { x.data[$0] != y.data[$0] } ?? 0
+                func hex(_ d: [UInt8]) -> String { d[max(0, i - 4)..<min(d.count, i + 12)].map { String(format: "%02x", $0) }.joined(separator: " ") }
+                out.append("\(name): bytes differ at 0x\(String(i, radix: 16)): ours=[\(hex(x.data))] oracle=[\(hex(y.data))]")
+            }
+        }
+        func relocs(_ elf: TestELF) -> [String] {
+            elf.relas.map { r in
+                let addend = r.addend >= 0 ? "+\(r.addend)" : "\(r.addend)"
+                return "\(elf.sections[r.targetSection].name)+0x\(String(r.offset, radix: 16)) type=\(r.type) \(symbolName(elf, r.symbol))\(addend)"
+            }.sorted()
+        }
+        func symbols(_ elf: TestELF) -> [String] {
+            elf.symbols.indices.dropFirst().map { i in
+                let s = elf.symbols[i]
+                return "\(symbolName(elf, i)) bind=\(s.binding) type=\(s.type) vis=\(s.visibility) \(sectionName(elf, s.shndx))+0x\(String(s.value, radix: 16)) size=\(s.size)"
+            }.sorted()
+        }
+        func multisetDifference(_ l: [String], _ r: [String]) -> [String] {
+            var counts: [String: Int] = [:]
+            for x in r { counts[x, default: 0] += 1 }
+            var extra: [String] = []
+            for x in l {
+                if let c = counts[x], c > 0 { counts[x] = c - 1 } else { extra.append(x) }
+            }
+            return extra
+        }
+        let (ra, rb) = (relocs(ours), relocs(oracle))
+        out += multisetDifference(ra, rb).map { "extra reloc \($0)" } + multisetDifference(rb, ra).map { "missing reloc \($0)" }
+        let (sa, sb) = (symbols(ours), symbols(oracle))
+        out += multisetDifference(sa, sb).map { "extra symbol \($0)" } + multisetDifference(sb, sa).map { "missing symbol \($0)" }
+        return out
+    }
+}
+
 // MARK: - Assembling with Swift-Stack and with oracles
 
 enum DifferentialAssembly {
@@ -385,7 +488,8 @@ enum DifferentialAssembly {
     static func riscvOptions(for flags: [String]) -> RVAsmOptions {
         guard let march = flags.last(where: { $0.hasPrefix("-march=") }) else { return RVAsmOptions() }
         let pic = flags.contains { ["-fPIC", "-fPIE", "-fpic", "-fpie"].contains($0) }
-        return RVAsmOptions(march: String(march.dropFirst("-march=".count)), pic: pic, relax: !flags.contains("-mno-relax"))
+        let abi = flags.last { $0.hasPrefix("-mabi=") }.map { String($0.dropFirst("-mabi=".count)) }
+        return RVAsmOptions(march: String(march.dropFirst("-march=".count)), pic: pic, relax: !flags.contains("-mno-relax"), abi: abi)
     }
 
     /// Assembles `path` with Swift-Stack and returns the serialized object plus error diagnostics count. The
@@ -400,7 +504,7 @@ enum DifferentialAssembly {
     }
 
     static func assembleWithClang(path: String, target: Target, includePaths: [String]) throws -> TestELF {
-        guard let clang = ExternalTool.find("clang") else { throw TestELF.FormatError(description: "clang not found") }
+        guard let clang = ExternalTool.referenceClang else { throw TestELF.FormatError(description: "clang not found") }
         let out = ExternalTool.temporaryPath(".o")
         defer { try? FileManager.default.removeItem(atPath: out) }
         let args = ["-target", target.clangTriple, "-c", path, "-o", out] + includePaths.map { "-I\($0)" } + target.clangFlags

@@ -85,6 +85,8 @@ public enum ELF64Constants {
     public static let shtGroup: UInt32 = 17
     public static let shtX86_64Unwind: UInt32 = 0x7000_0001
     public static let shtRiscvAttributes: UInt32 = 0x7000_0003
+    public static let shtAArch64Attributes: UInt32 = 0x7000_0003
+    public static let shtLLVMAddrsig: UInt32 = 0x6FFF_4C03
 
     // Special section indices
     public static let shnUndef: UInt16 = 0
@@ -252,7 +254,8 @@ public struct ELFObjectWriter: Sendable {
                 let alignLog2 = obj.sectionAligns[sec]
                 let align = alignLog2 == 0 ? UInt64(1) : (UInt64(1) << UInt64(alignLog2))
                 let shName = shstrtab.add(name)
-                let shType = elfSectionType(for: kind)
+                // LLVM MC types x86-64 `.eh_frame` SHT_X86_64_UNWIND
+                let shType = kind == .ehFrame && obj.arch == .x86_64 ? ELF64Constants.shtX86_64Unwind : elfSectionType(for: kind)
 
                 if kind.isNobits {
                     alignBuffer(&fileBytes, to: Int(align))
@@ -269,7 +272,7 @@ public struct ELFObjectWriter: Sendable {
                             shLink: 0,
                             shInfo: 0,
                             shAddralign: align,
-                            shEntsize: 0
+                            shEntsize: UInt64(obj.sectionEntsizes[sec])
                         )
                     )
                 } else {
@@ -281,6 +284,9 @@ public struct ELFObjectWriter: Sendable {
                     if (kind == .ssSymTypes || name == ".ss_symtypes") && secData.count >= 24 && secData.count % 24 == 0 {
                         remapSymTypesBuffer(&secData, elfSymByObjSym: elfSymByObjSym)
                     }
+                    if kind == .llvmAddrsig {
+                        secData = encodeAddrsig(secData, elfSymByObjSym: elfSymByObjSym)
+                    }
                     fileBytes.append(contentsOf: secData)
                     sectionHeaders.append(
                         RawELFSectionHeader(
@@ -290,10 +296,10 @@ public struct ELFObjectWriter: Sendable {
                             shAddr: 0,
                             shOffset: offset,
                             shSize: UInt64(secData.count),
-                            shLink: 0,
+                            shLink: kind == .llvmAddrsig ? UInt32(symtabElfIdx) : 0,
                             shInfo: 0,
                             shAddralign: align,
-                            shEntsize: 0
+                            shEntsize: UInt64(obj.sectionEntsizes[sec])
                         )
                     )
                 }
@@ -484,7 +490,7 @@ public struct ELFObjectWriter: Sendable {
         appendUInt64(&headerBytes, 0) // e_entry = 0
         appendUInt64(&headerBytes, 0) // e_phoff = 0
         appendUInt64(&headerBytes, shoff) // e_shoff
-        let eFlags: UInt32 = (obj.arch == .riscv64) ? 0x0005 : 0 // RVC + double-float ABI default or 0
+        let eFlags: UInt32 = obj.elfFlags ?? ((obj.arch == .riscv64) ? 0x0005 : 0) // default: RVC + double-float ABI, or 0
         appendUInt32(&headerBytes, eFlags)
         appendUInt16(&headerBytes, UInt16(ELF64Constants.ehdrSize)) // e_ehsize = 64
         appendUInt16(&headerBytes, 0) // e_phentsize = 0
@@ -529,9 +535,31 @@ public struct ELFObjectWriter: Sendable {
             return ELF64Constants.shtNote
         case .riscvAttributes:
             return ELF64Constants.shtRiscvAttributes
+        case .aarch64Attributes:
+            return ELF64Constants.shtAArch64Attributes
+        case .llvmAddrsig:
+            return ELF64Constants.shtLLVMAddrsig
         default:
             return ELF64Constants.shtProgbits
         }
+    }
+
+    /// `.llvm_addrsig` contents: each little-endian 32-bit `SymbolIndex` of `bytes` as the ULEB128 `.symtab` index
+    /// of that symbol (LLVM MC's `ELFObjectWriter::writeAddrsigSection`).
+    private static func encodeAddrsig(_ bytes: [UInt8], elfSymByObjSym: [UInt32]) -> [UInt8] {
+        var out: [UInt8] = []
+        var i = 0
+        while i + 4 <= bytes.count {
+            let raw = Int(UInt32(bytes[i]) | UInt32(bytes[i + 1]) << 8 | UInt32(bytes[i + 2]) << 16 | UInt32(bytes[i + 3]) << 24)
+            var v = raw > 0 && raw < elfSymByObjSym.count ? elfSymByObjSym[raw] : 0
+            repeat {
+                let byte = UInt8(v & 0x7F)
+                v >>= 7
+                out.append(v != 0 ? byte | 0x80 : byte)
+            } while v != 0
+            i += 4
+        }
+        return out
     }
 
     private static func remapSymTypesBuffer(_ bytes: inout [UInt8], elfSymByObjSym: [UInt32]) {
@@ -675,6 +703,7 @@ public struct ELFObjectReader: Sendable {
         let eShstrndx = readUInt16(bytes, at: 62)
 
         var obj = RelocatableObject(origin: .foreignELF, arch: arch, moduleId: .foreign)
+        obj.elfFlags = readUInt32(bytes, at: 48)
         if eShnum == 0 {
             return obj
         }
@@ -780,6 +809,7 @@ public struct ELFObjectReader: Sendable {
                     kind: kind,
                     flags: flags,
                     alignLog2: alignLog2,
+                    entsize: UInt32(truncatingIfNeeded: shdr.shEntsize),
                     bytes: dataSlice
                 )
             }
@@ -941,6 +971,9 @@ public struct ELFObjectReader: Sendable {
     // MARK: - Private Decoding Helpers
 
     private static func classifySectionKind(name: String, shType: UInt32, shFlags: UInt64) -> SectionKind {
+        if name == ".ARM.attributes" {
+            return .aarch64Attributes
+        }
         if shType == ELF64Constants.shtRiscvAttributes || name == ".riscv.attributes" {
             return .riscvAttributes
         }

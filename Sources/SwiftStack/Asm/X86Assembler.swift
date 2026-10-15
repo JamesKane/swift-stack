@@ -132,14 +132,15 @@ public enum X86Asm {
            !rawOperands[0].hasPrefix("%") {
             if let exprVal = AsmExprEvaluator.evaluate(rawOperands[0], constants: session.constants) {
                 switch exprVal {
-                case .symbolOffset(let sym, let addend, _):
-                    let fixup = AsmInstFixup(
+                case .symbolOffset(let sym, let addend, let modifier):
+                    var fixup = AsmInstFixup(
                         offsetInInst: 1,
                         kind: .x86_64_plt32,
                         symbol: sym,
                         addend: addend - 4,
                         resolveIfSameSection: true
                     )
+                    fixup.keepsSymbol = modifier == .x86PLT
                     session.currentSection.emitBytes([0xE8, 0, 0, 0, 0], fixups: [fixup], loc: loc)
                     return
                 case .constant(let relVal):
@@ -224,17 +225,20 @@ public enum X86Asm {
                     )
                 } else {
                     let mod = symModifiers[rel.symbol] ?? .none
-                    let mappedKind = mapRelocKind(rel.kind, modifier: mod)
+                    var mappedKind = mapRelocKind(rel.kind, modifier: mod)
+                    if mappedKind == .x86_64_gotpcrel, let relaxable = relaxableGOTLoadKind(mnemonic: mnem, operands: parsedOperands, bytes: encoded.bytes) {
+                        mappedKind = relaxable
+                    }
                     let resolveSameSec = (mappedKind == .x86_64_pc32)
-                    fixups.append(
-                        AsmInstFixup(
-                            offsetInInst: rel.offset,
-                            kind: mappedKind,
-                            symbol: rel.symbol,
-                            addend: rel.addend,
-                            resolveIfSameSection: resolveSameSec
-                        )
+                    var fixup = AsmInstFixup(
+                        offsetInInst: rel.offset,
+                        kind: mappedKind,
+                        symbol: rel.symbol,
+                        addend: rel.addend,
+                        resolveIfSameSection: resolveSameSec
                     )
+                    fixup.keepsSymbol = mod == .x86PLT
+                    fixups.append(fixup)
                 }
             }
             session.currentSection.emitBytes(encoded.bytes, fixups: fixups, loc: loc)
@@ -245,6 +249,37 @@ public enum X86Asm {
                 args: ["\(rawMnemonic) \(rawArgs)".trimmingCharacters(in: .whitespaces)]
             )
         }
+    }
+
+    /// LLVM MC's linker-relaxable GOT references (`X86MCCodeEmitter::emitMemModRMByte`, `-mrelax-relocations`, on by
+    /// default): `sym@GOTPCREL(%rip)` as the memory source of a 32/64-bit `mov` load, `lea`, `test` or ALU operation
+    /// (`adc add and cmp or sbb sub xor`), or as the target of an indirect `call`/`jmp`, is `R_X86_64_REX_GOTPCRELX`
+    /// when the instruction has a REX prefix and `R_X86_64_GOTPCRELX` otherwise. nil: plain `R_X86_64_GOTPCREL`.
+    private static func relaxableGOTLoadKind(mnemonic: String, operands: [X86Operand], bytes: [UInt8]) -> RelocKind? {
+        func isGPR32or64(_ op: X86Operand) -> Bool {
+            guard case .reg(let r) = op else { return false }
+            return r.operandSize == .dword || r.operandSize == .qword
+        }
+        func isMem(_ op: X86Operand) -> Bool {
+            if case .mem = op { return true }
+            return false
+        }
+        let base = ["l", "q"].contains(mnemonic.suffix(1)) && mnemonic.count > 2 ? String(mnemonic.dropLast()) : mnemonic
+        let relaxable: Bool
+        switch base {
+        case "mov", "lea", "adc", "add", "and", "cmp", "or", "sbb", "sub", "xor":
+            relaxable = operands.count == 2 && isMem(operands[0]) && isGPR32or64(operands[1])
+        case "test":
+            relaxable = operands.count == 2 && isGPR32or64(operands[0]) && isMem(operands[1])
+        case "call", "jmp":
+            if operands.count == 1, case .indirectMem = operands[0] { relaxable = true } else { relaxable = false }
+        default:
+            relaxable = false
+        }
+        guard relaxable else { return nil }
+        let legacyPrefixes: Set<UInt8> = [0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65]
+        let rex = bytes.first { !legacyPrefixes.contains($0) }.map { $0 & 0xF0 == 0x40 } ?? false
+        return rex ? .x86_64_rexGotpcrelx : .x86_64_gotpcrelx
     }
 
     private static func mapRelocKind(_ kind: X86RelocKind, modifier: AsmRelocModifier) -> RelocKind {

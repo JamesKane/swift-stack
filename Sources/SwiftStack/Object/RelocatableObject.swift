@@ -167,6 +167,11 @@ public enum SectionKind: UInt8, BitwiseCopyable, Sendable, Equatable, Hashable, 
     case customProgbits = 14
     case customNobits = 15
     case note = 16
+    /// AArch64 build attributes (`.ARM.attributes`, `SHT_AARCH64_ATTRIBUTES`), from `.aeabi_subsection`/`.aeabi_attribute`.
+    case aarch64Attributes = 17
+    /// `.llvm_addrsig` (`SHT_LLVM_ADDRSIG`): the address-significant symbols, held as little-endian 32-bit
+    /// `SymbolIndex` values; the ELF writer turns them into the ULEB128 `.symtab` indices the format stores.
+    case llvmAddrsig = 18
 
     /// True if this section occupies no bytes in the object file (`SHT_NOBITS`).
     @inlinable
@@ -183,8 +188,10 @@ public enum SectionKind: UInt8, BitwiseCopyable, Sendable, Equatable, Hashable, 
     @inlinable
     public var defaultFlags: SectionFlags {
         switch self {
-        case .null, .ssSymTypes, .ssDebug, .riscvAttributes, .customProgbits, .customNobits:
+        case .null, .ssSymTypes, .ssDebug, .riscvAttributes, .aarch64Attributes, .customProgbits, .customNobits:
             return []
+        case .llvmAddrsig:
+            return [.exclude]
         case .text:
             return [.alloc, .execinstr]
         case .rodata, .ehFrame, .ssUnwind, .note:
@@ -215,6 +222,8 @@ public enum SectionKind: UInt8, BitwiseCopyable, Sendable, Equatable, Hashable, 
         case .customProgbits: return "customProgbits"
         case .customNobits: return "customNobits"
         case .note: return "note"
+        case .aarch64Attributes: return "aarch64Attributes"
+        case .llvmAddrsig: return "llvmAddrsig"
         }
     }
 }
@@ -246,6 +255,8 @@ public struct SectionFlags: OptionSet, BitwiseCopyable, Sendable, Equatable, Has
     public static let group = SectionFlags(rawValue: 0x200)
     /// `SHF_TLS` (0x400): Section holds thread-local data.
     public static let tls = SectionFlags(rawValue: 0x400)
+    /// `SHF_EXCLUDE` (0x80000000): Section is dropped by the linker (`.llvm_addrsig`).
+    public static let exclude = SectionFlags(rawValue: 0x8000_0000)
 }
 
 /// Contiguous byte slice inside `RelocatableObject.bytes`.
@@ -1041,6 +1052,8 @@ public struct RelocatableObject: ~Copyable {
     public var arch: ObjectArch
     public var moduleId: ModuleId
     public var inputPriority: UInt32
+    /// ELF `e_flags`, or nil for the writer's default for `arch`.
+    public var elfFlags: UInt32? = nil
 
     /// Interned string table for section and symbol names.
     public var atoms: ObjectAtomTable
@@ -1050,6 +1063,8 @@ public struct RelocatableObject: ~Copyable {
     public var sectionKinds: Column<SectionIndex, SectionKind>
     public var sectionFlags: Column<SectionIndex, UInt32>
     public var sectionAligns: Column<SectionIndex, UInt8>
+    /// `sh_entsize` (the element size of an `SHF_MERGE` section; 0 otherwise).
+    public var sectionEntsizes: Column<SectionIndex, UInt32>
     public var sectionBytes: Column<SectionIndex, ByteRange>
     public var bytes: Column<ByteIndex, UInt8>
 
@@ -1104,6 +1119,7 @@ public struct RelocatableObject: ~Copyable {
         self.sectionKinds = Column(reservedCapacity: reservedSectionCapacity, defaultNilValue: .null)
         self.sectionFlags = Column(reservedCapacity: reservedSectionCapacity)
         self.sectionAligns = Column(reservedCapacity: reservedSectionCapacity)
+        self.sectionEntsizes = Column(reservedCapacity: reservedSectionCapacity)
         self.sectionBytes = Column(reservedCapacity: reservedSectionCapacity)
         self.bytes = Column(reservedCapacity: reservedByteCapacity)
 
@@ -1144,6 +1160,7 @@ public struct RelocatableObject: ~Copyable {
         kind: SectionKind,
         flags: SectionFlags? = nil,
         alignLog2: UInt8 = 0,
+        entsize: UInt32 = 0,
         bytes sectionData: [UInt8] = [],
         nobitsSize: UInt32 = 0
     ) -> SectionIndex {
@@ -1167,6 +1184,7 @@ public struct RelocatableObject: ~Copyable {
         _ = sectionKinds.append(kind)
         _ = sectionFlags.append(resolvedFlags.rawValue)
         _ = sectionAligns.append(alignLog2)
+        _ = sectionEntsizes.append(entsize)
         _ = sectionBytes.append(byteRange)
         _ = relocSectionStart.append(0)
         _ = relocSectionCount.append(0)
@@ -1447,6 +1465,7 @@ public struct RelocatableObject: ~Copyable {
             + sectionKinds.bytesCommitted
             + sectionFlags.bytesCommitted
             + sectionAligns.bytesCommitted
+            + sectionEntsizes.bytesCommitted
             + sectionBytes.bytesCommitted
             + bytes.bytesCommitted
             + symbolNames.bytesCommitted
@@ -1469,6 +1488,7 @@ public struct RelocatableObject: ~Copyable {
             + sectionKinds.bytesReserved
             + sectionFlags.bytesReserved
             + sectionAligns.bytesReserved
+            + sectionEntsizes.bytesReserved
             + sectionBytes.bytesReserved
             + bytes.bytesReserved
             + symbolNames.bytesReserved
