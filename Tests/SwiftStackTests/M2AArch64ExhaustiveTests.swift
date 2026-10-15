@@ -574,7 +574,7 @@ struct M2AArch64ExhaustiveTests {
     static var llvmMC: String? { ExternalTool.find("llvm-mc") }
     /// The features the table covers: base A64, LSE, FP16, Advanced SIMD, the SVE subset, the PAC/BTI/PAN
     /// system aliases (without `+pauth`/`+bti`/`+pan`, LLVM prints and accepts only the raw `hint`/`msr` forms),
-    /// and what `smc` (`+el3`) and the EL2/SME/RNDR system registers Todhchai and Croi name require.
+    /// and what `smc` (`+el3`) and the EL2/SME/RNDR system registers VectraOS's arm64 loader and kernel name require.
     static let llvmArgs = ["--triple=aarch64", "-mattr=+lse,+fp-armv8,+neon,+fullfp16,+sve,+pauth,+bti,+pan,+el3,+el2vmsa,+sme,+rand"]
 
     @Test("Every AArch64 descriptor: all operand forms round-trip and match llvm-mc bit for bit",

@@ -941,13 +941,41 @@ public struct CSemanticAnalyzer: ~Copyable {
         // Parenthesized: `(` before the name, past any `*` and qualifiers (`int (*const p)[3]`)
         var j = Int(nameTok.rawIndex) - 1
         var sawStar = false
-        while j >= 1, let k = CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(j)))),
-              k == .star || k == .kwConst || k == .kwVolatile || k == .kwRestrict || k == .kwAtomic {
-            if k == .star { sawStar = true }
-            j -= 1
+        while j >= 1, let k = CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(j)))) {
+            if k == .star || k == .kwConst || k == .kwVolatile || k == .kwRestrict || k == .kwAtomic {
+                if k == .star { sawStar = true }
+                j -= 1
+            } else if k == .rParen, let open = attributeGroupStart(endingAt: j, tokens: tokens) {
+                // A GNU attribute inside the declarator: `EFI_STATUS (__attribute__((ms_abi)) *OutputString)(...)`
+                j = open - 1
+            } else {
+                break
+            }
         }
         let opens = j >= 1 && CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(j)))) == .lParen
         return (dims, opens, sawStar)
+    }
+
+    /// If the `)` at token index `close` ends `__attribute__((...))` or `__declspec(...)`, the index of that keyword.
+    private func attributeGroupStart(endingAt close: Int, tokens: borrowing TokenBuffer) -> Int? {
+        var i = close
+        var depth = 0
+        while i >= 1 {
+            switch CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(i)))) {
+            case .rParen: depth += 1
+            case .lParen: depth -= 1
+            default: break
+            }
+            if depth == 0 { break }
+            i -= 1
+        }
+        guard depth == 0, i >= 2 else { return nil }
+        let keyword = TokenId(UInt32(i - 1))
+        guard CTokenKind(rawValue: tokens.kind(of: keyword)) == .identifier else { return nil }
+        switch spelling(of: keyword, in: tokens) {
+        case "__attribute__", "__attribute", "__declspec": return i - 1
+        default: return nil
+        }
     }
 
     /// Approximate type of a parenthesized declarator, which the parser does not model: nearly always a

@@ -13,7 +13,7 @@ Compiling, assembling and linking all happen in one address space, with objects 
 
 ## 2. Goals
 
-- One executable with the personalities that real users need: native, `cc`, and `swiftc` (Todhchai's CMake drives `swiftc`). Assembler and linker personalities are deferred until a concrete user exists.
+- One executable with the personalities that real users need: native, `cc`, and `swiftc`. VectraOS's CMake build drives `swiftc` for Swift and `clang` for C and for `.S` assembly (`-target <triple> -c`), so the `cc` personality assembles `.S` inputs, and links go to `ld.lld` directly. Standalone assembler and linker personalities are deferred until a concrete user exists.
 - Cross-compilation by triple from day one.
 - Deterministic output independent of job count (D6).
 - Diagnostics that are precise, stable, machine-readable, and testable.
@@ -36,7 +36,7 @@ The executable selects its personality from `argv[0]` or from the first subcomma
 | `swift-stack cc …` / `ss-cc` | C compiler | Subset of `cc`: `-c -o -I -D -U -std=c23 -O0/-O1/-O2 -g -target`, `-M*` dependency output |
 | `swift-stack as …` / `ss-as` | Assembler | *Deferred until a concrete user exists.* `.s`/`.S` inputs are accepted by the native and `cc` personalities. |
 | `swift-stack ld …` / `ss-ld` | Linker | *Deferred until a concrete user exists.* Linking happens in the native and `cc`/`swiftc` personalities. |
-| `swift-stack swiftc …` | Swift compatibility | Subset of `swiftc` options used by SwiftPM and by Todhchai's CMake build, including `-load-plugin-executable <path>#<module>`, `-plugin-path`, `-parse-as-library`, `-wmo`, `-Osize`, `-no-allocations`, `-strict-memory-safety`, `-enforce-exclusivity=unchecked`, `-enable-experimental-feature {Embedded, Lifetimes, Extern, Volatile}`, and `-Werror <group>` / `-Wwarning <group>` for diagnostic groups. Feature names and diagnostic-group names match `swiftc`'s spelling, so that existing builds work unchanged ([02](02-semantic-analysis.md) §4.3.5). Todhchai's backend flag `-Xllvm -disable-loop-idiom-all` is accepted and mapped to `-disable-loop-idioms` ([17](17-simd-and-vectorization.md) §5.5). Unsupported options are a hard error, never silently ignored. |
+| `swift-stack swiftc …` | Swift compatibility | Subset of `swiftc` options used by SwiftPM and by VectraOS's CMake build: `-target`, `-module-name`, `-parse-as-library`, `-wmo`, `-Osize`, `-strict-memory-safety`, `-enforce-exclusivity=unchecked`, `-enable-experimental-feature {Embedded, Lifetimes}`, `-Xfrontend -function-sections`, `-Xcc <clang flag>`, and `-Werror <group>` / `-Wwarning <group>` for diagnostic groups (`StrictMemorySafety`, `EmbeddedRestrictions`, `PerformanceHints`); also `-load-plugin-executable <path>#<module>`, `-plugin-path`, `-no-allocations` and the `Extern` and `Volatile` features, for the macros and libc VectraOS lifts later. Feature names and diagnostic-group names match `swiftc`'s spelling, so that existing builds work unchanged ([02](02-semantic-analysis.md) §4.3.5). The backend flag `-Xllvm -disable-loop-idiom-all`, which a Swift-implemented libc needs under `swiftc`, is accepted and mapped to `-disable-loop-idioms` ([17](17-simd-and-vectorization.md) §5.5). Unsupported options are a hard error, never silently ignored. |
 
 Native mode takes a whole build description (modules, sources, dependencies) and produces final artifacts in one process. The compatibility personalities exist so that existing build systems can drive Swift-Stack one step at a time, using on-disk objects and module files ([13](13-modules-and-incremental-builds.md)).
 
@@ -49,7 +49,7 @@ Native mode takes a whole build description (modules, sources, dependencies) and
 - runtime tier and default sysroot ([08](08-runtime-and-stdlib.md));
 - the ISA baseline, and any opt-in features given with `-target-feature` ([17](17-simd-and-vectorization.md) §5.4).
 
-The table is data, not code. Adding a new OS on an existing architecture is a table entry plus a linker layout. The host triple is the default. Todhchai triples (`x86_64-unknown-todhchai`, `aarch64-unknown-todhchai`, `riscv64-unknown-todhchai`) are first-class.
+The table is data, not code. Adding a new OS on an existing architecture is a table entry plus a linker layout. The host triple is the default. VectraOS's triples are first-class: the freestanding ones its build uses today (Swift `x86_64-unknown-none-elf`, `aarch64-none-none-elf`, `riscv64-none-none-eabi`; C and assembly `x86_64-unknown-none-elf`, `aarch64-unknown-none-elf`, `riscv64-unknown-none-elf`), with VectraOS's ISA flags (`-mgeneral-regs-only`, `-march=rv64imac_zicsr_zifencei -mabi=lp64`, …), and an OS-named triple once the `os(...)` spelling is decided ([12](12-standard-library-strategy.md) open question 1).
 
 ### 4.3 Phases and lanes
 
@@ -127,7 +127,7 @@ D5 requires the same accepted programs, not the same messages. Differential test
 - **`--dump=<stage>`:** textual dumps of TokenBuffer, ParseTree, SemIR, AIR (before or after a named pass), LIR, and the object model. These are deterministic and used by FileCheck-style golden tests.
 - **`--dump=macro-expansions`:** every macro expansion with its site, role and discriminator ([16](16-macros.md)).
 - **`--verify-each`:** runs IR verifiers after every pass (debug builds of the compiler enable this by default).
-- **`--profile=<file>`:** the built-in profiler. Timed blocks are always compiled in. They read the cycle counter (x86-64 `rdtsc`, AArch64 `cntvct_el0`, RV64 `rdtime`), and cost one predictable branch when profiling is off. The output is a per-lane timeline in Chrome trace JSON. It works on Todhchai, where `perf` and Cachegrind don't exist, and it supplies cycle counts to CI ([14](14-measurement-methodology.md) §8–9).
+- **`--profile=<file>`:** the built-in profiler. Timed blocks are always compiled in. They read the cycle counter (x86-64 `rdtsc`, AArch64 `cntvct_el0`, RV64 `rdtime`), and cost one predictable branch when profiling is off. The output is a per-lane timeline in Chrome trace JSON. It works on VectraOS, where `perf` and Cachegrind don't exist, and it supplies cycle counts to CI ([14](14-measurement-methodology.md) §8–9).
 
 ### 4.8 Record and replay
 
@@ -152,5 +152,5 @@ D5 requires the same accepted programs, not the same messages. Differential test
 1. Which SwiftPM version and `swiftc` flag subset is the compatibility target?
 2. Should native mode read `Package.swift` directly? That would require evaluating Swift manifests, which in turn requires Tier 1 and Foundation.
 3. Is a persistent compiler daemon (warm caches across builds) in scope after v1?
-4. Per-OS plugin sandboxing (Capsicum, Landlock/seccomp, the macOS sandbox, Todhchai handles): when, and opt-in or default ([16](16-macros.md) §5.5)?
+4. Per-OS plugin sandboxing (Capsicum, Landlock/seccomp, the macOS sandbox, VectraOS capabilities): when, and opt-in or default ([16](16-macros.md) §5.5)?
 5. Is there a concrete user for the `as`/`ld` personalities or SARIF output?

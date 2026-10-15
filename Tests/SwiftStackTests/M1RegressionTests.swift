@@ -155,6 +155,43 @@ struct M1RegressionTests {
         #expect(SWAR.horizontalSpaceRun(0x2020_2020_3D21_2020) == 2)
     }
 
+    @Test("VectraOS C: nullability qualifiers, attributes in declarators, `__INT64_C`, directives in macro arguments")
+    func vectraOSConstructs() throws {
+        // Clang's nullability qualifiers, on every pointer of VectraOS's kernel headers (Swift's importer reads them)
+        #expect(try Self.accepts("""
+        void f(const void *_Nullable regs, int *_Nonnull out, char *_Null_unspecified s, void *_Nullable_result *r);
+        void cpuid(unsigned leaf, unsigned out[_Nonnull 4]);
+        int (*_Nullable handler)(int);
+        int call(void) { return handler ? handler(1) : 0; }
+        """))
+        // A GNU attribute inside a parenthesized declarator still declares a function pointer (efi.h's EFIAPI)
+        #expect(try Self.accepts("""
+        typedef struct P P;
+        struct P { int (__attribute__((ms_abi)) *Out)(P *self, int x); };
+        static inline int call(P *p) { return p->Out(p, 1); }
+        int (__attribute__((ms_abi)) *g)(int);
+        int use(void) { return g(1); }
+        """))
+        // Clang's predefined integer-constant macros, which its freestanding <stdint.h> uses for `UINT64_C`
+        #expect(try Self.accepts("""
+        #if !defined(__INT64_C_SUFFIX__) || __UINT64_C(5) != 5 || __INT32_C(-3) != -3
+        #error "integer constant macros"
+        #endif
+        unsigned long big = __UINT64_C(18446744073709551615);
+        """))
+        // `#if` inside a function-like macro's arguments (usertest.c's `CHECK(...)`), as GCC and Clang process it
+        #expect(try Self.accepts("""
+        #define CHECK(n, cond) int check##n(void) { return (cond); }
+        CHECK(1, 1 ==
+        #if defined(__x86_64__)
+                 1
+        #else
+                 undeclared_identifier
+        #endif
+        )
+        """))
+    }
+
     @Test("Shared C literal decoding")
     func literalDecoding() {
         #expect(CLiteral.characterValue("'\\n'") == 10)

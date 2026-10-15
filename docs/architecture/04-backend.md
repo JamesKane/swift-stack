@@ -186,7 +186,7 @@ For each interval taken from `unhandled` in start order:
   - **x86 variable shifts:** the count operand must be in `CL`.
   - Argument and return registers at call sites and at function entry and exit.
 - **Two-address forms (x86):** most x86 ALU instructions overwrite their first source. Instruction selection emits `dst = op src1, src2` and gives `dst` a hint for `src1`'s register. If `src1` is still live after the instruction, the allocator inserts `MOV dst, src1` first.
-- **Reserved registers:** stack pointer, frame pointer (§4.6), AArch64 `X18` on Apple and Todhchai targets (§4.7.2), RISC-V `gp` and `tp`, and any register a Swift CC role pins for the function (§4.7.4).
+- **Reserved registers:** stack pointer, frame pointer (§4.6), AArch64 `X18` on Apple and VectraOS targets (§4.7.2), RISC-V `gp` and `tp`, and any register a Swift CC role pins for the function (§4.7.4).
 
 #### 4.5.5 Resolution and SSA destruction
 
@@ -199,7 +199,7 @@ For each interval taken from `unhandled` in start order:
 
 - **Frame pointers MUST be kept by default on all targets** (`RBP`, `X29`, `s0`/`fp`), with the standard frame record (saved FP and return address adjacent at the FP). This lets CUD ([07](07-debugging-and-sdi.md)) unwind most frames with one load each, and lets external profilers walk stacks. A later flag MAY allow leaf functions to omit the frame; CUD describes such frames with its frameless mode ([07](07-debugging-and-sdi.md) §5.5).
 - **Stack alignment:** 16 bytes at every call boundary on all three architectures.
-- **Red zone:** v1 does not use a red zone on any target. Tier 0 and kernel-adjacent code on Todhchai cannot rely on one. Using SysV's 128-byte red zone for hosted Linux and FreeBSD leaf functions is a later optimization.
+- **Red zone:** v1 does not use a red zone on any target. Tier 0 and kernel-adjacent code on VectraOS cannot rely on one (its kernels build with `-mno-red-zone`). Using SysV's 128-byte red zone for hosted Linux and FreeBSD leaf functions is a later optimization.
 - **Layout (growing down):** return address → saved FP → callee-saved register area → spill slots → locals and allocas → outgoing argument area. On AArch64, `STP`/`LDP` pairs save and restore registers. On RV64, the C extension's `c.sdsp`/`c.ldsp` are used when encodable.
 
 ### 4.7 Calling conventions
@@ -230,7 +230,7 @@ For each interval taken from `unhandled` in start order:
 - `X18` is a reserved platform register and MUST NOT be allocated.
 - `long double` is the same as `double`.
 
-`X18` is also reserved on Todhchai AArch64 (pending confirmation, §6). It is allocatable only on Linux and FreeBSD.
+Swift-Stack also reserves `X18` on VectraOS AArch64 (§6, open question 2). It is allocatable only on Linux and FreeBSD.
 
 #### 4.7.3 C ABI: RISC-V LP64D
 
@@ -307,7 +307,7 @@ Branches to symbols outside the function always use the long form plus a relocat
 
 | Target | Canonical unwind info | Also emitted |
 |---|---|---|
-| Todhchai (all architectures) | **CUD** records, sorted by the linker into `.ss_unwind` ([06](06-linker.md) §5.6), with a copy in SDI (`.ss_debug`, [07](07-debugging-and-sdi.md)) | `.eh_frame` only for functions CUD cannot describe (e.g. hand-written assembly with non-standard frames) |
+| VectraOS (all architectures) | **CUD** records, sorted by the linker into `.ss_unwind` ([06](06-linker.md) §5.6), with a copy in SDI (`.ss_debug`, [07](07-debugging-and-sdi.md)) | `.eh_frame` only for functions CUD cannot describe (e.g. hand-written assembly with non-standard frames) |
 | Linux, FreeBSD | **`.eh_frame`** (system unwinders, gdb, perf need it), plus `.eh_frame_hdr` built by the linker | CUD in SDI for Swift-Stack tools |
 | macOS | **Apple compact unwind** (`__LD,__compact_unwind` input → linker-built `__TEXT,__unwind_info`) with `__eh_frame` fallback | CUD in SDI |
 
@@ -320,7 +320,7 @@ Branches to symbols outside the function always use the long form plus a relocat
 - The backend picks final encodings itself, including compressed forms, and does **not** emit `R_RISCV_RELAX` or `R_RISCV_ALIGN`.
 - `call` sequences are emitted as `AUIPC`+`JALR` with `R_RISCV_CALL_PLT`. Alignment padding is exact, so no linker-side deletion is needed.
 - The cost is a few bytes per far call compared with a relaxing toolchain. The benefit is that layout is final at emission time, which keeps the linker simple and deterministic.
-- Foreign RISC-V objects (from GCC or Clang) may contain `R_RISCV_ALIGN`. The linker MUST at least handle that relocation correctly ([06](06-linker.md)).
+- Foreign RISC-V objects (from GCC or Clang), and Swift-Stack's own objects from hand-written assembly assembled with relaxation on (clang's default, and VectraOS's build), contain `R_RISCV_ALIGN` and `R_RISCV_RELAX`. The linker MUST at least handle `R_RISCV_ALIGN` correctly and may ignore `R_RISCV_RELAX` ([06](06-linker.md)).
 
 ## 5. Alternatives considered
 
@@ -328,12 +328,12 @@ Branches to symbols outside the function always use the long form plus a relocat
 - **SelectionDAG or GlobalISel-style selection:** more global matching, at much higher cost and complexity. Greedy tiling with the single-use rule covers the high-value patterns: addressing modes, compare-and-branch, and immediates.
 - **Array-of-structs LIR:** not rejected. A naive field order wastes 6 bytes per instruction on padding (stride 24), but an alignment-ordered 32-byte row matches the whole-row access of the encoder and register allocator. It is the leading alternative in [18](18-data-catalog.md) §6.
 - **Emitting assembly text and running the assembler on it:** avoided. The shared `Encode` tables give the same consistency guarantee without a text round trip.
-- **RISC-V linker relaxation in v1:** gives smaller code, but layout would depend on the linker, and the linker would need a delete-bytes relaxation engine. Deferred.
+- **RISC-V linker relaxation in v1:** gives smaller code, but layout would depend on the linker, and the linker would need a delete-bytes relaxation engine. Deferred for code Swift-Stack generates. The assembler does emit LLVM MC's relaxation relocations (`R_RISCV_RELAX`, `R_RISCV_ALIGN`) when relaxation is on, as it is by default in clang and in VectraOS's build ([05](05-assembler.md) §4.8), so the linker must accept them ([06](06-linker.md) open question 4).
 
 ## 6. Open questions
 
 1. **RV64 Swift CC registers:** which registers serve `swiftself`, `swifterror` and `swiftasync` on RV64? Candidates are callee-saved `s` registers. To be confirmed against current upstream LLVM conventions and then fixed in [11](11-generics-and-runtime-metadata.md).
-2. **Todhchai AArch64 `X18`:** is `X18` reserved by croi or Todhchai (for example for a shadow call stack)? The default assumption is reserved.
+2. **VectraOS AArch64 `X18`:** VectraOS does not reserve it today. It builds for `aarch64-unknown-none-elf`, where clang allocates `X18`, uses no shadow call stack, and saves `X18` like any other register on exception entry. Reserving it in Swift-Stack's code stays compatible; should Swift-Stack allocate it on VectraOS, or keep it free for a future shadow call stack?
 3. **`_BitInt(N)` ABI:** follow each psABI's `_BitInt` rules (x86-64 has them; AArch64 and RISC-V rules are newer). Confirm per target before implementing N > 64 parameter passing.
 4. **Immediate side table:** should `imm` move to a sparse side column? This depends on the measured fraction of LIR instructions that carry immediates.
 5. **Switch density threshold and minimum case count:** to be tuned on the [14](14-measurement-methodology.md) corpus.

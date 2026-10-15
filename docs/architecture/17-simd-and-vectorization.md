@@ -17,16 +17,19 @@ Writing vector code by hand for x86-64, AArch64 and RV64 separately is tedious a
 
 Writing code once as Layer A gives experts multi-architecture SIMD without per-architecture code. Layer C is a convenience on top of that, not a requirement of the spec.
 
-## 2. First-party evidence (Todhchai)
+## 2. First-party evidence (VectraOS)
 
-Todhchai already writes its hot codec kernels with Swift's portable SIMD types: inflate, Adler-32, JPEG IDCT and output, color conversion, and PNG row filters. The common types are `SIMD8<UInt8>`, `SIMD16<UInt8>`, `SIMD8<Int16>` and `SIMD8<Int32>`, using reductions such as `wrappedSum()` and unaligned loads.
+VectraOS has no SIMD code today. None of its Swift uses a `SIMDn` type, its kernels are built without FP or vector registers (`-mgeneral-regs-only`; `-mno-sse -mno-mmx` for kernel Swift on x86-64), and its C uses no intrinsics headers or vector extensions. Two portable-SIMD users are on its roadmap:
 
-Those kernels are guarded by `#if arch(x86_64) || arch(arm64)` or `#if !arch(riscv64)`. Today's RV64 target for `swiftc` is `rv64gc`, which has no vector unit, so the portable code would be scalarized there, and the authors keep a separate scalar path instead. Two consequences follow:
+- **Codecs**, lifted with its UI, text and graphics libraries in roadmap V6. Their hot kernels are written with Swift's portable SIMD types: inflate, Adler-32, JPEG IDCT and output, color conversion, and PNG row filters. The common types are `SIMD8<UInt8>`, `SIMD16<UInt8>`, `SIMD8<Int16>` and `SIMD8<Int32>`, using reductions such as `wrappedSum()` and unaligned loads. (This was surveyed in the source VectraOS lifts them from, and is re-checked when it does.)
+- **The CPU backend of its TOSA executor** (roadmap V8), the reference every accelerator backend is checked against. VectraOS's architecture names it the "NEON/SSE TOSA executor".
+
+The codec kernels are guarded by `#if arch(x86_64) || arch(arm64)` or `#if !arch(riscv64)`. The RV64 target `swiftc` offers is `rv64gc`, which has no vector unit, so the portable code would be scalarized there, and the authors keep a separate scalar path instead. VectraOS's own RV64 user code is `rv64gc` too, with V optional and detected at run time. Two consequences follow:
 
 1. Layer A must produce good code on x86-64 and AArch64. An earlier draft of [04](04-backend.md) excluded SIMD instruction selection, which would have scalarized these kernels everywhere.
 2. On RV64, the baseline is the **RVA23** profile, which includes RVV 1.0 (§5.4). Layer A therefore always has a vector unit on RV64, and the architecture guards can be removed.
 
-Todhchai uses no C intrinsics headers and no hand-written vector assembly today.
+VectraOS uses no C intrinsics headers and no hand-written vector assembly today. Its assembly saves and restores vector state (`xsave`, SVE and SME registers, RVV) for user threads, but computes nothing with it.
 
 ## 3. Goals
 
@@ -43,7 +46,7 @@ Todhchai uses no C intrinsics headers and no hand-written vector assembly today.
 
 ## 4. Non-goals
 
-- **C intrinsics headers** (`<immintrin.h>`, `<arm_neon.h>`, `<riscv_vector.h>`) in v1. They contain thousands of target builtins. Todhchai doesn't use them. Hand-written assembly remains available ([05](05-assembler.md)).
+- **C intrinsics headers** (`<immintrin.h>`, `<arm_neon.h>`, `<riscv_vector.h>`) in v1. They contain thousands of target builtins. VectraOS doesn't use them. Hand-written assembly remains available ([05](05-assembler.md)).
 - **SVE/SVE2 and AVX-512** code generation in v1.
 - **x86-64 CPUs older than the 2013 Mac Pro-class floor** (§5.4), and RV64 below RVA23 as a release target.
 - **Auto-vectorization as a v1 exit criterion** (D9).
@@ -108,7 +111,7 @@ These baselines are deliberate floors. Code generated without extra flags MAY us
   - **Floating-point** vectors are legal up to **256 bits** (`SIMD8<Float>`, `SIMD4<Double>` in one YMM register).
   - **Integer** vectors are legal up to **128 bits**, because AVX1 has no 256-bit integer operations. `SIMD16<UInt16>` and `SIMD8<Int32>` are split into two XMM operations.
   - No FMA, so `a*b+c` stays two rounded operations. This also keeps differential testing simple ([14](14-measurement-methodology.md) §7).
-- **Scalar uses:** F16C gives hardware `Float16` ↔ `Float` conversion. RDRAND is available to the runtime's entropy source. FSGSBASE is used by codegen only where the OS enables it (Todhchai TLS, [08](08-runtime-and-stdlib.md)), never on hosts by default.
+- **Scalar uses:** F16C gives hardware `Float16` ↔ `Float` conversion. RDRAND is available to the runtime's entropy source. FSGSBASE is used by codegen only where the OS enables it, never on hosts by default. VectraOS does not enable it: its kernel keeps `CR4.FSGSBASE` off and sets `%fs` itself ([08](08-runtime-and-stdlib.md) §7).
 - **Opt-in:** `-target-feature +avx2` (with FMA and BMI as separate features), which adds 256-bit integer vectors.
 
 **AArch64:** `armv8-a` with Advanced SIMD (NEON), which is mandatory. Later features (e.g. `+dotprod`, `+i8mm`, SVE) are opt-in. SVE is a non-goal for v1.
@@ -144,7 +147,7 @@ Layer B runs at `-O` after LICM ([03](03-intermediate-representation.md) §4.4).
 
 The runtime's `memset`/`memcpy`/`memmove` ([08](08-runtime-and-stdlib.md)) are hand-vectorized per architecture once, by the runtime authors. Every user loop the pass recognizes benefits from that work.
 
-**Self-recursion guard.** Todhchai implements its libc in Swift (`@c(memcpy)` and friends). The pass MUST NOT rewrite a loop into a call to the function it is inside, matched by C symbol name (`memset`, `memcpy`, `memmove`, `memcmp`, `bcmp`, and their `__*_chk` variants). `-disable-loop-idioms` turns the pass off for a whole module; Todhchai's libc build currently passes `-Xllvm -disable-loop-idiom-all` to `swiftc` for this reason, and that flag is mapped to it ([15](15-driver-and-diagnostics.md)).
+**Self-recursion guard.** A libc implemented in Swift (`@c(memcpy)` and friends), such as the one VectraOS's userland brings in its roadmap V2, is compiled by this pass too. The pass MUST NOT rewrite a loop into a call to the function it is inside, matched by C symbol name (`memset`, `memcpy`, `memmove`, `memcmp`, `bcmp`, and their `__*_chk` variants). `-disable-loop-idioms` turns the pass off for a whole module; such a libc, built with `swiftc`, passes `-Xllvm -disable-loop-idiom-all` for this reason, and that flag is mapped to it ([15](15-driver-and-diagnostics.md)). VectraOS's `memset`/`memcpy`/`memmove` are C23 today (`lib/rt/string.c`).
 
 ### 5.6 Layer C: auto-vectorization (optional track)
 
@@ -168,7 +171,7 @@ Layer C is a loop vectorizer over AIR, enabled with `-vectorize`. It will become
   - otherwise, **runtime overlap checks** on the loop's address ranges, with the original scalar loop as fallback.
 - **Swift bounds checks** must have been hoisted or eliminated first ([03](03-intermediate-representation.md) bounds-check elimination). A loop that still contains per-iteration bounds checks is not vectorized.
 - **Swift overflow checks.** Checked arithmetic (`+`, `*`) traps on overflow, and the trap is observable relative to the loop's stores. Layer C vectorizes:
-  - wrapping arithmetic (`&+`, `&*`), as Todhchai's kernels already use;
+  - wrapping arithmetic (`&+`, `&*`), as the codec kernels VectraOS lifts already use;
   - checked arithmetic when range analysis proves no overflow;
   - checked **reductions** with no stores in the loop, using vector overflow detection. On overflow, the loop re-executes in scalar mode from the start of the vector iteration, so the trap occurs at the same iteration with the same state.
 
@@ -191,7 +194,7 @@ The host-header profile (D7, [02](02-semantic-analysis.md)) includes GCC `__attr
   - output equivalence on Csmith/YARPGen loops with vectorization on and off;
   - a corpus of loops that must vectorize, with expected remarks;
   - a corpus that must not vectorize (aliasing, overflow traps).
-- **Todhchai codecs** with the architecture guards removed: same output on all three architectures, and performance per B9.
+- **VectraOS's codecs** (once lifted, roadmap V6) with the architecture guards removed: same output on all three architectures, and performance per B9.
 
 ## 7. Alternatives considered
 
@@ -199,14 +202,15 @@ The host-header profile (D7, [02](02-semantic-analysis.md)) includes GCC `__attr
 |---|---|
 | Require auto-vectorization in v1 (as LLVM does by default) | It is the most complex pass in a conventional optimizer, and its benefit is unreliable without strong alias analysis. Portable SIMD gives experts predictable results now (D9). |
 | Expose target intrinsics (`<immintrin.h>`, `<arm_neon.h>`) as the SIMD story | Per-architecture code is exactly the tedium this chapter removes, and the headers are thousands of builtins. They stay a non-goal. |
-| Target `x86-64-v3` (Haswell) as the x86 floor | Excludes the 2013 Mac Pro-class machines Todhchai intends to support. AVX2 remains opt-in. |
+| Target `x86-64-v3` (Haswell) as the x86 floor | Excludes the 2013 Mac Pro-class machines the x86 floor was chosen to support. AVX2 remains opt-in. |
 | Make `rv64gc` the RV64 floor | Leaves RV64 without vectors and keeps the `#if !arch(riscv64)` guards. RVA23 will be the shipping floor. |
 | Vector-length-agnostic `SIMDn` lowering on RVV | Unnecessary: `SIMDn` types have fixed widths, and RVA23 guarantees `VLEN ≥ 128`. Strip-mining is used only by the loop vectorizer. |
 
 ## 8. Open questions
 
-1. ~~Todhchai RV64 baseline?~~ Resolved: RVA23 (§5.4). Todhchai's `#if !arch(riscv64)` codec guards can be removed once Swift-Stack, or `swiftc` with an RVA23 target, builds them.
-2. **Function multiversioning** (AVX and AVX2 paths in one binary, chosen at load time): worth it in v1, or is a per-target build enough for Todhchai?
+1. ~~RV64 baseline?~~ Resolved: RVA23 (§5.4). The codec kernels' `#if !arch(riscv64)` guards can be removed once Swift-Stack, or `swiftc` with an RVA23 target, builds them.
+2. **Function multiversioning** (AVX and AVX2 paths in one binary, chosen at load time): worth it in v1, or is a per-target build enough for VectraOS? Its RV64 user code detects V at run time, which favors multiversioning there (question 6).
 3. **`#if targetFeature(...)`:** should Swift-Stack offer it as an extension, given D5?
 4. Should Layer C eventually be the default at `-O`? This is decided by B13 and B9 measurements, not in advance.
-5. Is a subset of `<arm_neon.h>`/`<immintrin.h>` worth providing for porting existing C code bases, even though Todhchai doesn't need it?
+5. Is a subset of `<arm_neon.h>`/`<immintrin.h>` worth providing for porting existing C code bases, even though VectraOS doesn't need it?
+6. **VectraOS builds below the floors.** Its x86-64 user code targets baseline x86-64 (SSE2) and its RV64 user code `rv64gc` with V detected at run time; the D9 floors were chosen before VectraOS became the primary target. Should the floors follow VectraOS's hardware (its desktop PCs and the SC8280XP, an Armv8.2-A part, which the AArch64 floor already covers), or should VectraOS adopt them for its SIMD code?

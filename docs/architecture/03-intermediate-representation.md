@@ -49,7 +49,7 @@ SemIR (doc 10)
 - Columnar storage: no per-instruction heap objects, no pointers in persistent data, linear scans for most passes.
 - Swift semantics (ownership, ARC, generics, async) represented explicitly until the passes that need them have run.
 - Deterministic output (D6): the result of optimization MUST NOT depend on thread count or scheduling.
-- An OS-agnostic IR: nothing in AIR names croi, kqueue, or epoll. Platform behaviour lives in the runtime ([08](08-runtime-and-stdlib.md)).
+- An OS-agnostic IR: nothing in AIR names VectraOS ports, kqueue, or epoll. Platform behaviour lives in the runtime ([08](08-runtime-and-stdlib.md)).
 
 ## 3. Non-goals
 
@@ -115,13 +115,13 @@ This form is what the mandatory ownership checks (§4.3) verify.
 
 **Access markers.** `air.begin_access [read|modify] [static|dynamic]` and `air.end_access` delimit formal accesses for exclusivity enforcement. Dynamic markers lower to runtime calls; the optimizer removes them where it can prove they are unneeded (§4.5).
 
-**Volatile memory.** `air.load` and `air.store` carry a `volatile` flag. It is set by C `volatile` accesses and by the `_Volatile` module's builtins (`VolatileMappedRegister`, used for Todhchai MMIO). Optimizations MUST NOT delete, duplicate, merge, widen, narrow or split a volatile access, and MUST NOT reorder two volatile accesses relative to each other. ADCE treats them as roots, and the vectorizer and loop-idiom pass skip loops that contain them.
+**Volatile memory.** `air.load` and `air.store` carry a `volatile` flag. It is set by C `volatile` accesses and by the `_Volatile` module's builtins (`VolatileMappedRegister`, used for VectraOS's MMIO drivers). Optimizations MUST NOT delete, duplicate, merge, widen, narrow or split a volatile access, and MUST NOT reorder two volatile accesses relative to each other. ADCE treats them as roots, and the vectorizer and loop-idiom pass skip loops that contain them.
 
 **Vectors.** Builtin vector types (`Vec<N × E>`) and their operations (lane-wise arithmetic, masks and `select`, shuffles, reductions, vector loads and stores) are ordinary AIR types and opcodes. They are produced by `SIMDn<T>` code, C vector extensions, and the optional loop vectorizer, and are legalized per target in the backend ([17](17-simd-and-vectorization.md) §5.1–5.2).
 
 **Generics.** `air.witness_method %wt, #Protocol.requirement` loads a requirement from a witness table. `air.metadata` produces a type-metadata reference. In unspecialized (Tier 1) code, values of unknown size are address-only and are handled through value-witness calls. The representation is defined in [11](11-generics-and-runtime-metadata.md).
 
-**Async.** `air.await` marks a suspension point in an `async` function. The coroutine split (§4.3) turns each async function into a sequence of partial functions whose state lives in a heap-allocated async frame. A suspension becomes a tail call into the executor runtime interface ([08 §5](08-runtime-and-stdlib.md)), for example the `swift_task_switch` or `swift_task_enqueue` families ([12 §6](12-standard-library-strategy.md); emitted symbols use the `_SS` scheme). AIR never refers to a specific OS event mechanism. How the executor sleeps (a croi port, kqueue, or epoll) is purely a runtime concern.
+**Async.** `air.await` marks a suspension point in an `async` function. The coroutine split (§4.3) turns each async function into a sequence of partial functions whose state lives in a heap-allocated async frame. A suspension becomes a tail call into the executor runtime interface ([08 §5](08-runtime-and-stdlib.md)), for example the `swift_task_switch` or `swift_task_enqueue` families ([12 §6](12-standard-library-strategy.md); emitted symbols use the `_SS` scheme). AIR never refers to a specific OS event mechanism. How the executor sleeps (a VectraOS port, kqueue, or epoll) is purely a runtime concern.
 
 **Semantics attributes.** The upstream stdlib annotates functions with `@_semantics("...")` (for example `array.check_subscript` and `array.get_count`) and `@_effects(...)` (D2, [12](12-standard-library-strategy.md)). Lowering records these annotations in a per-function attribute column. The ARC optimizer and the bounds-check eliminator match on them; they do not pattern-match on function names.
 
@@ -152,7 +152,7 @@ These steps run at every optimization level, including `-Onone`, because they pr
    - **What it rejects.** Heap allocation (`alloc_ref`, `alloc_box`, escaping closure contexts, growing collections), retain and release, metadata instantiation, existential boxing, lock and runtime calls not marked safe, and calls to functions whose bodies are unavailable and that carry no matching annotation.
    - `@_noLocks` rejects locks and blocking runtime calls but permits allocation that the runtime documents as lock-free. `@_noAllocation` implies `@_noLocks`.
    - **Diagnostics** name the offending instruction and the call path from the annotated root.
-   - Todhchai's `@AudioRenderer` macro ([16](16-macros.md)) attaches `@_noAllocation` to real-time `render` methods. The check is the point of that macro, so it is mandatory and never weakened to a warning. Which constructs `swiftc` accepts here must be matched (D5) and is differential-tested.
+   - The `@AudioRenderer` macro of VectraOS's SDK ([16](16-macros.md); lifted in VectraOS roadmap V6) attaches `@_noAllocation` to real-time `render` methods. The check is the point of that macro, so it is mandatory and never weakened to a warning. Which constructs `swiftc` accepts here must be matched (D5) and is differential-tested.
 10. **Mandatory inlining.** `@_transparent` functions are always inlined, at every optimization level, and the inlined generic bodies are specialized for the concrete types at the call site. Swift semantics require this, and so does performance: the stdlib's `SIMDn<T>` operations and integer operators reach `Builtin` operations only through `@_transparent` code. Without it, `-Onone` SIMD code would run through generic witness calls ([17](17-simd-and-vectorization.md) §5.1). This step's position relative to steps 1–5 MUST match `swiftc`, because inlining affects which diagnostics fire (D5); the exact order is to be verified.
 
 ### 4.4 Optimization pipeline and scheduling
@@ -206,7 +206,7 @@ The optimizer has three groups of passes, plus the optional loop vectorizer. The
 
 **`-Onone`** runs step 1 only, plus a trivial ADCE that preserves debug values.
 
-**`-Osize`** runs the `-O` schedule with these changes: inlining budgets cut to callees that shrink or keep the caller's size; no unrolling; loop idioms enabled (they shrink code); vectorization off. Todhchai's Embedded build uses `-Osize` for some targets.
+**`-Osize`** runs the `-O` schedule with these changes: inlining budgets cut to callees that shrink or keep the caller's size; no unrolling; loop idioms enabled (they shrink code); vectorization off. VectraOS's Embedded build uses `-Osize` for every target.
 
 **Related flags:**
 - `-no-allocations` applies the performance-annotation checker (§4.3 step 9) to every function in the module, as if each were `@_noAllocation`.

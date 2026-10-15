@@ -7,7 +7,7 @@
 
 ## 1. Summary
 
-Systems code needs hand-written assembly: process entry stubs (`system/sys/floor/start.S`), trap and interrupt entry, context switching, control-register setup, and hand-tuned memory and crypto kernels. Swift-Stack includes built-in assemblers for x86-64, AArch64 and RV64, so building Todhchai needs no external `as`.
+Systems code needs hand-written assembly: firmware and kernel entry (VectraOS's `boot/arch/<arch>/enter.S`, `kernel/arch/<arch>/start.S`), trap and interrupt entry, SMP start-up trampolines, context switching, user-copy routines with fault recovery, control-register setup, and hand-tuned memory and crypto kernels. Swift-Stack includes built-in assemblers for x86-64, AArch64 and RV64, so building VectraOS needs no external `as`.
 
 The assembler:
 
@@ -19,7 +19,7 @@ The assembler:
 
 ## 2. Goals
 
-- Assemble Todhchai's existing assembly sources without modifying them. This needs GNU `as` dialect compatibility for the directives and syntax those files actually use.
+- Assemble VectraOS's existing assembly sources (26 `.S` files, about 5,300 lines across the three architectures) without modifying them, with the flags its build passes. This needs GNU `as` dialect compatibility for the directives and syntax those files actually use, with LLVM MC's semantics (§4.11).
 - Have exactly one encoding source of truth (`Encode`), shared with codegen and the disassembler.
 - Produce deterministic output (D6): the same input and flags give identical bytes.
 - Produce `.eh_frame` from CFI directives, and produce or verify CUD records ([07](07-debugging-and-sdi.md)) from the same information.
@@ -30,8 +30,8 @@ The assembler:
 - Intel syntax for x86 (planned after AT&T; see §4.6).
 - EVEX encodings (AVX-512) and SVE, until there is a concrete user. VEX (AVX, in the x86-64 baseline; AVX2, opt-in) and all RVA23 extensions (including RVV 1.0, Zba/Zbb/Zbs, Zicond, Zfa, Zcb) are supported, because the backend uses them and they come from the shared `Encode` tables ([04](04-backend.md) §4.9, [17](17-simd-and-vectorization.md)). That keeps hand-written kernels possible on every architecture.
 - MASM, NASM, or armasm dialects.
-- RISC-V linker relaxation (`R_RISCV_RELAX`/`R_RISCV_ALIGN` emission). The v1 policy is in [04 §4.12](04-backend.md).
-- Target-specific features of GNU `as` that Todhchai sources do not use. Each directive is added when a corpus file needs it.
+- Relaxing RISC-V code in Swift-Stack's own backend. The v1 policy is in [04 §4.12](04-backend.md); the assembler still emits LLVM MC's relaxation relocations for hand-written assembly (§4.8).
+- Target-specific features of GNU `as` that VectraOS's sources do not use. Each directive is added when a corpus file needs it.
 
 ## 4. Design
 
@@ -112,7 +112,7 @@ extension AssemblerArch {
 
 ### 4.4 Common language (all targets)
 
-The assembler implements the subset of the GNU assembler language used by the Todhchai corpus, with LLVM MC's semantics wherever LLVM MC and GNU `as` differ (§4.11). The list grows only when a corpus file needs a new directive.
+The assembler implements the subset of the GNU assembler language used by the VectraOS corpus, with LLVM MC's semantics wherever LLVM MC and GNU `as` differ (§4.11). The list grows only when a corpus file needs a new directive. VectraOS's 26 files use `.globl`, `.type`, `.size`, `.section`, `.pushsection`/`.popsection`, `.balign`, `.skip`, `.zero`, `.quad`/`.long`/`.word`/`.4byte`, `.ascii`, `.set`, `.hidden`, `.macro`, `.irp`, `.rept`, `.if`, `.incbin`, `.option`, `.insn`, `.inst`, `.ltorg`, `.arch_extension` and `.code16`/`.code32`/`.code64`; they use no CFI directives.
 
 | Category | Directives / features |
 |---|---|
@@ -171,7 +171,7 @@ Branches to symbols that are undefined, external, or in another section are enco
 
 ### 4.6 x86-64
 
-- **Syntax:** AT&T syntax (`movq %rax, (%rdi)`) is implemented first. *Assumption to verify before M1:* Todhchai's existing x86-64 `.S` files use GNU AT&T syntax. Intel syntax (`.intel_syntax noprefix`) is a later item, added when a corpus file needs it.
+- **Syntax:** AT&T syntax (`movq %rax, (%rdi)`) is implemented first. VectraOS's x86-64 `.S` files all use GNU AT&T syntax. Intel syntax (`.intel_syntax noprefix`) is a later item, added when a corpus file needs it.
 - **Operands:** registers (`%rax`… `%r15`, sub-registers, `%xmm0`–`%xmm15`, `%ymm0`–`%ymm15`, segment and control registers), immediates (`$expr`), memory operands `disp(base, index, scale)` including RIP-relative `sym(%rip)`, and operand-size suffixes (`b/w/l/q`), inferred from registers when omitted.
 - **Encoding:** through `Encode` tables (legacy prefixes, REX, two- and three-byte VEX, ModR/M, SIB, maps `0F`/`0F38`/`0F3A`). Both legacy SSE and VEX (`v`-prefixed) mnemonics are accepted; AVX is in the baseline and AVX2 is accepted when enabled ([17](17-simd-and-vectorization.md) §5.4). The displacement size (none, 8-bit, or 32-bit) is chosen at encode time when the value is known; symbolic displacements are always 32-bit with a relocation.
 - **Relaxable:** `JMP` and `Jcc` (rel8 → rel32).
@@ -214,10 +214,13 @@ Branches to symbols that are undefined, external, or in another section are enco
   - `lla`; `call sym` / `tail sym` (`auipc` + `jalr`, `R_RISCV_CALL_PLT`); `ret`; `nop` (`c.nop` when C is enabled); `mv`, `not`, `neg`, `seqz`, `snez`, `beqz`, `bnez`, `bgt`, `ble`, `j`, `jr`, `csrr`, `csrw`, `csrs`, `csrc`, `fence`, `fmv`.
 - **Extensions:** every RVA23 mandatory extension, including RVV 1.0 (`vsetvli`/`vsetivli`, vector loads, stores and arithmetic with `vtype` operands), Zba/Zbb/Zbs, Zicond, Zfa and Zcb ([17](17-simd-and-vectorization.md) §5.4).
 - **Compressed instructions:** when `.option rvc` is in effect (the default; C and Zcb are part of RVA23), each instruction is emitted in its 16-bit C form if registers and immediates fit (`c.li`, `c.mv`, `c.add`, `c.addi`, `c.addi16sp`, `c.addi4spn`, `c.ld`, `c.sd`, `c.ldsp`, `c.sdsp`, `c.j`, `c.beqz`, `c.bnez`, `c.jr`, `c.jalr`). `.option norvc` disables this. `.option push`/`.option pop` are supported.
-- **Relaxation (v1):** `.option relax` is accepted, but the assembler behaves as `norelax` per [04 §4.12](04-backend.md):
-  - it never emits `R_RISCV_RELAX` or `R_RISCV_ALIGN`;
-  - alignment padding is exact;
-  - `%pcrel_lo` refers to the label of its paired `auipc`, as in GNU `as`.
+- **Target options.** The driver sets the initial state from the target, as clang does: `-march` gives the C extension (compression) and Zbs (`li` of a single high bit uses `bseti` only with Zbs, as LLVM's `RISCVMatInt` does), `-fPIC`/`-fPIE` makes `la` load through the GOT, and linker relaxation is on unless `-mno-relax` is given. VectraOS's rv64 kernel is assembled for `rv64imac_zicsr_zifencei` PIE with relaxation on, its user code for `rv64gc`. `.option rvc`/`norvc`, `relax`/`norelax`, `pic`/`nopic` and `push`/`pop` change the state in the source.
+- **Linker relaxation (`.option relax`)**, matching LLVM MC byte for byte:
+  - `call`/`tail`, `%hi`/`%lo`, `%pcrel_hi`/`%pcrel_lo` (`lla`, and the `%pcrel_lo` of a GOT `la`) and `%tprel_*` relocations are each followed by an `R_RISCV_RELAX` at the same offset. `%got_pcrel_hi` and branches are not relaxable. A `%pcrel_hi` stays a relocation even for a same-section label.
+  - Alignment in an executable section without a fill value emits the worst-case padding, `align − 2` bytes with C (`align − 4` without), as `c.nop` and `nop`s, and an `R_RISCV_ALIGN` whose addend is that size, whatever the current offset. Data sections are padded with zeros as usual.
+  - A branch, or a label difference in data, whose two ends span a relaxable instruction or a relaxed alignment stays a relocation (`R_RISCV_BRANCH`, `R_RISCV_JAL`, `R_RISCV_RVC_BRANCH`, `R_RISCV_RVC_JUMP`; `R_RISCV_ADD*`/`R_RISCV_SUB*` pairs), keeping the form chosen by distance. One that spans neither is folded, as LLVM MC folds it.
+  - Not implemented yet: `.eh_frame` advance relocations (`R_RISCV_SET6`/`SUB6`, …) for CFI that spans relaxable code, and `.uleb128` label differences (`R_RISCV_SET_ULEB128`/`R_RISCV_SUB_ULEB128`). VectraOS's assembly needs neither.
+- **Without relaxation** (`-mno-relax`, `.option norelax`), alignment padding is exact, same-section `%pcrel_hi` targets are resolved, and `%pcrel_lo` refers to the label of its paired `auipc`, as in GNU `as`.
 - **Relaxable branches (assembler-local):** `c.beqz`/`c.bnez` → `beq`/`bne` → inverted branch over `jal`; `c.j` → `jal`.
 - **Relocations (ELF only; there is no RISC-V Mach-O):** `R_RISCV_PCREL_HI20`, `R_RISCV_PCREL_LO12_I/S`, `R_RISCV_HI20`, `R_RISCV_LO12_I/S`, `R_RISCV_CALL_PLT`, `R_RISCV_JAL`, `R_RISCV_BRANCH`, `R_RISCV_RVC_JUMP`, `R_RISCV_RVC_BRANCH`, `R_RISCV_GOT_HI20`, `R_RISCV_64`, `R_RISCV_32`, and TLS LE (`R_RISCV_TPREL_HI20`/`LO12_I`/`LO12_S`/`ADD`).
 
@@ -225,10 +228,10 @@ Branches to symbols that are undefined, external, or in another section are enco
 
 CFI directives in hand-written assembly serve two purposes, reconciling the unwind policy in [04 §4.11](04-backend.md) and [07](07-debugging-and-sdi.md):
 
-1. **`.eh_frame` generation.** Each `.cfi_startproc`…`.cfi_endproc` region produces one FDE. Each CFA instruction follows a `DW_CFA_advance_loc`, `advance_loc1`, `advance_loc2` or `advance_loc4` from the previous one's address, chosen after layout so relaxed branches are accounted for. The layout is LLVM MC's: FDEs are stable-sorted by CIE key (`.cfi_signal_frame`, then `.cfi_startproc simple`, then the return column, where an explicit `.cfi_return_column` sorts before the default and gets its own CIE even when it names the default register), and each CIE is emitted once, just before its group. Records are padded with `DW_CFA_nop` to 4 bytes, the last FDE to 8. The bytes and `pc_begin` relocations match LLVM MC on all three targets. A CFI directive outside a `.cfi_startproc`…`.cfi_endproc` region, or a `.cfi_startproc` inside one, is an error. This is the canonical unwind info on Linux and FreeBSD, and the fallback on Todhchai and macOS.
-2. **CUD synthesis.** The assembler interprets each region's CFI program symbolically. If the final state at every instruction past the prologue matches a CUD-describable layout (frame pointer established, fixed frame size, callee-saved registers at fixed offsets), it emits a CUD record and, on Todhchai, drops the FDE. Otherwise the function is marked *CUD-inexpressible* and keeps its FDE. A note-level diagnostic lists such functions.
+1. **`.eh_frame` generation.** Each `.cfi_startproc`…`.cfi_endproc` region produces one FDE. Each CFA instruction follows a `DW_CFA_advance_loc`, `advance_loc1`, `advance_loc2` or `advance_loc4` from the previous one's address, chosen after layout so relaxed branches are accounted for. The layout is LLVM MC's: FDEs are stable-sorted by CIE key (`.cfi_signal_frame`, then `.cfi_startproc simple`, then the return column, where an explicit `.cfi_return_column` sorts before the default and gets its own CIE even when it names the default register), and each CIE is emitted once, just before its group. Records are padded with `DW_CFA_nop` to 4 bytes, the last FDE to 8. The bytes and `pc_begin` relocations match LLVM MC on all three targets. A CFI directive outside a `.cfi_startproc`…`.cfi_endproc` region, or a `.cfi_startproc` inside one, is an error. This is the canonical unwind info on Linux and FreeBSD, and the fallback on VectraOS and macOS.
+2. **CUD synthesis.** The assembler interprets each region's CFI program symbolically. If the final state at every instruction past the prologue matches a CUD-describable layout (frame pointer established, fixed frame size, callee-saved registers at fixed offsets), it emits a CUD record and, on VectraOS, drops the FDE. Otherwise the function is marked *CUD-inexpressible* and keeps its FDE. A note-level diagnostic lists such functions.
 
-Functions with no CFI region (common in entry stubs and context switches) get no unwind info. Unwinders stop at them.
+Functions with no CFI region (common in entry stubs and context switches; VectraOS's assembly has none at all) get no unwind info. Unwinders stop at them.
 
 - `_start` and similar entry points SHOULD mark the end of the stack explicitly with `.cfi_undefined` on the return-address register, following existing practice in glibc and FreeBSD. CUD records this as a terminal frame.
 - Context-switch routines that change stacks SHOULD carry `.cfi_signal_frame`, or no CFI at all, so unwinders do not walk across stacks.
@@ -245,7 +248,7 @@ Functions with no CFI region (common in entry stubs and context switches) get no
 
 - **Reference assembler: LLVM MC.** Swift-Stack replaces LLVM in the stack, so LLVM MC (`llvm-mc`, and the integrated assembler of `clang -c`) is the reference. Wherever GNU `as` and LLVM MC disagree, Swift-Stack matches LLVM MC exactly; the GNU `as` behavior is documented below, not matched.
 - **Round trip:** every `Encode` table entry is assembled from text, disassembled, and compared with the original statement.
-- **Differential:** each corpus file is assembled with Swift-Stack, with `clang -c` for all three architectures, and with host GNU `as` for x86-64. The `clang -c` comparison is exact. The GNU `as` comparison exempts only the documented differences below, each for the affected section or file only. The section bytes, symbol tables and relocations are compared (after normalizing for documented differences such as RISC-V relaxation).
+- **Differential:** each corpus file is assembled with Swift-Stack, with `clang -c` for all three architectures, and with host GNU `as` for x86-64. The `clang -c` comparison is exact. The GNU `as` comparison exempts only the documented differences below, each for the affected section or file only. The section bytes, symbol tables and relocations are compared, RISC-V relaxation relocations included.
   - Both objects are parsed by an independent test-only ELF reader. Relocations against local symbols are normalized to `section + offset`, since GNU `as` and LLVM MC choose differently between a section symbol and a local label; temporary `.L*` labels and `$x`/`$d` mapping symbols are excluded.
   - Every allocatable section is compared: bytes, size, flags, alignment. So are all relocations (type, offset, target, addend) and all non-temporary symbols (binding, type, visibility, section, value, size).
 - **Documented differences from GNU `as` (x86-64 encoding).** Swift-Stack matches LLVM MC, and the `clang -c` comparison checks these sections exactly:
@@ -264,18 +267,18 @@ Functions with no CFI region (common in entry stubs and context switches) get no
 - **Exhaustive x86-64 sweep** (`M2X86ExhaustiveTests`): every descriptor in the x86 table is instantiated in every operand form its format allows. Each register slot is swept over its whole class, all low/extended combinations of the register slots are tried (REX.R/X/B, VEX.R/X/B/vvvv, 2- vs 3-byte VEX), memory operands cover every ModR/M and SIB special case (`%rsp`/`%rbp`/`%r12`/`%r13` bases, no base, RIP-relative, disp8/disp32 boundaries, every index and scale, segment overrides, 32-bit addressing), and immediates cover their boundary values. Every instance must round-trip encode → disassemble → re-encode to identical bytes. Its text and its disassembly must assemble to exactly those bytes with `llvm-mc` and with Swift-Stack's own assembler, and with GNU `as` too, apart from differences 4–7 above. A form the encoder rejects must be rejected by `llvm-mc` as well, and every descriptor must be selected at least once, so a new table entry cannot escape the sweep.
 - **Exhaustive AArch64 sweep** (`M2AArch64ExhaustiveTests`): every descriptor in the A64 table is instantiated in every width and vector arrangement it accepts, with each register slot swept over all 32 encodings (so register 31 is tried as both SP and ZR where each is legal), every addressing mode, extend and shift, all conditions, and immediates covering their boundaries plus every bitmask immediate, every bitfield `immr:imms` pair and every FP8 value. Every instance must round-trip encode → disassemble → re-encode to the same descriptor and word. Its disassembly must assemble to exactly that word with `llvm-mc` and with Swift-Stack's own assembler, and `llvm-mc --disassemble` must print exactly the same text, preferred aliases included. Forms LLVM rejects as unpredictable are not generated. Every descriptor must round-trip at least once.
 - **Encoder oracle:** every `Encode` table sample is also checked against `llvm-mc`. `llvm-mc` assembles the disassembler's text, and the bytes must match or decode to the same instruction. This catches encoder/disassembler pairs that agree on a wrong encoding, which a self round trip cannot.
-- **Corpus:** Todhchai `system/sys/floor/start.S`, context-switch and trap sources for all three architectures, plus synthetic tests for every directive in §4.4. Regressions live in `Tests/Differential/asm/<arch>/`.
+- **Corpus:** all 26 VectraOS `.S` files (`SWIFTSTACK_VECTRAOS_ROOT`), each assembled for its architecture with the preprocessor definitions, include paths and ISA flags of VectraOS's CMake build: `boot/arch/<arch>/enter.S` and `kernel/arch/<arch>/*.S` with the kernel flags, `kernel/userprogram.S` (with stand-ins for the binaries it `.incbin`s) and `user/vdso/header.S` assembled for each architecture, 30 objects in all. The comparison with `clang -c` is exact; the x86-64 files are also compared with GNU `as`, with the allowances above. Synthetic tests cover every directive in §4.4. Regressions live in `Tests/Differential/asm/<arch>/`, and `Tests/Differential/asm/riscv64-relax/` holds the RISC-V relaxation cases, assembled with VectraOS's kernel flags.
 
 ## 5. Alternatives considered
 
 - **Separate encoders for the assembler and codegen:** this was the original design implied by doc 04, which described encoders twice. Rejected: two encoders drift apart, and every bug has to be fixed twice.
 - **Driving the backend's LIR from the assembler (assembly → LIR → encoder):** LIR is SSA- and virtual-register-oriented and does not model directives or exact user-chosen encodings. The assembler instead talks to `Encode` directly.
 - **Single-pass "optimistic" relaxation:** incorrect, as shown in §4.5. Rejected in favor of the fixpoint.
-- **Requiring Intel syntax or a new assembly dialect:** would force rewriting existing Todhchai sources and break compatibility with GNU-syntax references.
+- **Requiring Intel syntax or a new assembly dialect:** would force rewriting VectraOS's sources and break compatibility with GNU-syntax references.
 
 ## 6. Open questions
 
-1. **Corpus syntax audit:** confirm that all Todhchai x86-64 `.S` files use AT&T syntax, and list exactly which directives the corpus uses, to fix the v1 directive set.
+1. ~~Corpus syntax audit?~~ Resolved: VectraOS's x86-64 files use AT&T syntax only, and §4.4 lists the directives its corpus uses.
 2. **Custom unwind directive:** should Swift-Stack add one (e.g. `.ss_unwind none|terminal`) for cases CFI expresses badly, or rely only on standard CFI?
 3. ~~Foreign RISC-V objects with `R_RISCV_ALIGN`?~~ Resolved in [06](06-linker.md) §5.5: the linker deletes excess padding NOPs only, and rejects the object with a diagnostic if that is not possible.
 4. **Mach-O assembler dialect differences** (Apple `as` uses `sym@PAGE`, different section directives such as `.section __TEXT,__text`, and `.subsections_via_symbols`): how much is needed for macOS host builds?

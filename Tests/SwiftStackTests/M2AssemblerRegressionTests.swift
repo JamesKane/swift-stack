@@ -489,6 +489,63 @@ struct M2AssemblerRegressionTests {
         #expect(pp.rendered.contains("\(src):8:5: error: invalid instruction 'bogus7'"))
     }
 
+    @Test("`A - B` with `B` in the current section is a PC-relative relocation against `A` (VectraOS vDSO header)")
+    func differenceAgainstCurrentSectionLabel() {
+        // VectraOS user/vdso/header.S: `.long <entry point> - vdso_header` for each vDSO entry, defined in
+        // vdso.c. LLVM MC folds `P - B` into the addend: `ext - hdr` at offset 4 is `ext - P + 4`.
+        let src = """
+            .section .vdso.header, "a"
+            .balign 16
+            hdr:
+                .long 0x53445643
+                .long ext - hdr
+                .quad ext2 - hdr + 4
+            """
+        for (arch, pc32, pc64) in [(AssemblerArch.x86_64, RelocKind.x86_64_pc32, RelocKind.x86_64_pc64),
+                                   (.aarch64, .aarch64_prel32, .aarch64_prel64)] {
+            var diags = DiagnosticBag()
+            let obj = Assembler.assemble(source: src, arch: arch, diagnostics: &diags)
+            #expect(diags.errorCount == 0, "\(arch)")
+            guard let sec = obj.findSection(name: ".vdso.header") else {
+                Issue.record("\(arch): no .vdso.header")
+                continue
+            }
+            let relocs = obj.relocs(for: sec).map { ($0.offset, obj.symbolName($0.symbol), $0.addend, $0.kind) }
+            #expect(relocs.count == 2, "\(arch)")
+            guard relocs.count == 2 else { continue }
+            #expect(relocs[0] == (4, "ext", 4, pc32), "\(arch)")
+            #expect(relocs[1] == (8, "ext2", 12, pc64), "\(arch)")
+        }
+    }
+
+    @Test("RISC-V `-march` without Zbs, and linker relaxation's R_RISCV_RELAX/R_RISCV_ALIGN (VectraOS rv64 kernel)")
+    func riscvKernelISAAndRelaxation() {
+        // VectraOS builds its rv64 kernel for rv64imac_zicsr_zifencei, PIE, with clang's default relaxation.
+        let src = """
+                li t0, (8 << 60)
+                call ext
+                .balign 8
+            1:  j 1b
+            """
+        var diags = DiagnosticBag()
+        let opts = RVAsmOptions(march: "rv64imac_zicsr_zifencei", pic: true, relax: true)
+        let obj = Assembler.assemble(source: src, arch: .riscv64, riscvOptions: opts, diagnostics: &diags)
+        #expect(diags.errorCount == 0)
+        guard let text = obj.findSection(name: ".text") else {
+            Issue.record("no .text")
+            return
+        }
+        // `c.li t0, -1; c.slli t0, 63` (no `bseti`), `call`, worst-case `c.nop; nop` padding, `c.j` to itself
+        #expect(obj.sectionData(text) == [0xfd, 0x52, 0xfe, 0x12, 0x97, 0x00, 0x00, 0x00, 0xe7, 0x80, 0x00, 0x00,
+                                          0x01, 0x00, 0x13, 0x00, 0x00, 0x00, 0x01, 0xa0])
+        let relocs = obj.relocs(for: text).map { ($0.offset, $0.symbol.isValid ? obj.symbolName($0.symbol) : "", $0.addend, $0.kind) }
+        #expect(relocs.count == 3)
+        guard relocs.count == 3 else { return }
+        #expect(relocs[0] == (4, "ext", 0, RelocKind.riscv_call_plt))
+        #expect(relocs[1] == (4, "", 0, RelocKind.riscv_relax))
+        #expect(relocs[2] == (12, "", 6, RelocKind.riscv_align))
+    }
+
     @Test("ELF reader rejects truncated and corrupted objects with an error, never a crash")
     func elfReaderFuzz() throws {
         var seeds: [[UInt8]] = []

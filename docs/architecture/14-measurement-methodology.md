@@ -16,7 +16,7 @@ This chapter defines:
 - how baselines for `swiftc`, Clang and lld are established;
 - how continuous integration (CI) gates on regressions.
 
-It follows the Todhchai principle "slower is a claim to measure, not assume". The same applies to "faster".
+It follows the rule VectraOS states as its principle 13, "every promise is a budget with a running check": "slower" is a claim to measure, not assume, and the same applies to "faster".
 
 ## 2. Goals
 
@@ -39,14 +39,14 @@ All values are **targets**. The "Baseline" column records the comparison toolcha
 | B2 | Parsing throughput (lex + parse), single core | ≥ 300 MB/s | ≈ 11.7 cycles/byte | `swiftc -parse`, Clang `-fsyntax-only` (C, headers pre-expanded): TBM | Unmeasured |
 | B3 | End-to-end debug build, single core | ≥ 100,000 lines/s | ≈ 35,000 cycles/line | `swiftc -Onone` + lld; `clang -O0` + lld: TBM | Unmeasured |
 | B4 | End-to-end optimized build, single core | ≥ 20,000 lines/s | ≈ 175,000 cycles/line | `swiftc -O`; `clang -O2`: TBM | Unmeasured |
-| B5 | Link time, Todhchai system-service image | < 50 ms | ≈ 175 M cycles per link | `ld.lld` with equivalent inputs: TBM | Unmeasured |
+| B5 | Link time, VectraOS system-service image | < 50 ms | ≈ 175 M cycles per link | `ld.lld` with equivalent inputs: TBM | Unmeasured |
 | B6 | SDI emission, 100K-line program | < 5 ms | ≈ 175 cycles/line | `ld.lld` DWARF 5 handling: TBM | Unmeasured |
 | B7 | Stack unwind, 100 frames, frame-pointer path | < 2 µs | ≈ 70 cycles/frame | libunwind with `.eh_frame`: TBM | Unmeasured |
 | B8 | Peak RSS, 100K-line build | < 256 MB | ≈ 2.6 KB/line | `swiftc` + LLVM: TBM | Unmeasured |
 | B9 | Runtime performance, optimized | 80–90% of `clang -O2` (C) / `swiftc -O` (Swift) (geomean per category, §7) | — | `swiftc -O`, `clang -O2` | Hypothesis |
 | B10 | Incremental rebuild after body-only edit, 100K-line module | < 200 ms | ≈ 700 M cycles per rebuild | `swiftc` incremental: TBM | Unmeasured |
 | B11 | Assembling a typical OS stub (`start.S`, context switch) | < 1 ms | ≈ 3.5 M cycles per file | GNU `as`, Clang integrated assembler: TBM | Unmeasured |
-| B12 | Macro expansion overhead: plugin start-up, per-expansion round-trip, and cache-hit cost, on the Todhchai `@IPCLibrary` corpus | Per-expansion host overhead (excluding plugin compute) < 0.5 ms; cache hit < 20 µs | ≈ 1.75 M cycles per expansion; ≈ 70,000 cycles per cache hit | `swiftc` with the same plugins: TBM | Unmeasured |
+| B12 | Macro expansion overhead: plugin start-up, per-expansion round-trip, and cache-hit cost, on VectraOS's `@IPCLibrary` uses once it carries them (its roadmap V2), synthetic uses until then | Per-expansion host overhead (excluding plugin compute) < 0.5 ms; cache hit < 20 µs | ≈ 1.75 M cycles per expansion; ≈ 70,000 cycles per cache hit | `swiftc` with the same plugins: TBM | Unmeasured |
 | B13 | Compile-time cost of `-vectorize` (optional loop vectorizer, [17](17-simd-and-vectorization.md)) | ≤ 5% added to optimized build time on `swift-real` and `c-real`; its benefit is reported per B9 category | — | LLVM loop vectorizer share of `clang -O2` time: TBM | Unmeasured |
 | B14 | Clean build of Swift-Stack itself (D10), ~100K lines, reference machine, current host `swiftc` | ≤ 20 s debug; ≤ 60 s release (WMO) | ≈ 700,000 cycles/line (debug) | Tracked over time; no external baseline | Unmeasured |
 
@@ -89,7 +89,7 @@ Both are reported.
 | `swift-synth` | Generated Swift with controlled mix: declarations, generic code, closures, operator-heavy expressions | B1–B4, B8, type-checker stress |
 | `swift-real` | Swift-Stack's own sources (once self-hosting-capable), selected open-source Swift packages pinned by commit | B1–B4, B8, B10 |
 | `c-real` | SQLite amalgamation, Lua, a pinned c-testsuite snapshot | B1–B4 (C), differential tests |
-| `todhchai` | Pinned snapshot of Todhchai OS sources, assembly stubs, and macro plugins | B5, B6, B9 (portable-SIMD codec kernels), B11, B12, end-to-end |
+| `vectraos` | Pinned snapshot of VectraOS sources: its 26 assembly files, 12 C files and headers, its Swift (Tier 0 today), and, once VectraOS carries them, its macro plugins (roadmap V2, V6) and `SIMDn` codec kernels (V6) | B5, B6, B9 (portable-SIMD codec kernels), B11, B12, end-to-end; differential tests ([05](05-assembler.md) §4.11, M1) |
 | `runtime-swift` | A subset of the upstream Swift benchmark suite (input per D2) plus project micro-benchmarks | B9 |
 | `runtime-c` | CoreMark, selected Embench programs, SQLite speed test | B9 |
 
@@ -102,7 +102,7 @@ Corpora are pinned by content hash. Changing a corpus resets the regression hist
   - Swift collections / ARC-heavy
   - Swift generics-heavy
   - Swift string processing
-  - Swift portable SIMD (`SIMDn` kernels, e.g. Todhchai codecs; also run on RV64 RVA23 under QEMU, and on `rv64gc` to measure the scalar fallback)
+  - Swift portable SIMD (`SIMDn` kernels, such as the codec kernels VectraOS lifts in its roadmap V6 (open question 4); also run on RV64 RVA23 under QEMU, and on `rv64gc`, VectraOS's RV64 user baseline, to measure the scalar fallback)
   - C integer
   - C floating-point / numeric (reported with and without `-vectorize`)
 - **Aggregation:** geometric mean of per-benchmark speed ratios within each category. There is no single overall number, because an overall mean hides category regressions (vectorizable C kernels are expected to be the outlier, see [00](00-overview-and-principles.md) Principle 4).
@@ -123,7 +123,7 @@ Corpora are pinned by content hash. Changing a corpus resets the regression hist
 - **Built-in profiler (primary attribution tool).** Every phase and hot routine is wrapped in a timed block that reads the cycle counter: `rdtsc` on x86-64, `cntvct_el0` on AArch64, `rdtime` on RV64 ([15](15-driver-and-diagnostics.md) §4.7).
   - Blocks are always compiled in and cost one predictable branch when off.
   - `--profile=<file>` writes per-lane timelines as Chrome trace JSON.
-  - It runs identically on Linux, FreeBSD, macOS and Todhchai. That makes it the one tool available everywhere, including on croi, where `perf` and Cachegrind don't exist.
+  - It runs identically on Linux, FreeBSD, macOS and VectraOS. That makes it the one tool available everywhere, including on VectraOS, where `perf` and Cachegrind don't exist (VectraOS has its own trace format and PMU sampling, which a later version may feed).
   - Counter frequencies are calibrated at startup and recorded in the output. `cntvct_el0` and `rdtime` tick at a fixed timer rate rather than the core clock, so their results are reported in nanoseconds and converted to cycles using the measured core clock.
 - **Repetition tester.** `Benchmarks/` contains a harness for kernels (the lexer inner loop, instruction encoding, relocation application, legalization tables). It runs a kernel repeatedly on fixed input until the best time stops improving, and reports:
   - best and mean cycles per byte or per item;
@@ -140,7 +140,7 @@ Wall-clock time on shared CI machines is too noisy to gate on small percentages.
 | Signal | Tool | Gate |
 |---|---|---|
 | Retired instructions per phase on fixed corpora | `perf stat -e instructions` (Linux) or Cachegrind | Fail if > 2% increase vs. the main-branch rolling median |
-| Cycles per phase, from the built-in profiler (used where hardware instruction counts are unavailable, e.g. Todhchai, some CI virtual machines) | `--profile`, median of 5 runs | Fail if > 5% increase (cycles are noisier than retired instructions, hence the wider threshold) |
+| Cycles per phase, from the built-in profiler (used where hardware instruction counts are unavailable, e.g. VectraOS, some CI virtual machines) | `--profile`, median of 5 runs | Fail if > 5% increase (cycles are noisier than retired instructions, hence the wider threshold) |
 | Self-build time (B14) | Nightly on reference machines | Alert on a sustained shift > 10% |
 | Peak RSS on fixed corpora | `ru_maxrss` | Fail if > 2% increase |
 | Output size (text, data, SDI) | Driver statistics | Fail if > 1% increase without an accompanying note |
@@ -153,10 +153,11 @@ Intentional regressions are allowed with a commit trailer (`Perf-Regression: <re
 
 - **Gate on wall time per commit.** Rejected: noise on shared hardware exceeds the 2% threshold.
 - **Single aggregate runtime score.** Rejected: hides the category-specific risks in Principle 4.
-- **Rely only on external profilers.** Rejected: they don't exist on Todhchai, differ between hosts, and see the compiler from outside. The built-in profiler sees phases and lanes as the compiler defines them, everywhere.
+- **Rely only on external profilers.** Rejected: they don't exist on VectraOS, differ between hosts, and see the compiler from outside. The built-in profiler sees phases and lanes as the compiler defines them, everywhere.
 
 ## 11. Open questions
 
 1. Which open-source Swift packages make up `swift-real` before self-hosting is possible?
-2. Do we need a Todhchai-native benchmark harness (running on croi), or are host measurements sufficient until M6?
+2. Do we need a VectraOS-native benchmark harness (running in QEMU or on its Q8B board, reporting through VectraOS's `budget name=… value=…` console lines so `vx bench` can judge it), or are host measurements sufficient until M6?
 3. Is B4 (optimized lines/s) the right second throughput target, or should it be expressed as "optimized build ≤ N× debug build"?
+4. Until VectraOS carries its `SIMDn` codec kernels (roadmap V6), which portable-SIMD kernels make up B9's SIMD category and the M5 exit check ([09](09-roadmap.md))?

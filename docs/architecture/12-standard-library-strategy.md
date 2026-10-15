@@ -110,7 +110,7 @@ The compiler must locate these stdlib declarations by name after loading the `Sw
 
 Swift-Stack MUST define the platform conditions the stdlib tests:
 
-- `os(...)` with a new value `Todhchai` (to be decided with upstream naming conventions in mind), `arch(...)`, `_endian(...)`, `_pointerBitWidth(...)`, `_runtime(_Native)`
+- `os(...)` with a new value for VectraOS (spelling to be decided with upstream naming conventions in mind; VectraOS itself builds for `*-none-*` triples today), `arch(...)`, `_endian(...)`, `_pointerBitWidth(...)`, `_runtime(_Native)`
 - `canImport(...)`
 - `hasFeature(...)` for each upstream feature flag the sources test
 - `$Feature` checks
@@ -158,14 +158,15 @@ Both tiers are built from the same pinned sources:
 | Distribution | Shipped as a module interface with `@inlinable` bodies only. Clients specialize what they use; there is no prebuilt binary beyond non-generic leaf functions. | A prebuilt static library plus module interface. |
 | Unavailable APIs | Upstream `@_unavailableInEmbedded` (or its successor) is honoured. Uses produce a diagnostic. | — |
 
-### 7.1 Stdlib modules and types Todhchai depends on
+### 7.1 Stdlib modules and types VectraOS depends on
 
 These are compiled from the same pinned sources. They are listed because each one pulls in compiler features ([02](02-semantic-analysis.md) §4.3.5):
 
 - **`Span`, `MutableSpan`, `RawSpan`, `MutableRawSpan`** need `~Escapable`, lifetime dependence, and the lifetime-checking pass ([03](03-intermediate-representation.md) §4.3).
 - **`InlineArray`** needs value generics. Its storage uses a fixed-size `Builtin` array type (expected `Builtin.FixedArray`, to be verified by the audit).
 - **`_Volatile`** (`VolatileMappedRegister`) is a separate upstream module, built when the `Volatile` feature is enabled. Its `Builtin` volatile load and store map to AIR volatile accesses ([03](03-intermediate-representation.md) §4.2).
-- **`SIMDn<T>`** needs `Builtin.Vec*` and mandatory inlining ([17](17-simd-and-vectorization.md) §5.1).
+- **`Synchronization`** (`Atomic<T>`) needs the atomic builtins with explicit orderings. VectraOS's kernel uses `Atomic` throughout; `Mutex` is not available on its targets.
+- **`SIMDn<T>`** needs `Builtin.Vec*` and mandatory inlining ([17](17-simd-and-vectorization.md) §5.1). VectraOS has no SIMD code yet (§5 of [17](17-simd-and-vectorization.md)).
 
 ## 8. FoundationEssentials and macros (D4)
 
@@ -186,13 +187,13 @@ Package dependencies such as swift-collections are compiled from pinned sources 
 ## 9. Testing
 
 - **Upstream stdlib tests.** Upstream's `test/stdlib` and `validation-test/stdlib` contain both executable tests (`StdlibUnittest`-based) and FileCheck-style compiler-output tests. Only the executable tests are used. They are compiled by Swift-Stack, run, and their pass/fail is compared against the same tests built with swiftc at the pinned tag. `StdlibUnittest` itself is compiled as an input under §4.
-- **FoundationEssentials and Todhchai tests.** These suites use swift-testing. Its library is compiled from pinned sources as an input. Its `TestingMacros` plugin is built as an executable plugin ([16](16-macros.md)). Runtime test discovery requires Tier 1 metadata or section support (open question 4).
+- **FoundationEssentials and VectraOS tests.** These suites use swift-testing (VectraOS's host tests do; its on-device tests are Embedded Swift suites run by the kernel). Its library is compiled from pinned sources as an input. Its `TestingMacros` plugin is built as an executable plugin ([16](16-macros.md)). Runtime test discovery requires Tier 1 metadata or section support (open question 4).
 - **Differential behaviour.** `String` normalization, grapheme breaking, `Hasher` (with a fixed seed), float printing, and sorting stability are checked against swiftc output on generated inputs.
 - **Audit gate.** CI fails if the pinned sources use a `Builtin`, attribute, `@_semantics` tag, or `@_silgen_name` that is not in the classification tables (§5). Upgrading the pin therefore surfaces new requirements explicitly.
 
 ## 10. Version pinning and patch policy
 
-- Track **one** upstream Swift release tag for the stdlib, and a matching swift-foundation tag. The initial pin is **Swift 6.4**, the compiler and swift-syntax (`604.x`) release that Todhchai builds against. The pin moves when Todhchai moves. Both are recorded in a single pin file with commit hashes.
+- Track **one** upstream Swift release tag for the stdlib, and a matching swift-foundation tag. The initial pin is **Swift 6.4**, the compiler and swift-syntax (`604.x`) release that VectraOS builds against (its `.swift-version` pins 6.4.0). The pin moves when VectraOS moves. Both are recorded in a single pin file with commit hashes.
 - Move the pin deliberately, at most once per upstream minor release. Each move is a separate change with the audit diff attached.
 - **Patch queue.** If the pinned sources depend on a feature Swift-Stack does not yet support, the preferred order is:
   1. Implement the feature.
@@ -205,14 +206,14 @@ Package dependencies such as swift-collections are compiled from pinned sources 
 ## 11. Alternatives considered
 
 - **Clean-room stdlib.** Rejected (§3). Too large, and it would define a dialect.
-- **Link Apple's prebuilt `libswiftCore`.** Rejected by D1: incompatible ABI and metadata, and no Todhchai build.
+- **Link Apple's prebuilt `libswiftCore`.** Rejected by D1: incompatible ABI and metadata, and no VectraOS build.
 - **Vendor the stdlib into the repository.** Rejected. It blurs the clean-room boundary and complicates licence hygiene. A pinned external checkout keeps the boundary visible.
 - **Natively reimplement the macros the stdlib and Foundation need (allowlist).** Rejected once macros became a goal (D4). Running the real plugins is less work and can't diverge from upstream behavior.
 
 ## 12. Open questions
 
-1. Final `os(...)` spelling for Todhchai and whether to propose it upstream.
+1. Final `os(...)` spelling for VectraOS and whether to propose it upstream.
 2. Should Tier 1 stdlib clients be able to rely on non-frozen stdlib layouts (whole-world compilation), or should Swift-Stack implement library evolution (resilience) for the stdlib from the start?
 3. Does FoundationEssentials internally require any macro expansion, and does it hard-depend on swift-collections? (Audit item.)
-4. How does swift-testing discover tests at runtime (a section-based record or conformance scanning) on Linux and Todhchai, and which runtime support does that require ([16](16-macros.md) open question 4)?
-5. ~~Pin cadence?~~ Resolved: the pin follows the Swift release Todhchai builds against (§10).
+4. How does swift-testing discover tests at runtime (a section-based record or conformance scanning) on Linux and VectraOS, and which runtime support does that require ([16](16-macros.md) open question 4)?
+5. ~~Pin cadence?~~ Resolved: the pin follows the Swift release VectraOS builds against (§10).

@@ -3885,7 +3885,7 @@ extension X86InstructionTable {
             results.append((mnemonic: desc.mnemonic, bytes: encoded.bytes, disassembled: decoded.attString))
         }
 
-        // Additional special-case addressing & prefix round-trip checks from todhchai/croi .S files
+        // Additional special-case addressing & prefix round-trip checks from the VectraOS amd64 .S files
         let specialCases: [X86Instruction] = [
             // %rsp base (SIB 0x24)
             X86Instruction(mnemonic: "mov", operands: [.mem(.baseDisp(.rsp, disp: 8)), .reg(.r9)]),

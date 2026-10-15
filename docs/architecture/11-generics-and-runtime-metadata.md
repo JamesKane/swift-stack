@@ -262,7 +262,7 @@ _SS8Geometry5PointS F8distancel2to_ T Q0 _ Kd
   - `@_extern(c, "name")` declares an external C function by its Swift signature;
   - `@_silgen_name("name")` uses `name`, under the mapping table in [12](12-standard-library-strategy.md) §5.
 
-  Todhchai's libc (`@c(getenv)`, `@c(exit)`, …) and its `libtodhchai.so` C ABI rely on this ([02](02-semantic-analysis.md) §4.3.5). For `.ss_symtypes` (§7.1), these symbols get a hash of their C-level signature, so a Swift `@c` definition and a C declaration of the same function are checked against each other.
+  VectraOS's kernel and loader implement C-declared entry points this way (`@c @implementation`), and a Swift-implemented libc (`@c(getenv)`, `@c(exit)`, …) relies on it ([02](02-semantic-analysis.md) §4.3.5). For `.ss_symtypes` (§7.1), these symbols get a hash of their C-level signature, so a Swift `@c` definition and a C declaration of the same function are checked against each other.
 - **Value generics** (SE-0452, e.g. `InlineArray<let count: Int, Element>`). Integer generic arguments are mangled as signed decimal literals in the generic-argument list. Specializations for different counts are distinct symbols. In Tier 1, integer generic parameters are passed as `Int` arguments alongside type metadata, and metadata for such types is cached per (descriptor, integer arguments).
 
 ### 7.1 Relationship to `.ss_symtypes`
@@ -322,10 +322,10 @@ The scope of this list is why D1 excludes compatibility from v1.
 
 ## 11. Open questions
 
-1. Is the per-target spare-bit mask for Todhchai pointers stable? It depends on the croi address-space layout.
+1. Is the per-target spare-bit mask for VectraOS pointers stable? It depends on VectraOS's address-space layout (user mappings in the lower half; the kernel in the upper half, at a random base).
 2. What are the RV64 `swiftself`/`swifterror`/`swiftasync` registers? They must be confirmed against LLVM `RISCVCallingConv` (also [04](04-backend.md) §6, question 1).
 3. On x86-64, should the indirect result pointer be a hidden first argument (RDI, as in C) or a dedicated register (as on AArch64 with X8)?
-4. ~~Should `~Escapable` / lifetime dependencies be in v1?~~ Resolved: yes, in both tiers. Todhchai's Tier 0 code uses `Span`, `MutableSpan` and `@_lifetime` throughout ([02](02-semantic-analysis.md) §4.3.5). `~Escapable` values need no runtime metadata beyond that of their `Escapable` counterparts.
+4. ~~Should `~Escapable` / lifetime dependencies be in v1?~~ Resolved: yes, in both tiers. VectraOS builds every target with the `Lifetimes` feature and uses `Span` and `MutableSpan` throughout its Tier 0 code ([02](02-semantic-analysis.md) §4.3.5). `~Escapable` values need no runtime metadata beyond that of their `Escapable` counterparts.
 5. Does FoundationEssentials need key paths before Tier 1 is complete (§5.10)?
-6. Is it worth keeping field names in descriptors for future reflection, given the size cost on Todhchai images?
+6. Is it worth keeping field names in descriptors for future reflection, given the size cost on VectraOS images?
 7. Should metadata-completion cycles be diagnosed at compile time where possible, rather than only detected at runtime?

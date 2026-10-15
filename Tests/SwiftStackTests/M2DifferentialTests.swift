@@ -13,7 +13,7 @@ struct AsmCorpusFile: CustomTestStringConvertible, Sendable {
     let arch: AssemblerArch
     let includePaths: [String]
     let clangFlags: [String]
-    var testDescription: String { path.split(separator: "/").suffix(3).joined(separator: "/") }
+    var testDescription: String { "\(arch): " + path.split(separator: "/").suffix(3).joined(separator: "/") }
 
     var target: DifferentialAssembly.Target {
         let base = DifferentialAssembly.target(for: arch)
@@ -23,10 +23,7 @@ struct AsmCorpusFile: CustomTestStringConvertible, Sendable {
 
 enum AsmCorpora {
     static let env = ProcessInfo.processInfo.environment
-    static let todhchaiRoot = env["SWIFTSTACK_TODHCHAI_ROOT"] ?? "/home/jkane/Projects/OS/todhchai"
-    static let croiRoot = env["SWIFTSTACK_CROI_ROOT"] ?? "/home/jkane/Projects/OS/croi"
-    static var todhchaiEntryDir: String { "\(todhchaiRoot)/system/sys/floor/entry" }
-    static var croiArchDir: String { "\(croiRoot)/kernel/arch" }
+    static let vectraRoot = env["SWIFTSTACK_VECTRAOS_ROOT"] ?? "/home/jkane/Projects/OS/VectraOS-swift"
 
     /// In-repo corpus (`Tests/Differential/asm/<arch>/*.S`): always available, covers fixed regressions.
     static var inRepoDir: String {
@@ -41,25 +38,59 @@ enum AsmCorpora {
             .map { "\(dir)/\($0)" }
     }
 
-    static var todhchai: [AsmCorpusFile] {
-        let d = todhchaiEntryDir
-        return [
-            AsmCorpusFile(path: "\(d)/amd64.S", arch: .x86_64, includePaths: [d], clangFlags: []),
-            AsmCorpusFile(path: "\(d)/arm64.S", arch: .aarch64, includePaths: [d], clangFlags: []),
-            AsmCorpusFile(path: "\(d)/rv64.S", arch: .riscv64, includePaths: [d], clangFlags: ["-march=rv64gc", "-mabi=lp64d", "-mno-relax"]),
-        ].filter { FileManager.default.fileExists(atPath: $0.path) }
+    /// Stand-ins for the build outputs `kernel/userprogram.S` embeds with `.incbin` (the user test program,
+    /// the vDSO, the Swift test programs and userboot). Both assemblers read the same files, so their
+    /// contents only need to be fixed and distinct.
+    static let incbinDir = FileManager.default.temporaryDirectory.appendingPathComponent("ss_vectraos_incbin").path
+    static let incbinMacros = ["CROI_USER_PROGRAM", "CROI_VDSO", "CROI_SWIFT_TEST", "CROI_SWIFT_TEST_EXEC", "CROI_USERBOOT"]
+
+    static func prepareIncbinStandIns() throws {
+        try FileManager.default.createDirectory(atPath: incbinDir, withIntermediateDirectories: true)
+        for (i, name) in incbinMacros.enumerated() {
+            let bytes = (0..<(37 * (i + 1))).map { UInt8(truncatingIfNeeded: $0 * 7 + i) }
+            try Data(bytes).write(to: URL(fileURLWithPath: "\(incbinDir)/\(name).bin"))
+        }
     }
 
-    static var croi: [AsmCorpusFile] {
-        let inc = ["\(croiRoot)/kernel/include", "\(croiRoot)/kernel"]
+    /// The VectraOS assembly (all 26 `.S` files), each assembled for its architecture with the flags its CMake
+    /// build uses (`cmake/toolchain.cmake`, the per-arch files in `cmake/arch/`, the user-binary rules in `cmake/`,
+    /// `kernel/CMakeLists.txt`). Arch-independent files are assembled once per architecture. `-g` is left out:
+    /// assembler-generated DWARF for `.S` sources is not part of M2.
+    static var vectraOS: [AsmCorpusFile] {
+        let root = vectraRoot
+        guard FileManager.default.fileExists(atPath: "\(root)/cmake/toolchain.cmake") else { return [] }
+        let common = ["-fPIE", "-fvisibility=hidden", "-ffunction-sections", "-fdata-sections", "-fno-omit-frame-pointer",
+                      "-fstack-protector-strong", "-O2", "-DNDEBUG"]
         var files: [AsmCorpusFile] = []
         for (dir, arch) in [("amd64", AssemblerArch.x86_64), ("arm64", .aarch64), ("rv64", .riscv64)] {
-            let archDir = "\(croiArchDir)/\(dir)"
-            for p in listS(archDir) {
-                files.append(AsmCorpusFile(path: p, arch: arch, includePaths: inc + [archDir], clangFlags: DifferentialAssembly.target(for: arch).clangFlags))
+            let kernelFlags: [String], userFlags: [String]
+            switch arch {
+            case .x86_64:
+                kernelFlags = ["-mno-red-zone", "-mgeneral-regs-only"]
+                userFlags = []
+            case .aarch64:
+                kernelFlags = ["-mgeneral-regs-only"]
+                userFlags = ["-mbranch-protection=bti"]
+            case .riscv64:
+                kernelFlags = ["-march=rv64imac_zicsr_zifencei", "-mabi=lp64", "-mcmodel=medany"]
+                userFlags = ["-march=rv64gc", "-mabi=lp64d", "-mcmodel=medany"]
             }
+            func file(_ rel: String, _ inc: [String], _ flags: [String]) -> AsmCorpusFile {
+                AsmCorpusFile(path: "\(root)/\(rel)", arch: arch, includePaths: inc.map { "\(root)/\($0)" }, clangFlags: flags)
+            }
+            // The loader (boot/CMakeLists.txt) and the kernel (kernel/CMakeLists.txt): the kernel flag set.
+            files.append(file("boot/arch/\(dir)/enter.S", ["boot/include"], kernelFlags + common))
+            for name in ["cpu", "exceptions", "smp", "start", "thread", "usercopy", "usertest"] {
+                files.append(file("kernel/arch/\(dir)/\(name).S", ["kernel/include"], kernelFlags + common))
+            }
+            let incbin = incbinMacros.map { "-D\($0)=\"\(incbinDir)/\($0).bin\"" }
+            files.append(file("kernel/userprogram.S", ["kernel/include"], incbin + kernelFlags + common))
+            // The vDSO (a position-independent user binary): the user flag set.
+            files.append(file("user/vdso/header.S", ["user/include", "kernel/include"],
+                              userFlags + ["-O2", "-fno-omit-frame-pointer", "-ffreestanding", "-fno-stack-protector", "-fno-builtin",
+                                           "-fPIE", "-fvisibility=hidden"]))
         }
-        return files
+        return files.filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     static var inRepo: [AsmCorpusFile] {
@@ -68,6 +99,11 @@ enum AsmCorpora {
             for p in listS("\(inRepoDir)/\(dir)") {
                 files.append(AsmCorpusFile(path: p, arch: arch, includePaths: [], clangFlags: DifferentialAssembly.target(for: arch).clangFlags))
             }
+        }
+        // RISC-V with linker relaxation on (clang's default), for VectraOS's kernel ISA and PIE.
+        for p in listS("\(inRepoDir)/riscv64-relax") {
+            files.append(AsmCorpusFile(path: p, arch: .riscv64, includePaths: [],
+                                       clangFlags: ["-march=rv64imac_zicsr_zifencei", "-mabi=lp64", "-fPIE"]))
         }
         return files
     }
@@ -116,13 +152,10 @@ struct M2DifferentialAssemblyTests {
         try Self.check(file, oracle: DifferentialAssembly.assembleWithClang(path: file.path, target: file.target, includePaths: file.includePaths), oracleName: "clang")
     }
 
-    @Test("Todhchai floor entry stubs match clang", .enabled(if: AsmCorpora.hasClang && !AsmCorpora.todhchai.isEmpty), arguments: AsmCorpora.todhchai)
-    func todhchaiVsClang(_ file: AsmCorpusFile) throws {
-        try Self.check(file, oracle: DifferentialAssembly.assembleWithClang(path: file.path, target: file.target, includePaths: file.includePaths), oracleName: "clang")
-    }
-
-    @Test("Croi kernel arch assembly matches clang", .enabled(if: AsmCorpora.hasClang && AsmCorpora.croi.count == 21), arguments: AsmCorpora.croi)
-    func croiVsClang(_ file: AsmCorpusFile) throws {
+    @Test("VectraOS assembly matches clang (all 26 .S files, per architecture)",
+          .enabled(if: AsmCorpora.hasClang && AsmCorpora.vectraOS.count == 30), arguments: AsmCorpora.vectraOS)
+    func vectraOSVsClang(_ file: AsmCorpusFile) throws {
+        try AsmCorpora.prepareIncbinStandIns()
         try Self.check(file, oracle: DifferentialAssembly.assembleWithClang(path: file.path, target: file.target, includePaths: file.includePaths), oracleName: "clang")
     }
 
@@ -130,9 +163,11 @@ struct M2DifferentialAssemblyTests {
         "x86-64 corpora match GNU as (relocations, symbols, data; documented encoding choices excepted)",
         .enabled(if: AsmCorpora.hasGNUAs),
         arguments: (AsmCorpora.inRepo.filter { !gnuIncompatibleFiles.contains(URL(fileURLWithPath: $0.path).lastPathComponent) }
-            + AsmCorpora.todhchai + AsmCorpora.croi).filter { $0.arch == .x86_64 }
+            + AsmCorpora.vectraOS).filter { $0.arch == .x86_64 }
     )
     func x86VsGNU(_ file: AsmCorpusFile) throws {
-        try Self.check(file, oracle: DifferentialAssembly.assembleWithGNU(path: file.path, includePaths: file.includePaths), options: gnuDocumentedDifferences(for: file), oracleName: "GNU as")
+        try AsmCorpora.prepareIncbinStandIns()
+        try Self.check(file, oracle: DifferentialAssembly.assembleWithGNU(
+            path: file.path, includePaths: file.includePaths, defines: file.clangFlags.filter { $0.hasPrefix("-D") }), options: gnuDocumentedDifferences(for: file), oracleName: "GNU as")
     }
 }

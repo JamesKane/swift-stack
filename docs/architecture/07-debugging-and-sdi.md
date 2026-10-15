@@ -10,7 +10,7 @@
 Swift-Stack defines **SDI (Swift-Stack Debug Info)**, a memory-mappable debug-information format inspired by the RAD Debugger's RDI format (Ryan Fleury, Epic Games Tools). SDI is a set of flat, sorted tables with 32-bit indices and an explicitly specified little-endian layout. Readers `mmap` it and use it without a parse step.
 
 - The compiler emits one **SDI fragment per module**. The linker merges fragments into the image's `.ss_debug` section ([06](06-linker.md) §5.7).
-- Unwinding on Todhchai uses **Compact Unwind Descriptors (CUD)**, which avoid bytecode interpretation for common frames and escape to an explicit rule record for everything else.
+- Unwinding on VectraOS uses **Compact Unwind Descriptors (CUD)**, which avoid bytecode interpretation for common frames and escape to an explicit rule record for everything else.
 - For host debuggers (GDB, LLDB), the same internal records can be emitted as DWARF 5.
 - This repository provides the format, a reader library, a symbolizer, and an unwinder. A full interactive debugger is a consumer built on top of these (§5.8).
 
@@ -216,7 +216,7 @@ The 24-bit mask covers the callee-saved sets of all three targets: x86-64 `rbx, 
 - **Epilogues.** Epilogue start offsets are listed in a sorted side table (`ss_unwind_epilogues`: `(function_offset: u32, kind: u8)`). Within a listed epilogue, the unwinder applies the canonical reverse state.
 - **Escape.** A function whose prologue or epilogue is not canonical MUST use mode `10`.
 
-**Relation to `.eh_frame`.** On Todhchai, CUD is the canonical format. Foreign objects provide only `.eh_frame` FDEs, which the linker indexes with `.eh_frame_hdr` ([06](06-linker.md) §5.6). The unwinder consults CUD first and falls back to FDEs. Linux and FreeBSD emit `.eh_frame` because the system tools expect it; macOS uses Apple compact unwind with an `__eh_frame` fallback ([04](04-backend.md) §4.11). CUD records are also kept in SDI on every target, for Swift-Stack's own tools. Swift error propagation does not unwind.
+**Relation to `.eh_frame`.** On VectraOS, CUD is the canonical format. Foreign objects provide only `.eh_frame` FDEs, which the linker indexes with `.eh_frame_hdr` ([06](06-linker.md) §5.6). The unwinder consults CUD first and falls back to FDEs. Linux and FreeBSD emit `.eh_frame` because the system tools expect it; macOS uses Apple compact unwind with an `__eh_frame` fallback ([04](04-backend.md) §4.11). CUD records are also kept in SDI on every target, for Swift-Stack's own tools. Swift error propagation does not unwind.
 
 ### 5.6 Per-module fragments and linking
 
@@ -243,7 +243,7 @@ SDI is only useful if something reads it. This repository provides the following
 1. **`SDIReader`.** A C23 and Swift library with explicit-offset, bounds-checked accessors, plus a validator (`ssdb-dump --verify`) that checks sortedness, index bounds, and record sizes. It also serves as the format's conformance test.
 2. **Symbolizer.** `ssdb-symbolize <image> <addr...>` resolves addresses to procedure, inline frames, file, and line. Used by crash reports and runtime backtraces.
 3. **Unwinder library.** Shared by the runtime's backtrace support ([08](08-runtime-and-stdlib.md)) and the debugger; supports CUD, extended rules, and the FDE fallback.
-4. **Debugger (`ssdb`).** An interactive debugger for Todhchai that uses 1–3 together with OS debugging services. It is a separate milestone and may live in the Todhchai tree.
+4. **Debugger (`ssdb`).** An interactive debugger for VectraOS that uses 1–3 together with OS debugging services (VectraOS's kernel already has exception channels, `thread_read/write_state` and hardware breakpoint and watchpoint state). It is a separate milestone and may live in the VectraOS tree.
 
 ### 5.9 Expression evaluation
 
@@ -268,12 +268,12 @@ Example: evaluating `person.address.zipCode` for stored properties of fixed-layo
 
 `--debug-format=dwarf` (or `both`) emits DWARF 5 from the same internal records: `.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`/`.debug_line_str`, `.debug_rnglists`, `.debug_loclists`, and `.debug_addr`. SDI location kinds map one-to-one to simple DWARF location expressions. Swift types are described as DWARF structures, enumerations, and pointers with their Swift names, so GDB and LLDB provide C-level inspection of Swift code. Swift-aware LLDB features (expression evaluation in Swift, reflection-based formatting) are not expected to work (D1).
 
-### 5.11 Hot reload (Todhchai OS principle 17)
+### 5.11 Hot reload (VectraOS principle 23)
 
-Todhchai OS principle 17 makes debugging and hot reload OS services. SDI supports this as follows:
+VectraOS principle 23 makes debugging and hot reload OS services. VectraOS has no hot-reload mechanism yet, so this section states what SDI provides for one:
 
 - Each code-module build has a `generation_id` in its SDI header.
-- When Todhchai swaps a `CodeModule`, the debugger is notified on its event port. It maps the new generation's SDI and unmaps the old one when no frames of the old code remain live.
+- When the OS swaps a code module, the debugger is notified on its port. It maps the new generation's SDI and unmaps the old one when no frames of the old code remain live.
 - Breakpoints are stored as `(procedure display name, file, line)` and re-bound against the new generation. Breakpoints in unchanged procedures resolve to the same source positions; breakpoints in changed procedures are re-resolved, and the user is told if one cannot be bound.
 
 Hot reload needs relocatable code modules, which v1 does not link ([06](06-linker.md) §11, question 5). Whether patchable code modules for live code editing should move ahead of macOS output in the roadmap is [06](06-linker.md) §11, question 6.
@@ -292,7 +292,7 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md).
 
 ## 7. Alternatives considered
 
-- **DWARF only.** Rejected for Todhchai because of the query cost of interpreted location and CFI programs and the link-time cost of deduplication. Kept as a host output (§5.10).
+- **DWARF only.** Rejected for VectraOS because of the query cost of interpreted location and CFI programs and the link-time cost of deduplication. Kept as a host output (§5.10).
 - **Swift structs as the on-disk format.** Rejected: Swift layout is not a stable format, and readers in other languages need a normative definition.
 - **Location expressions as bytecode (like DWARF).** Rejected in favor of a closed set of kinds plus `OPTIMIZED_OUT`. This costs some coverage of optimized code in exchange for simple and fast readers.
 - **Apple-style compact unwind alone.** Rejected: it is not precise at arbitrary instructions and depends on DWARF for fallbacks. CUD adds prologue and epilogue information and a table-based escape mode.
@@ -303,7 +303,7 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md).
 
 1. Should line rows be delta-compressed (with a sorted block index) in v1, or kept as raw 24-byte rows until size is measured?
 2. Should SDI optionally live in a separate file (`.sdi`) next to stripped release images, keyed by build-id?
-3. Should DWARF in foreign C objects be converted to SDI at link time so that whole-program symbolication works on Todhchai, and at what cost?
+3. Should DWARF in foreign C objects be converted to SDI at link time so that whole-program symbolication works on VectraOS, and at what cost?
 4. What is the RISC-V register for the async context, and does it change the CUD canonical prologue shapes? (Depends on [11](11-generics-and-runtime-metadata.md) §8, open question 2.)
 5. What is the policy for data formatters when stdlib storage layouts change, and how are their versions recorded in SDI?
 6. **Emit RDI instead of SDI?** Producing RDI directly, or a strict superset, would give Swift-Stack a mature debugger (the RAD Debugger) instead of only the `ssdb` symbolizer.

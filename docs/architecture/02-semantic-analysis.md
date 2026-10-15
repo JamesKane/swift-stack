@@ -127,7 +127,7 @@ That is 16 bytes per type across six columns.
 | Constants | `constexpr` objects (§4.2.3); `u8` character literals; binary literals; digit separators |
 | Attributes | `[[nodiscard]]`, `[[nodiscard("…")]]`, `[[maybe_unused]]`, `[[deprecated]]`, `[[deprecated("…")]]`, `[[fallthrough]]`, `[[noreturn]]` (and deprecated `[[_Noreturn]]`), `[[reproducible]]`, `[[unsequenced]]`; unknown vendor attributes warn and are ignored; `__has_c_attribute` reports the supported set |
 | Library-facing builtins | `unreachable()`, the `<stdbit.h>` operations (`stdc_count_ones`, `stdc_leading_zeros`, …) as intrinsics, `memset_explicit` recognized as non-elidable |
-| Atomics | `_Atomic` and `<stdatomic.h>` via builtins. `__STDC_NO_ATOMICS__` is **not** defined, because Todhchai's runtime needs atomics |
+| Atomics | `_Atomic` and `<stdatomic.h>` via builtins. `__STDC_NO_ATOMICS__` is **not** defined, because VectraOS's runtime needs atomics |
 | Variably modified types | Pointers to VLA types and VM parameters are mandatory in C23 and supported |
 
 `[[reproducible]]` and `[[unsequenced]]` are recorded as function effects and passed to the optimizer as `readonly`/`readnone`-style facts ([03](03-intermediate-representation.md)).
@@ -160,8 +160,8 @@ Both are resolved by type-checking the operand without evaluating it, except tha
 - **Attributes** (`__attribute__`). Implemented: `aligned`, `packed`, `noreturn`, `unused`, `used`, `visibility`, `always_inline`, `noinline`, `section`, `weak`, `alias`, `nonnull`, `warn_unused_result`, `deprecated`, and `format` (checked loosely). Recorded but not enforced: `availability` and `swift_name`.
 - **Asm labels.** `__asm__("sym")` on a declaration overrides its symbol name. macOS uses this for `$INODE64` and similar variants, so it is required for correct linking.
 - **Builtins.** A documented `__builtin_*` catalog, covering what the profiled headers reference: `__builtin_va_*`, `__builtin_expect`, `__builtin_bswap*`, `__builtin_clz*`, `__builtin_offsetof`, `__builtin_unreachable`, and the overflow builtins.
-- **Inline `asm`.** Basic and extended inline `asm`, with the constraint subset that Todhchai sources need (`r`, `m`, `i`, `=`, `+`, `&`, register-pinned operands, `memory`/`cc` clobbers).
-- **Nullability qualifiers** are kept as type sugar for Swift import (§4.6).
+- **Inline `asm`.** Basic and extended inline `asm`, with the constraint subset that VectraOS's C needs (`r`, `m`, `i`, `=`, `+`, `&`, register-pinned operands, `memory`/`cc` clobbers).
+- **Nullability qualifiers** (`_Nonnull`, `_Nullable`, `_Nullable_result`, `_Null_unspecified`) are kept as type sugar for Swift import (§4.6). VectraOS's kernel, loader and runtime headers annotate every pointer with them, including inside array parameter brackets (`uint32_t out[_Nonnull 4]`).
 - **Vector extensions.** `__attribute__((vector_size(N)))`, `ext_vector_type(N)`, `__builtin_shufflevector` and `__builtin_convertvector`. They map to the TypePool's builtin vector types, shared with Swift `SIMDn` ([17](17-simd-and-vectorization.md) §5.7), and macOS `<simd/simd.h>` needs them. Target intrinsics headers are a non-goal.
 
 #### 4.2.6 Deferred optional features
@@ -231,23 +231,26 @@ Literals, operators, `Optional` sugar, `for`-`in`, `try`/`throws`, and implicit 
 
 Macro declarations and uses: role attributes, introduced-name specifiers, `#externalMacro` targets, and the argument types of macro uses, which are type-checked like a call before expansion ([16](16-macros.md)). Access control; availability; property wrappers; `@inlinable`/`@usableFromInline` restrictions; `@frozen`; enum exhaustiveness (the space engine); `defer`; `throws` and `rethrows` checking; protocol extensions and their default implementations; class inheritance, overrides, and `final`; and initializer rules (designated/convenience, `required`, failable).
 
-#### 4.3.5 Required feature profile (Todhchai)
+#### 4.3.5 Required feature profile (VectraOS)
 
-Todhchai, the first-party user, builds against the **Swift 6.4** compiler, and its Tier 0 code is held to stricter settings. Everything below is required. It is checked with the same D5 parity rule as the rest of the language. Counts are approximate use sites in the Todhchai tree at survey time.
+VectraOS, the first-party user, builds with the **Swift 6.4** compiler, and its Tier 0 code is held to stricter settings: every target is built with `-enable-experimental-feature Embedded`, `-enable-experimental-feature Lifetimes`, `-strict-memory-safety`, `-Werror StrictMemorySafety`, `-Werror EmbeddedRestrictions`, `-Wwarning PerformanceHints`, `-enforce-exclusivity=unchecked`, `-Osize` and whole-module compilation. Everything below is required. It is checked with the same D5 parity rule as the rest of the language. Counts are use sites in VectraOS's 171 Swift files at the time it became the first-party consumer; rows with no use yet are required by components VectraOS's roadmap lifts later, and say which.
 
-| Feature | Todhchai use | Swift-Stack requirement | Owner |
+| Feature | VectraOS use | Swift-Stack requirement | Owner |
 |---|---|---|---|
-| `@c` / `@c(name)` (C-compatible functions) | ~600: Todhchai's Swift-implemented libc (`@c(getenv)`, `@c(exit)`), the `libtodhchai.so` C ABI, the Vulkan ICD | Check that the signature is C-representable. Emit an unmangled C symbol with the C calling convention. Callable from C through the shared TypePool. | here; symbols in [11](11-generics-and-runtime-metadata.md) §7 |
-| `@_extern(c, "sym")` (`Extern` feature) | 7: libc entry points on hosted builds | Declare an external C function by Swift signature, without a header | here; [11](11-generics-and-runtime-metadata.md) §7 |
-| `@_silgen_name` | 3 | As for the stdlib ([12](12-standard-library-strategy.md) §5.2) | [12](12-standard-library-strategy.md) |
-| Strict memory safety (SE-0458): `unsafe` expressions, `@unsafe`, `@safe`, `-strict-memory-safety` | ~9,600 `unsafe` expressions; all Tier 0 code built with `-Werror StrictMemorySafety` | Classify every declaration and expression as safe or unsafe, following `swiftc`'s rules, and diagnose under the `StrictMemorySafety` diagnostic group. Warnings are promotable to errors by group ([15](15-driver-and-diagnostics.md) §4.5). | here |
-| Lifetime dependence (`Lifetimes` feature): `~Escapable`, `@_lifetime(...)` | `@_lifetime(self: copy self)`, `@_lifetime(copy a, copy b)`; ~330 uses of `Span`/`MutableSpan`/`RawSpan`/`MutableRawSpan` | Parse and check annotations here. Dependence enforcement is a mandatory AIR pass ([03](03-intermediate-representation.md) §4.3). | here + [03](03-intermediate-representation.md) |
-| Value generics (SE-0452): `InlineArray<let count: Int, Element>` | ~100 uses of `InlineArray` | Integer generic parameters in the TypePool, generic signatures, specialization and mangling | here + [11](11-generics-and-runtime-metadata.md) |
-| `_Volatile` module (`Volatile` feature): `VolatileMappedRegister` | 24 uses in drivers (MMIO) | Volatile load and store builtins lowering to AIR volatile memory operations ([03](03-intermediate-representation.md) §4.2) | [12](12-standard-library-strategy.md) |
-| `@_noAllocation`, `-no-allocations` | `@AudioRenderer` ([16](16-macros.md)); Embedded builds | Performance-annotation checking, per function or for a whole module | [03](03-intermediate-representation.md) §4.3–4.4 |
-| `-enforce-exclusivity=unchecked` | One host-side target | Omit dynamic exclusivity checks. Static exclusivity diagnostics still apply. | [03](03-intermediate-representation.md) §4.4 |
+| `@c` / `@c(name)` (C-compatible functions), and `@c @implementation` | 10 today, all `@c @implementation`: Swift bodies for functions that `kernel.h` and `loader.h` declare, called from assembly and C. A Swift-implemented libc (`@c(getenv)`, `@c(exit)`) arrives with the userland in roadmap V2. | Check that the signature is C-representable, and for `@implementation` that it matches the imported C declaration. Emit an unmangled C symbol with the C calling convention. Callable from C through the shared TypePool. | here; symbols in [11](11-generics-and-runtime-metadata.md) §7 |
+| `@_extern(c, "sym")` (`Extern` feature) | None yet; libc entry points on hosted builds (V2) | Declare an external C function by Swift signature, without a header | here; [11](11-generics-and-runtime-metadata.md) §7 |
+| `@_silgen_name` | None yet | As for the stdlib ([12](12-standard-library-strategy.md) §5.2) | [12](12-standard-library-strategy.md) |
+| Strict memory safety (SE-0458): `unsafe` expressions, `@unsafe`, `@safe`, `-strict-memory-safety` | ~2,100 `unsafe` expressions, ~40 `@unsafe` and ~60 `@safe`; all code built with `-Werror StrictMemorySafety` | Classify every declaration and expression as safe or unsafe, following `swiftc`'s rules, and diagnose under the `StrictMemorySafety` diagnostic group. Warnings are promotable to errors by group ([15](15-driver-and-diagnostics.md) §4.5). | here |
+| Lifetime dependence (`Lifetimes` feature): `~Escapable`, `@_lifetime(...)` | Feature enabled on every target; ~100 uses of `Span`/`MutableSpan`/`RawSpan`/`MutableRawSpan`, no `@_lifetime` annotations of its own yet | Parse and check annotations here. Dependence enforcement is a mandatory AIR pass ([03](03-intermediate-representation.md) §4.3). | here + [03](03-intermediate-representation.md) |
+| Value generics (SE-0452): `InlineArray<let count: Int, Element>` | ~270 uses of `InlineArray` | Integer generic parameters in the TypePool, generic signatures, specialization and mangling | here + [11](11-generics-and-runtime-metadata.md) |
+| Typed throws (`throws(E)`) | ~900 uses (VectraOS principle 17: errors are values) | As in §4.3 | here |
+| Noncopyable types (`~Copyable`) | ~75 uses | As in §4.5 | here |
+| `Synchronization` module: `Atomic<T>` | ~70 imports, ~120 `Atomic<Int>`/`<UInt64>`/`<Bool>`/… in the kernel (no `Mutex` on the kernel's targets) | `Atomic` builtins lowering to AIR atomics with the requested orderings | [12](12-standard-library-strategy.md) |
+| `_Volatile` module: `VolatileMappedRegister` | 13 imports, ~80 uses in the kernel's MMIO drivers (UART, IOMMUs, interrupt controllers) | Volatile load and store builtins lowering to AIR volatile memory operations ([03](03-intermediate-representation.md) §4.2) | [12](12-standard-library-strategy.md) |
+| `@_noAllocation`, `-no-allocations` | None yet; `@AudioRenderer` ([16](16-macros.md)) puts it on real-time callbacks once VectraOS lifts its SDK (V6), and VectraOS's performance contracts name it | Performance-annotation checking, per function or for a whole module | [03](03-intermediate-representation.md) §4.3–4.4 |
+| `-enforce-exclusivity=unchecked` | Every Embedded target | Omit dynamic exclusivity checks. Static exclusivity diagnostics still apply. | [03](03-intermediate-representation.md) §4.4 |
 
-New features that Todhchai adopts are added to this table as they appear. The table is kept current by the `ss-census` tool ([09](09-roadmap.md)). In CI it counts feature, attribute and flag uses over the pinned Todhchai tree, and ranks the unsupported ones by use count, which in turn sets implementation order. The [09](09-roadmap.md) differential corpus is the source tree itself, so additions are detected by the build failing.
+New features that VectraOS adopts are added to this table as they appear. The table is kept current by the `ss-census` tool ([09](09-roadmap.md)). In CI it counts feature, attribute and flag uses over a pinned VectraOS tree, and ranks the unsupported ones by use count, which in turn sets implementation order. The [09](09-roadmap.md) differential corpus is the source tree itself, so additions are detected by the build failing.
 
 ### 4.4 Swift 6 concurrency checking
 
@@ -266,7 +269,7 @@ Concurrency checking is part of the type system. It is therefore in scope for G1
 - **Region-based isolation** (SE-0414). This analysis is flow-sensitive, so it runs as an AIR mandatory diagnostic pass over the control-flow graph ([03](03-intermediate-representation.md)). Sem supplies the isolation facts it consumes.
 - **Language modes.** Swift 6 mode makes violations errors. Swift 5 mode emits them as warnings according to the same rules that `swiftc` uses.
 
-The runtime side (executors, task allocation, the `td_executor_port` integration) is in [08](08-runtime-and-stdlib.md).
+The runtime side (executors, task allocation, the VectraOS port backend) is in [08](08-runtime-and-stdlib.md).
 
 ### 4.5 Ownership: type-level rules
 
@@ -303,7 +306,7 @@ C headers are parsed by Swift-Stack's own C frontend into the shared `TypePool`.
 - **C macros.** An object-like macro whose replacement is a single literal, or a parenthesized constant expression over literals, casts to imported types, and other importable macros, is imported as a Swift `let` constant whose type follows `swiftc`'s rules. Function-like macros are not imported.
 - **Inline C functions.** C `static inline` functions are type-checked as C and lowered to AIR on demand. The optimizer can then inline them into Swift callers ([03](03-intermediate-representation.md)).
 - **Imported names.** `swift_name`, `swift_private`, and `NS_SWIFT_NAME`-style attributes are honored for renaming.
-- **C module boundaries.** How Swift code names a C module (`import Glibc`, `import CTodhchai`) and maps it to headers is defined by the module-map mechanism in [13](13-modules-and-incremental-builds.md).
+- **C module boundaries.** How Swift code names a C module (`import Glibc`, VectraOS's `import CKernel`) and maps it to headers is defined by the module-map mechanism in [13](13-modules-and-incremental-builds.md).
 
 ## 5. Alternatives considered
 

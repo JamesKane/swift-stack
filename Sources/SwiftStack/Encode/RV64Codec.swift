@@ -2011,20 +2011,20 @@ public enum RV64Encoder {
     /// Materializes any 64-bit constant `imm` into `rd` in up to 8 instructions,
     /// matching GNU `as` / LLVM MC sequences (32-bit sign-extended LUI+ADDIW, trailing-zero shifts,
     /// and recursive high-to-low `slli` + `addi` decomposition), using compressed forms when `rvcEnabled` is true.
-    public static func expandLi(rd: RVGPR, imm: Int64, rvcEnabled: Bool = true) -> [RV64Instruction] {
+    public static func expandLi(rd: RVGPR, imm: Int64, rvcEnabled: Bool = true, zbsEnabled: Bool = true) -> [RV64Instruction] {
         if rd == .zero {
             let nop = RV64Instruction.gpr(.addi, rd: .zero, rs1: .zero, imm: 0)
             return [rvcEnabled ? (compressInstruction(nop) ?? nop) : nop]
         }
 
-        let rawSeq = synthesizeLi64(rd: rd, val: imm)
+        let rawSeq = synthesizeLi64(rd: rd, val: imm, zbs: zbsEnabled)
         if !rvcEnabled {
             return rawSeq
         }
         return rawSeq.map { compressInstruction($0) ?? $0 }
     }
 
-    private static func synthesizeLi64(rd: RVGPR, val: Int64) -> [RV64Instruction] {
+    private static func synthesizeLi64(rd: RVGPR, val: Int64, zbs: Bool) -> [RV64Instruction] {
         // 1. Fits in signed 12-bit immediate (-2048..2047)
         if val >= -2048 && val <= 2047 {
             return [.gpr(.addi, rd: rd, rs1: .zero, imm: val)]
@@ -2033,8 +2033,9 @@ public enum RV64Encoder {
         let uval = UInt64(bitPattern: val)
         let tz = uval.trailingZeroBitCount
 
-        // 2. Single-bit power-of-two in upper 33 bits (bit 31..63): single Zbs `bseti rd, zero, shamt`
-        if uval.nonzeroBitCount == 1 && tz >= 31 {
+        // 2. Single-bit power-of-two in upper 33 bits (bit 31..63): single Zbs `bseti rd, zero, shamt` (without Zbs,
+        //    e.g. VectraOS's rv64imac kernel, `li t0, 8 << 60` is `c.li t0, -1; c.slli t0, 63`)
+        if zbs && uval.nonzeroBitCount == 1 && tz >= 31 {
             return [.gpr(.bseti, rd: rd, rs1: .zero, imm: Int64(tz))]
         }
 
@@ -2073,32 +2074,32 @@ public enum RV64Encoder {
         // 4. Check if shifting out trailing zeros allows a shorter sequence
         if tz > 0 {
             let shiftedSigned = val >> tz
-            let signedCandidate = synthesizeLiNoTrailingShift(rd: rd, val: shiftedSigned) + [
+            let signedCandidate = synthesizeLiNoTrailingShift(rd: rd, val: shiftedSigned, zbs: zbs) + [
                 .gpr(.slli, rd: rd, rs1: rd, imm: Int64(tz))
             ]
 
             let shiftedUnsigned = Int64(bitPattern: uval >> tz)
             if shiftedUnsigned != shiftedSigned && shiftedUnsigned > 0 {
-                let unsignedCandidate = synthesizeLiNoTrailingShift(rd: rd, val: shiftedUnsigned) + [
+                let unsignedCandidate = synthesizeLiNoTrailingShift(rd: rd, val: shiftedUnsigned, zbs: zbs) + [
                     .gpr(.slli, rd: rd, rs1: rd, imm: Int64(tz))
                 ]
                 if unsignedCandidate.count < signedCandidate.count {
-                    let directCandidate = synthesizeLiNoTrailingShift(rd: rd, val: val)
+                    let directCandidate = synthesizeLiNoTrailingShift(rd: rd, val: val, zbs: zbs)
                     return unsignedCandidate.count <= directCandidate.count ? unsignedCandidate : directCandidate
                 }
             }
 
-            let directCandidate = synthesizeLiNoTrailingShift(rd: rd, val: val)
+            let directCandidate = synthesizeLiNoTrailingShift(rd: rd, val: val, zbs: zbs)
             if signedCandidate.count <= directCandidate.count {
                 return signedCandidate
             }
             return directCandidate
         }
 
-        return synthesizeLiNoTrailingShift(rd: rd, val: val)
+        return synthesizeLiNoTrailingShift(rd: rd, val: val, zbs: zbs)
     }
 
-    private static func synthesizeLiNoTrailingShift(rd: RVGPR, val: Int64) -> [RV64Instruction] {
+    private static func synthesizeLiNoTrailingShift(rd: RVGPR, val: Int64, zbs: Bool) -> [RV64Instruction] {
         if val >= -2048 && val <= 2047 {
             return [.gpr(.addi, rd: rd, rs1: .zero, imm: val)]
         }
@@ -2125,7 +2126,7 @@ public enum RV64Encoder {
             shift += 1
         }
 
-        var seq = synthesizeLi64(rd: rd, val: hi)
+        var seq = synthesizeLi64(rd: rd, val: hi, zbs: zbs)
         seq.append(.gpr(.slli, rd: rd, rs1: rd, imm: Int64(shift)))
         if lo12 != 0 {
             seq.append(.gpr(.addi, rd: rd, rs1: rd, imm: lo12))

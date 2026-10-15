@@ -31,6 +31,57 @@ public enum RVAsm {
         session: AsmSession,
         diagnostics: inout DiagnosticBag
     ) {
+        let section = session.currentSection
+        let first = section.fragments.count
+        parseInstructionStatement(mnemonic: rawMnemonic, args: operandsStr, loc: loc, session: session, diagnostics: &diagnostics)
+        if session.rvOptions.relaxEnabled {
+            markLinkerRelaxable(section, from: first, session: session)
+        }
+    }
+
+    /// Fixup kinds LLVM MC (`RISCVMCCodeEmitter`) pairs with `R_RISCV_RELAX` under linker relaxation. GOT and TLS
+    /// GOT/GD `%*_hi` and branches/jumps are not relaxable.
+    private static func isLinkerRelaxable(_ kind: RelocKind) -> Bool {
+        switch kind {
+        case .riscv_call, .riscv_call_plt, .riscv_pcrel_hi20, .riscv_pcrel_lo12_i, .riscv_pcrel_lo12_s,
+             .riscv_hi20, .riscv_lo12_i, .riscv_lo12_s, .riscv_tprel_hi20, .riscv_tprel_lo12_i, .riscv_tprel_lo12_s,
+             .riscv_tprel_add:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Under `.option relax`: follows each relaxable fixup of the instruction just emitted with an `R_RISCV_RELAX`
+    /// marker at the same offset, and keeps `%pcrel_hi`/`%pcrel_lo` as relocations even for a same-section target
+    /// (the linker may move it). The marked fragment is a relaxation barrier for PC-relative differences
+    /// (`AsmSession.relaxBarriers`). A fixup against an assembly-time constant gets no marker: LLVM MC folds it.
+    private static func markLinkerRelaxable(_ section: AsmSectionBuilder, from first: Int, session: AsmSession) {
+        for i in first..<section.fragments.count {
+            guard case .inst(let bytes, let fixups, let loc) = section.fragments[i],
+                  fixups.contains(where: { isLinkerRelaxable($0.kind) && session.constants[$0.symbol] == nil }) else { continue }
+            var marked: [AsmInstFixup] = []
+            for fix in fixups {
+                let pcrel = fix.kind == .riscv_pcrel_hi20 || fix.kind == .riscv_pcrel_lo12_i || fix.kind == .riscv_pcrel_lo12_s
+                marked.append(pcrel && fix.resolveIfSameSection
+                    ? AsmInstFixup(offsetInInst: fix.offsetInInst, kind: fix.kind, symbol: fix.symbol, minusSymbol: fix.minusSymbol,
+                                   addend: fix.addend, width: fix.width, resolveIfSameSection: false)
+                    : fix)
+                if isLinkerRelaxable(fix.kind) && session.constants[fix.symbol] == nil {
+                    marked.append(AsmInstFixup(offsetInInst: fix.offsetInInst, kind: .riscv_relax, symbol: "", addend: 0, width: 0))
+                }
+            }
+            section.fragments[i] = .inst(bytes: bytes, fixups: marked, loc: loc)
+        }
+    }
+
+    private static func parseInstructionStatement(
+        mnemonic rawMnemonic: String,
+        args operandsStr: String,
+        loc: AsmLoc,
+        session: AsmSession,
+        diagnostics: inout DiagnosticBag
+    ) {
         let m = rawMnemonic.lowercased()
         let ops = splitOperands(operandsStr)
         let rvc = session.rvOptions.rvcEnabled
@@ -179,7 +230,7 @@ public enum RVAsm {
             }
             switch exprVal {
             case .constant(let imm):
-                let seq = RV64Encoder.expandLi(rd: rd, imm: imm, rvcEnabled: rvc)
+                let seq = RV64Encoder.expandLi(rd: rd, imm: imm, rvcEnabled: rvc, zbsEnabled: session.rvOptions.zbsEnabled)
                 for inst in seq {
                     emitInst(inst, rvc: rvc, session: session, loc: loc)
                 }
@@ -690,7 +741,14 @@ public enum RVAsm {
                 return
             }
             if let (mod, base) = parseRelocMemOperand(ops[1], session: session) {
-                let sKind: RelocKind = (mod.kind == .riscv_pcrel_lo12_i) ? .riscv_pcrel_lo12_s : mod.kind
+                // A store's 12-bit offset is split S-type, so `%lo`/`%tprel_lo`/`%pcrel_lo` take their `_S` relocation.
+                let sKind: RelocKind
+                switch mod.kind {
+                case .riscv_pcrel_lo12_i: sKind = .riscv_pcrel_lo12_s
+                case .riscv_lo12_i:       sKind = .riscv_lo12_s
+                case .riscv_tprel_lo12_i: sKind = .riscv_tprel_lo12_s
+                default:                  sKind = mod.kind
+                }
                 let bytes = RV64Encoder.encode(.gpr(opcode, rs1: base, rs2: rs2, imm: 0), rvcEnabled: false)
                 let fixup = AsmInstFixup(offsetInInst: 0, kind: sKind, symbol: mod.symbol, addend: mod.addend, width: 4)
                 session.currentSection.emitBytes(bytes, fixups: [fixup], loc: loc)

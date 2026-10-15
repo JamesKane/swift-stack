@@ -7,7 +7,7 @@
 
 ## 1. Summary
 
-The Swift-Stack linker runs in-process with the compiler, driven by the main `swift-stack` driver. A standalone `ld`-compatible personality (`ss-ld`) is deferred until a concrete external build needs one ([15](15-driver-and-diagnostics.md)). It consumes relocatable objects in a shared in-memory **object model** (the `Object` module, defined canonically in this chapter), whether they were produced by Codegen, by the native assemblers, or read from foreign ELF / Mach-O `.o` and `.a` files. It produces static ELF executables for Todhchai OS and static or dynamic executables for the POSIX host targets.
+The Swift-Stack linker runs in-process with the compiler, driven by the main `swift-stack` driver. A standalone `ld`-compatible personality (`ss-ld`) is deferred until a concrete external build needs one ([15](15-driver-and-diagnostics.md)). It consumes relocatable objects in a shared in-memory **object model** (the `Object` module, defined canonically in this chapter), whether they were produced by Codegen, by the native assemblers, or read from foreign ELF / Mach-O `.o` and `.a` files. It produces static ELF executables for VectraOS and static or dynamic executables for the POSIX host targets.
 
 Relative to a conventional linker it adds three things, without changing ordinary ELF/Mach-O symbol semantics:
 
@@ -24,7 +24,7 @@ The design is motivated by linker redundancies discussed by Jonathan Blow and ot
 - **No type information at link time.** In plain C, a declaration and a definition can disagree on a signature without any diagnostic. `.ss_symtypes` lets the linker report such mismatches when both sides were compiled by Swift-Stack.
 - **Disk round-trips.** Writing `.o` files only to have the linker re-parse them is unnecessary when compiler and linker share a process. In-process handoff (§6) removes this; on-disk objects remain supported for separate compilation and caching ([13](13-modules-and-incremental-builds.md)).
 
-A note on loaders: the original document claimed that ASLR makes link-time address assignment redundant. That overstates it. Position-independent executables use PC-relative code, so text is not patched at load time; the loader applies mostly `R_*_RELATIVE` and GOT/`JUMP_SLOT` relocations to data. Link-time layout remains necessary. What *can* be co-designed with the Todhchai loader is the set of load-time relocations (zero for static `ET_EXEC`).
+A note on loaders: the original document claimed that ASLR makes link-time address assignment redundant. That overstates it. Position-independent executables use PC-relative code, so text is not patched at load time; the loader applies mostly `R_*_RELATIVE` and GOT/`JUMP_SLOT` relocations to data. Link-time layout remains necessary. What *can* be co-designed with the VectraOS loaders is the set of load-time relocations: zero for static `ET_EXEC`, and only `R_*_RELATIVE` for static PIEs, which is all VectraOS's loaders accept.
 
 ## 3. Goals
 
@@ -165,14 +165,14 @@ GOT-indirect references to symbols that resolve locally in static images SHOULD 
 
 - `R_RISCV_PCREL_LO12_I/S` refers to the *label of the paired `auipc`*, not to the target symbol. The linker MUST locate the `PCREL_HI20` relocation at that address in the same section and compute the low part from that pair's target. The lookup uses a per-section index sorted by offset.
 - **RISC-V attributes.** Every input's `.riscv.attributes` section (`Tag_RISCV_arch` and related tags) is merged. Swift-Stack's own objects record the RVA23 profile ISA string. A foreign input whose ISA string needs an extension outside the output's target profile is a link error, unless `--allow-isa-superset` is given.
-- **Relaxation policy (depends on [04](04-backend.md)):** v1 does not perform linker relaxation. Swift-Stack's code generator and assembler MUST NOT emit `R_RISCV_RELAX` or `R_RISCV_ALIGN`. A foreign object containing `R_RISCV_RELAX` links correctly without relaxing, because the relaxation hint is optional. A foreign object containing `R_RISCV_ALIGN` requires NOP deletion to be correct. v1 handles it by deleting the excess padding NOPs only (the minimal form of relaxation), and rejects the object with a diagnostic if that is not possible.
+- **Relaxation policy (depends on [04](04-backend.md)):** v1 does not perform linker relaxation. Swift-Stack's code generator MUST NOT emit `R_RISCV_RELAX` or `R_RISCV_ALIGN`. Its assembler emits them, as LLVM MC does, for hand-written assembly assembled with relaxation on (clang's default, and how VectraOS builds; [05](05-assembler.md) §4.8), so the linker treats those objects like foreign ones. A foreign object containing `R_RISCV_RELAX` links correctly without relaxing, because the relaxation hint is optional. A foreign object containing `R_RISCV_ALIGN` requires NOP deletion to be correct. v1 handles it by deleting the excess padding NOPs only (the minimal form of relaxation), and rejects the object with a diagnostic if that is not possible.
 
 ### 5.6 Unwind information
 
-- **Todhchai:** Compact Unwind Descriptors (CUD, [07](07-debugging-and-sdi.md) §5.5) are the canonical unwind format. The linker sorts CUD records by address into a binary-searchable table in `.ss_unwind`. Frame pointers are kept on all targets by default.
+- **VectraOS:** Compact Unwind Descriptors (CUD, [07](07-debugging-and-sdi.md) §5.5) are the canonical unwind format. The linker sorts CUD records by address into a binary-searchable table in `.ss_unwind`. Frame pointers are kept on all targets by default.
 - **Linux and FreeBSD, and foreign objects on any ELF target:** `.eh_frame` sections are concatenated, CIEs are deduplicated, and `.eh_frame_hdr` is emitted (sorted FDE table, `PT_GNU_EH_FRAME`).
 - **macOS:** `__LD,__compact_unwind` inputs are turned into `__TEXT,__unwind_info`, with `__eh_frame` as the fallback ([04](04-backend.md) §4.11).
-- On Todhchai, functions that come only with FDEs (foreign C or assembly) are covered through `.eh_frame_hdr`, and the unwinder consults CUD first and FDEs second.
+- On VectraOS, functions that come only with FDEs (foreign C or assembly) are covered through `.eh_frame_hdr`, and the unwinder consults CUD first and FDEs second.
 - Swift errors do not use unwinding (they use the `swifterror` register convention). Unwind tables exist for backtraces, debuggers, profilers, and foreign code.
 
 ### 5.7 Debug information
@@ -213,7 +213,7 @@ When the driver compiles and links in one invocation ([15](15-driver-and-diagnos
 
 Only the local-exec and initial-exec models are produced in v1. The linker computes thread-pointer offsets as follows:
 
-- **x86-64 (variant II).** `%fs` points to the TCB, which follows the TLS block. A symbol's offset is `sym_offset_in_tls − align_up(tls_memsz, tls_align)`, which is negative. Todhchai uses this layout for its static TLS image.
+- **x86-64 (variant II).** `%fs` points to the TCB, which follows the TLS block. A symbol's offset is `sym_offset_in_tls − align_up(tls_memsz, tls_align)`, which is negative. VectraOS user threads set `%fs` through the kernel (`object_set_property` `REGISTER_FS`; the kernel leaves `CR4.FSGSBASE` off), and save `TPIDR_EL0` and `tp` per thread on AArch64 and RV64; its user runtime has no ELF TLS image yet (planned with pthreads in its userland).
 - **AArch64 (variant I).** `TPIDR_EL0` points to a 16-byte TCB, and the TLS block starts at `align_up(16, tls_align)`.
 - **RISC-V (variant I).** `tp` (`x4`) points directly at the start of the TLS block (TCB size 0 as seen from TLS offsets).
 
@@ -223,7 +223,11 @@ Only the local-exec and initial-exec models are produced in v1. The linker compu
 
 Targets are brought up in this order. Each stage is gated on the differential tests in [09](09-roadmap.md).
 
-1. **Todhchai static ELF64** (`ET_EXEC`). Fixed base `0x1000000`, 4 KiB pages, separate `PT_LOAD` segments `R-X` (text), `R--` (rodata, eh_frame_hdr), and `RW-` (data, bss). `PT_TLS`; `PT_GNU_STACK` (`RW-`); `PT_GNU_EH_FRAME`. The 256 KiB default stack is a loader contract; whether the linker should record a per-image stack size (for example in a `.note.todhchai.stack` note) is an open question (§11). No load-time relocations.
+1. **VectraOS static ELF64**, as VectraOS's CMake build links it today with `ld.lld`:
+   - User programs: `ET_EXEC` at `--image-base=0x1000000`, or a static PIE (`-static -pie --no-dynamic-linker -ztext`, linked at 0) that the loaders place at a random base, applying only `R_*_RELATIVE` relocations and then making `PT_GNU_RELRO` read-only. An `ET_EXEC` may carry a relocation-free dynamic section (`--export-dynamic`) as a symbol table for programs that will host loaded code.
+   - 4 KiB pages (`-zmax-page-size=4096`), page-aligned separate `PT_LOAD` segments `R-X` (text), `R--` (rodata, eh_frame_hdr) and `RW-` (data, bss) (`-zseparate-loadable-segments`), `PT_GNU_STACK` (`RW-`, `-znoexecstack`) whose size is the main-thread stack (`-zstack-size`, 256 KiB by default), `--gc-sections` with `-ffunction-sections`/`-fdata-sections`, and a SHA-1 `--build-id`. `PT_TLS` and `PT_GNU_EH_FRAME` when present.
+   - The kernel: a static PIE linked at `0xffffffff80000000` with its own linker script and `--orphan-handling=error`, placed at a random base by the UEFI loader (KASLR). The loader itself: a static PIE that `vx elf2efi` converts to PE32+.
+   - VectraOS's loaders read the stack size from `PT_GNU_STACK`, which settles §11 question 2 for this target.
 2. **Linux ELF64.**
    - Static: `ET_EXEC` or static-PIE.
    - Dynamic: `ET_DYN` (PIE) with `PT_INTERP` (`/lib64/ld-linux-x86-64.so.2`, `/lib/ld-linux-aarch64.so.1`, `/lib/ld-linux-riscv64-lp64d.so.1`), `PT_DYNAMIC`, `DT_NEEDED`, `DT_RELA`/`DT_JMPREL`, `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT` relocations, `.dynsym`/`.dynstr`, `DT_GNU_HASH`, and a PLT/GOT.
@@ -241,7 +245,7 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md); the
 
 | Metric | Target | Notes |
 |---|---|---|
-| Link a Todhchai system service (static, in-memory inputs) | < 50 ms | 8 cores; compare against `ld.lld` and `mold` on identical inputs |
+| Link a VectraOS system service (static, in-memory inputs) | < 50 ms | 8 cores; compare against `ld.lld` and `mold` on identical inputs |
 | SDI merge for a 100K-LOC program | < 5 ms | fragments precomputed at compile time |
 | 1-thread vs. N-thread output | bitwise identical | CI gate, not a performance target |
 
@@ -254,12 +258,12 @@ These are hypotheses to be measured per [14](14-measurement-methodology.md); the
 
 ## 11. Open questions
 
-1. **ASLR on Todhchai.** Fixed-address `ET_EXEC` at `0x1000000` means no address-space randomization for native executables. This is a deliberate trade-off (no load-time relocations, simpler loader) that weakens exploit mitigation. Should Todhchai move to static-PIE with a small `RELATIVE` table once the loader supports it?
-2. Where does the per-image stack size live: a note section, a loader default, or a program header?
+1. ~~ASLR on the primary target?~~ Resolved by VectraOS: its loaders already place static PIEs at random bases (and the kernel itself with KASLR), while `ET_EXEC` images still load where linked. The linker produces both, with a `RELATIVE`-only table for PIEs.
+2. Where does the per-image stack size live: a note section, a loader default, or a program header? VectraOS uses `PT_GNU_STACK`'s size; the question remains for the hosts.
 3. Should `--ss-type-mismatch` default to `warn` for C-only links until the hash canonicalization has been validated against a large C corpus?
-4. Minimal RISC-V `R_RISCV_ALIGN` handling versus rejecting such objects: what do the Todhchai foreign libraries actually contain?
-5. Should shared-library output be in scope for v2 (needed for Todhchai hot-reload of `CodeModule`s, [07](07-debugging-and-sdi.md) §5.11)?
+4. Minimal RISC-V `R_RISCV_ALIGN` handling versus rejecting such objects: VectraOS's rv64 assembly, assembled as its build does (relaxation on), contains `R_RISCV_ALIGN` and `R_RISCV_RELAX` in every file with code alignment or relaxable instructions, so v1's NOP deletion is required, not optional. Which other relocations do its C objects carry?
+5. Should shared-library output be in scope for v2 (needed for hot reload of code modules, [07](07-debugging-and-sdi.md) §5.11)? VectraOS has no dynamic linker yet; its decision comes first.
 6. **Patchable code modules ahead of macOS.** Should relocatable, patchable code modules, which enable live code editing, move ahead of macOS Mach-O output in the roadmap ([09](09-roadmap.md))?
-   - **What they are:** a code image the Todhchai loader can map, relocate and swap while the process runs. This is Handmade Hero-style hot reload and serves Todhchai principle 17.
+   - **What they are:** a code image a VectraOS loader could map, relocate and swap while the process runs. This is Handmade Hero-style hot reload and serves VectraOS principle 23 ("debugging and hot reload are OS services"). VectraOS has no such loader yet.
    - **Why now:** function-level incremental compilation ([13](13-modules-and-incremental-builds.md)) plus such modules would give edit-and-continue in seconds, which arguably matters more to day-to-day development than a fourth host format.
    - **Overlap with question 5:** shared-library output is the conventional route to the same capability.

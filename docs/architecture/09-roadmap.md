@@ -19,7 +19,7 @@ An earlier draft scheduled everything through self-hosting in 25 weeks. That sch
 
 - Every milestone ends in something that runs and is tested end-to-end.
 - Each milestone has objective exit criteria.
-- Target platforms come up in a fixed order: Todhchai static ELF → Linux → FreeBSD → macOS.
+- Target platforms come up in a fixed order: VectraOS static ELF → Linux → FreeBSD → macOS.
 
 ## 3. Non-goals
 
@@ -87,7 +87,7 @@ Each milestone lists its deliverables and its **exit criteria**. A milestone is 
   - `SourceManager`;
   - Swift and C lexers, with inner loops marked `@_noAllocation` (Principle 8);
   - the built-in profiler and repetition tester ([14](14-measurement-methodology.md));
-  - `ss-census`, a feature-census tool that counts Swift features, attributes and flags used in a source tree, ranks the unsupported ones by use count, and runs in CI over the pinned Todhchai snapshot. It keeps [02](02-semantic-analysis.md) §4.3.5 current and orders work in M4 and M6 by real use;
+  - `ss-census`, a feature-census tool that counts Swift features, attributes and flags used in a source tree, ranks the unsupported ones by use count, and runs in CI over a pinned VectraOS snapshot. It keeps [02](02-semantic-analysis.md) §4.3.5 current and orders work in M4 and M6 by real use;
   - benchmark harness and reference-machine setup ([14](14-measurement-methodology.md));
   - baseline numbers for `swiftc`, Clang and lld on the corpora;
   - `--dump`, `--stats` and `--time-phases` plumbing ([15](15-driver-and-diagnostics.md)).
@@ -118,7 +118,7 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
   - C semantic analysis and SemIR ([02](02-semantic-analysis.md), [10](10-semantic-ir-and-name-resolution.md));
   - diagnostics engine.
 - **Exit:**
-  - SQLite, Lua and Todhchai C sources parse and type-check;
+  - SQLite, Lua and VectraOS C sources parse and type-check; VectraOS's 12 C files and each of its headers are checked for each of its three architectures, freestanding, with its build's include paths and definitions;
   - glibc and FreeBSD libc headers parse;
   - the c-testsuite accept/reject set matches Clang.
 
@@ -129,7 +129,7 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
   - `Object` with ELF relocatable read/write;
   - AT&T-syntax x86-64 assembler, AArch64 and RV64 assemblers, `.S` preprocessing ([05](05-assembler.md)).
 - **Exit:**
-  - the Todhchai assembly stubs assemble byte-identically to LLVM MC (clang's integrated assembler), the reference assembler; differences from GNU `as` are documented, not matched ([05](05-assembler.md) §4.11);
+  - all 26 VectraOS assembly files, assembled for each architecture with its build's definitions, include paths and ISA flags (RV64 with linker relaxation), assemble byte-identically to LLVM MC (clang's integrated assembler), the reference assembler; differences from GNU `as` are documented, not matched ([05](05-assembler.md) §4.11);
   - encoder/disassembler round-trip is exhaustive over the instruction tables.
 
 ### M3 — C end-to-end at `-O0` (x86-64)
@@ -137,13 +137,13 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
 - **Deliverables:**
   - C lowering to AIR ([03](03-intermediate-representation.md));
   - LIR, SSA linear-scan register allocation, x86-64 code generation ([04](04-backend.md));
-  - linker for Todhchai static ELF and Linux static/dynamic ELF ([06](06-linker.md));
+  - linker for VectraOS static ELF (`ET_EXEC` and static PIE) and Linux static/dynamic ELF ([06](06-linker.md));
   - CUD and `.eh_frame`;
   - minimal SDI plus an `ssdb` symbolizer ([07](07-debugging-and-sdi.md)).
   - `--record`/`--replay` compile bundles ([15](15-driver-and-diagnostics.md)), so every M3 bug report and fuzzer find is one reproducible file.
 - **Exit:**
   - c-testsuite and SQLite's test suite pass on Linux x86-64 via differential execution against Clang;
-  - a C program built by Swift-Stack runs on Todhchai;
+  - a C program built by Swift-Stack, linked against VectraOS's user runtime, runs on VectraOS in QEMU;
   - `ssdb` symbolizes a crash backtrace.
 
 ### M4 — Tier 0 Swift
@@ -152,10 +152,11 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
   - Swift parser;
   - name resolution and operator folding ([10](10-semantic-ir-and-name-resolution.md));
   - type checker with D5 parity on the Tier 0 subset;
-  - Swift macros: the plugin host, all attached roles Todhchai uses (`member` with `names: arbitrary`, `peer`, `memberAttribute`, `extension`), freestanding expression macros, and built-in macros ([16](16-macros.md)). Plugins are built by the host `swiftc`;
+  - Swift macros: the plugin host, all attached roles VectraOS's macros use (`member` with `names: arbitrary`, `peer`, `memberAttribute`, `extension`; [16](16-macros.md) §2), freestanding expression macros, and built-in macros ([16](16-macros.md)). Plugins are built by the host `swiftc`;
   - ownership and borrow checking in AIR, and `@_noAllocation`/`@_noLocks` checking ([03](03-intermediate-representation.md) §4.3);
-  - the Todhchai feature profile ([02](02-semantic-analysis.md) §4.3.5):
-    - `@c`/`@c(name)` and `@_extern(c)`;
+  - the VectraOS feature profile ([02](02-semantic-analysis.md) §4.3.5):
+    - `@c`/`@c(name)`, `@c @implementation` and `@_extern(c)`;
+    - typed throws, `~Copyable`, `Synchronization`'s `Atomic`;
     - strict memory safety, with diagnostic groups;
     - `~Escapable`, `@_lifetime` and lifetime-dependence checking;
     - value generics (`InlineArray`), `Span`/`MutableSpan`;
@@ -165,12 +166,12 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
   - Embedded stdlib compiled from upstream sources, pinned to Swift 6.4 ([12](12-standard-library-strategy.md));
   - Tier 0 runtime ([08](08-runtime-and-stdlib.md)).
 - **Exit:**
-  - Todhchai's Tier 0 components (`userboot`, `devmgr`, `fs`) behave identically to builds made with `swiftc -enable-experimental-feature Embedded`;
+  - VectraOS's Tier 0 images (the kernel, the UEFI loader, `userboot` and its Embedded Swift test programs) built by Swift-Stack pass VectraOS's boot tests (`vx test`, QEMU, all three architectures), as its `swiftc` builds do;
   - the type-checker accept/reject differential suite matches `swiftc` on the Tier 0 corpus;
-  - every `@IPCLibrary` and `@AudioRenderer` expansion in the Todhchai corpus is textually identical to `swiftc`'s, using the same plugins;
+  - every `@IPCLibrary` and `@AudioRenderer` expansion in VectraOS is textually identical to `swiftc`'s, using the same plugins. This waits for VectraOS to lift them (its roadmap V2 and V6);
   - a deliberately allocating `@AudioRenderer` `render` method is rejected, as with `swiftc`;
-  - Todhchai's Tier 0 targets build with their exact CMake flag set (`-enable-experimental-feature Embedded`/`Lifetimes`/`Extern`/`Volatile`, `-strict-memory-safety`, `-Werror StrictMemorySafety`, `-no-allocations`, `-Osize`, `-wmo`, `-parse-as-library`), using Swift-Stack's `swiftc` personality ([15](15-driver-and-diagnostics.md));
-  - Todhchai's Swift libc (`@c(memcpy)` and friends) does not compile into self-calls ([17](17-simd-and-vectorization.md) §5.5).
+  - VectraOS's targets build with their exact CMake flag set (`-enable-experimental-feature Embedded`/`Lifetimes`, `-parse-as-library`, `-strict-memory-safety`, `-Werror StrictMemorySafety`, `-Werror EmbeddedRestrictions`, `-Wwarning PerformanceHints`, `-enforce-exclusivity=unchecked`, `-Xfrontend -function-sections`, `-Osize`, whole-module, and `-Xcc` arch flags), using Swift-Stack's `swiftc` personality ([15](15-driver-and-diagnostics.md));
+  - a Swift-implemented libc (`@c(memcpy)` and friends, as VectraOS's userland will carry from V2) does not compile into self-calls ([17](17-simd-and-vectorization.md) §5.5).
 
 ### M5 — Optimizer and remaining backends
 
@@ -181,7 +182,7 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
   - Linux AArch64 and RV64 targets.
 - **Exit:**
   - B9 measured per category on x86-64 and AArch64 ([14](14-measurement-methodology.md) §7), including the portable-SIMD category;
-  - Todhchai's `SIMDn` codec kernels (inflate, Adler-32, JPEG, PNG, color conversion) produce identical output on all three architectures, and also with their `arch` guards removed;
+  - `SIMDn` codec kernels (inflate, Adler-32, JPEG, PNG, color conversion) produce identical output on all three architectures, and also with their `arch` guards removed. VectraOS carries these from its roadmap V6; until then this criterion waits on [14](14-measurement-methodology.md) §11, open question 4;
   - the parity hypothesis confirmed, or the gap documented per category with a decision recorded in [00](00-overview-and-principles.md).
 
 ### M6 — Tier 1 Swift
@@ -190,13 +191,13 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
   - runtime metadata, witness tables, existentials, dynamic casts ([11](11-generics-and-runtime-metadata.md));
   - Tier 1 runtime;
   - full upstream stdlib and FoundationEssentials, including the `FoundationMacros` plugin and the stdlib's own macro plugins ([12](12-standard-library-strategy.md) §8);
-  - swift-testing (library as an input, `TestingMacros` plugin, runtime test discovery), so that Todhchai's test suites build;
+  - swift-testing (library as an input, `TestingMacros` plugin, runtime test discovery), so that VectraOS's host test suites build;
   - Swift-Stack able to build swift-syntax-based plugin executables itself;
   - `.ssmodule` files and incremental builds ([13](13-modules-and-incremental-builds.md));
   - FreeBSD target.
 - **Exit:**
   - the upstream stdlib's executable tests pass;
-  - Todhchai's swift-testing suites build and pass;
+  - VectraOS's swift-testing suites (the host tests of `vx`'s bench and image libraries) build and pass;
   - B10 measured;
   - separate compilation across modules works through `.ssmodule`.
 
@@ -204,12 +205,12 @@ The slice is deliberately throwaway where needed. Its purpose is to replace gues
 
 - **Deliverables:**
   - async lowering;
-  - executor backends (croi port, `kqueue`, `epoll`) ([08](08-runtime-and-stdlib.md));
+  - executor backends (VectraOS port, `kqueue`, `epoll`) ([08](08-runtime-and-stdlib.md));
   - Swift 6 strict-concurrency checking ([02](02-semantic-analysis.md));
   - the macOS target (Mach-O, chained fixups, ad-hoc signing).
 - **Exit:**
   - concurrency differential tests pass on all hosts;
-  - Todhchai shell components (Tracker, Deskbar, Terminal) build and run.
+  - VectraOS's desktop components (Tracker, Deskbar, the terminal; its roadmap V6) build and run, or, if VectraOS has not reached V6, a Tier 1 async program runs on VectraOS with the port backend.
 
 ### M8 — Self-hosting
 
@@ -274,6 +275,6 @@ See [14](14-measurement-methodology.md) §9.
 ## 7. Open questions
 
 1. Should the macOS target move earlier, since it's a common developer host? Swift-Stack can run on macOS (built by `swiftc`) long before it can *target* macOS.
-2. Is Linux the right first host target, or should FreeBSD come first to match Todhchai's developer environment?
-3. Which Todhchai components define the M4 corpus beyond `userboot`, `devmgr` and `fs`? `ss-census` output can guide this.
-4. Should relocatable, patchable code modules (live code editing, Todhchai principle 17) come before macOS Mach-O output in M7? Function-level incremental compilation ([13](13-modules-and-incremental-builds.md)) plus patchable modules would give edit-and-continue in seconds ([06](06-linker.md) open questions).
+2. ~~Is Linux the right first host target?~~ Yes for now: VectraOS is developed on Linux (its toolchain is a swiftly-installed Swift on Linux, with QEMU and edk2).
+3. Which VectraOS components define the M4 corpus beyond the kernel, the loader and `userboot`, as its userland (roadmap V2) arrives? `ss-census` output can guide this.
+4. Should relocatable, patchable code modules (live code editing, VectraOS principle 23) come before macOS Mach-O output in M7? Function-level incremental compilation ([13](13-modules-and-incremental-builds.md)) plus patchable modules would give edit-and-continue in seconds ([06](06-linker.md) open questions).

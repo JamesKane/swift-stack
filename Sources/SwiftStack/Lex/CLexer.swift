@@ -586,7 +586,12 @@ public struct CLexer: ~Copyable {
             if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x69 && ptr[3] == 0x6E && ptr[4] == 0x6C && ptr[5] == 0x69 && ptr[6] == 0x6E && ptr[7] == 0x65 { return 26 } // __inline
             if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x73 && ptr[3] == 0x69 && ptr[4] == 0x67 && ptr[5] == 0x6E && ptr[6] == 0x65 && ptr[7] == 0x64 { return 33 } // __signed
             if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x74 && ptr[3] == 0x79 && ptr[4] == 0x70 && ptr[5] == 0x65 && ptr[6] == 0x6F && ptr[7] == 0x66 { return 54 } // __typeof
+            // Clang's nullability qualifiers (`_Nonnull`, `_Nullable`, `_Nullable_result`, `_Null_unspecified`) are
+            // pointer type sugar with no effect on C semantics, so they parse as a pointer qualifier like
+            // `__restrict` (VectraOS's kernel headers annotate every pointer for Swift's importer).
+            if ptr[0] == 0x5F && ptr[1] == 0x4E && ptr[2] == 0x6F && ptr[3] == 0x6E && ptr[4] == 0x6E && ptr[5] == 0x75 && ptr[6] == 0x6C && ptr[7] == 0x6C { return 30 } // _Nonnull
         case 9:
+            if ptr[0] == 0x5F && ptr[1] == 0x4E && ptr[2] == 0x75 && ptr[3] == 0x6C && ptr[4] == 0x6C && ptr[5] == 0x61 && ptr[6] == 0x62 && ptr[7] == 0x6C && ptr[8] == 0x65 { return 30 } // _Nullable
             if ptr[0] == 0x63 && ptr[1] == 0x6F && ptr[2] == 0x6E && ptr[3] == 0x73 && ptr[4] == 0x74 && ptr[5] == 0x65 && ptr[6] == 0x78 && ptr[7] == 0x70 && ptr[8] == 0x72 { return 48 } // constexpr
             if ptr[0] == 0x5F && ptr[1] == 0x5F && ptr[2] == 0x63 && ptr[3] == 0x6F && ptr[4] == 0x6E && ptr[5] == 0x73 && ptr[6] == 0x74 && ptr[7] == 0x5F && ptr[8] == 0x5F { return 14 } // __const__
         case 10:
@@ -619,6 +624,17 @@ public struct CLexer: ~Copyable {
             if ptr[0] == 0x5F && ptr[1] == 0x53 && ptr[2] == 0x74 && ptr[3] == 0x61 && ptr[4] == 0x74 && ptr[5] == 0x69 && ptr[6] == 0x63 &&
                ptr[7] == 0x5F && ptr[8] == 0x61 && ptr[9] == 0x73 && ptr[10] == 0x73 && ptr[11] == 0x65 && ptr[12] == 0x72 && ptr[13] == 0x74 {
                 return 52 // _Static_assert
+            }
+        case 16:
+            if ptr[0] == 0x5F && ptr[1] == 0x4E && ptr[2] == 0x75 && ptr[3] == 0x6C && ptr[4] == 0x6C && ptr[5] == 0x61 && ptr[6] == 0x62 && ptr[7] == 0x6C &&
+               ptr[8] == 0x65 && ptr[9] == 0x5F && ptr[10] == 0x72 && ptr[11] == 0x65 && ptr[12] == 0x73 && ptr[13] == 0x75 && ptr[14] == 0x6C && ptr[15] == 0x74 {
+                return 30 // _Nullable_result
+            }
+        case 17:
+            if ptr[0] == 0x5F && ptr[1] == 0x4E && ptr[2] == 0x75 && ptr[3] == 0x6C && ptr[4] == 0x6C && ptr[5] == 0x5F && ptr[6] == 0x75 && ptr[7] == 0x6E &&
+               ptr[8] == 0x73 && ptr[9] == 0x70 && ptr[10] == 0x65 && ptr[11] == 0x63 && ptr[12] == 0x69 && ptr[13] == 0x66 && ptr[14] == 0x69 && ptr[15] == 0x65 &&
+               ptr[16] == 0x64 {
+                return 30 // _Null_unspecified
             }
         default:
             break

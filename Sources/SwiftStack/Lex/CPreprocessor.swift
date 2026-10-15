@@ -266,6 +266,13 @@ public final class CPreprocessor {
         defineMacro("__UINT_FAST32_TYPE__", replacement: "unsigned long")
         defineMacro("__UINT_FAST64_TYPE__", replacement: "unsigned long")
 
+        // Integer constant macros (LP64), which Clang's freestanding <stdint.h> builds `INTn_C`/`UINTn_C` from
+        for (name, suffix) in [("INT8", ""), ("INT16", ""), ("INT32", ""), ("INT64", "L"), ("INTMAX", "L"),
+                               ("UINT8", ""), ("UINT16", ""), ("UINT32", "U"), ("UINT64", "UL"), ("UINTMAX", "UL")] {
+            defineMacro("__\(name)_C_SUFFIX__", replacement: suffix)
+            defineFunctionMacro("__\(name)_C", parameters: ["c"], replacement: suffix.isEmpty ? "c" : "c##\(suffix)")
+        }
+
         // Floating point limits (<float.h>) and IEC 60559 extensions
         defineMacro("__STDC_WANT_IEC_60559_TYPES_EXT__", replacement: "1")
         defineMacro("__FLT_RADIX__", replacement: "2")
@@ -322,6 +329,13 @@ public final class CPreprocessor {
         let dummyFileId = sourceManager.addBuffer(bytes: Array(replacement.utf8), path: "<predefined>")
         let tokens = lexFileToPPTokens(dummyFileId)
         macros[name] = PPMacro(name: name, isFunctionLike: false, replacementTokens: tokens, location: .zero)
+    }
+
+    /// Helper to define a function-like macro (`name(parameters) replacement`).
+    public func defineFunctionMacro(_ name: String, parameters: [String], replacement: String) {
+        let dummyFileId = sourceManager.addBuffer(bytes: Array(replacement.utf8), path: "<predefined>")
+        let tokens = lexFileToPPTokens(dummyFileId)
+        macros[name] = PPMacro(name: name, isFunctionLike: true, parameters: parameters, replacementTokens: tokens, location: .zero)
     }
 
     /// Undefines a macro.
@@ -447,13 +461,19 @@ public final class CPreprocessor {
                 // Check for macro expansion
                 if isIdentifierOrKeyword(tok.kind), macros[tok.spelling] != nil {
                     var expanded: [PPToken] = []
-                    cursor = expandMacro(
-                        macroName: tok.spelling,
-                        tokens: input,
-                        index: cursor,
-                        disabled: [],
-                        into: &expanded
-                    )
+                    if macros[tok.spelling]?.isFunctionLike == true,
+                       let gathered = invocationWithDirectives(input, at: cursor, currentFilePath: currentFilePath, condStack: &condStack, output: &output) {
+                        _ = expandMacro(macroName: tok.spelling, tokens: gathered.tokens, index: 0, disabled: [], into: &expanded)
+                        cursor = gathered.end
+                    } else {
+                        cursor = expandMacro(
+                            macroName: tok.spelling,
+                            tokens: input,
+                            index: cursor,
+                            disabled: [],
+                            into: &expanded
+                        )
+                    }
                     // Macro expansion tokens might themselves contain macros to expand
                     var disabledSet: Set<String> = [tok.spelling]
                     var fullyExpanded: [PPToken] = []
@@ -495,6 +515,59 @@ public final class CPreprocessor {
 
             cursor += 1
         }
+    }
+
+    /// A function-like macro invocation at `start` whose arguments contain directive lines (`#if` inside the
+    /// arguments of VectraOS usertest.c's `CHECK(...)`): undefined in ISO C, but GCC and Clang process the
+    /// directives as they are reached. Returns the invocation with the directives applied and the tokens of
+    /// inactive branches dropped, and the index after it; nil if the arguments contain no directive.
+    private func invocationWithDirectives(
+        _ input: [PPToken],
+        at start: Int,
+        currentFilePath: String,
+        condStack: inout [CondBranch],
+        output: inout [PPToken]
+    ) -> (tokens: [PPToken], end: Int)? {
+        guard start + 1 < input.count, input[start + 1].kind == .lParen else { return nil }
+        func isDirectiveStart(_ i: Int) -> Bool { input[i].kind == .hash && input[i].isLeadingNewline }
+        func skipLine(_ i: inout Int) {
+            i += 1
+            while i < input.count && !input[i].isLeadingNewline { i += 1 }
+        }
+        var i = start + 2
+        var depth = 1
+        var sawDirective = false
+        while i < input.count && depth > 0 {
+            if isDirectiveStart(i) {
+                sawDirective = true
+                skipLine(&i)
+                continue
+            }
+            if input[i].kind == .lParen { depth += 1 } else if input[i].kind == .rParen { depth -= 1 }
+            i += 1
+        }
+        guard sawDirective else { return nil }
+        var tokens = [input[start], input[start + 1]]
+        i = start + 2
+        depth = 1
+        while i < input.count && depth > 0 {
+            if isDirectiveStart(i) {
+                var directive: [PPToken] = []
+                i += 1
+                while i < input.count && !input[i].isLeadingNewline {
+                    directive.append(input[i])
+                    i += 1
+                }
+                handleDirective(directive, currentFilePath: currentFilePath, condStack: &condStack, into: &output)
+                continue
+            }
+            if condStack.allSatisfy({ $0.isBranchActive }) {
+                if input[i].kind == .lParen { depth += 1 } else if input[i].kind == .rParen { depth -= 1 }
+                tokens.append(input[i])
+            }
+            i += 1
+        }
+        return (tokens, i)
     }
 
     private func isIdentifierOrKeyword(_ kind: CTokenKind) -> Bool {

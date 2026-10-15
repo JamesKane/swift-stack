@@ -27,7 +27,7 @@ public final class FeatureCensus {
     }
 
     private func registerKnownFeatures() {
-        // Known Todhchai & Swift 6.x features from 02-semantic-analysis.md §4.3.5
+        // Known VectraOS & Swift 6.x features from 02-semantic-analysis.md §4.3.5
         register(name: "@c", category: "Attribute", isSupported: true, milestone: "M4")
         register(name: "@_extern", category: "Attribute", isSupported: true, milestone: "M4")
         register(name: "@_silgen_name", category: "Attribute", isSupported: true, milestone: "M4")

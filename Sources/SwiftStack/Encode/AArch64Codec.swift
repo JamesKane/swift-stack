@@ -574,7 +574,7 @@ public enum A64SysMaintKind: UInt8, Equatable, Hashable, Sendable, BitwiseCopyab
 }
 
 /// System maintenance operation for `tlbi`, `ic`, `dc`, and `at` (the base-architecture operations
-/// plus the EL2 ones Todhchai and Croi use; feature-gated `OS`/range/MTE variants are not included).
+/// plus the EL2 ones VectraOS's arm64 kernel uses; feature-gated `OS`/range/MTE variants are not included).
 @frozen
 public enum A64SysMaintOp: UInt8, Equatable, Hashable, Sendable, BitwiseCopyable, CaseIterable {
     // TLBI
@@ -733,7 +733,7 @@ public struct A64SysReg: Equatable, Hashable, Sendable, BitwiseCopyable {
         self.op2 = UInt8(encoded15Bit & 0x7)
     }
 
-    /// Named system register table covering Todhchai and Croi (verified against Arm ARM / llvm-mc).
+    /// Named system register table covering VectraOS's arm64 loader and kernel (verified against Arm ARM / llvm-mc).
     public static let namedTable: [(name: String, reg: A64SysReg)] = {
         var list: [(name: String, reg: A64SysReg)] = [
             ("tpidr_el0",        A64SysReg(op0: 3, op1: 3, crn: 13, crm: 0,  op2: 2)),
@@ -1205,7 +1205,7 @@ public enum A64InstrFormat: UInt8, Equatable, Hashable, Sendable, BitwiseCopyabl
     case simdTbl            // tbl, tbx Vd.<8b|16b>, {list .16b}, Vm.<8b|16b>
     case simdExt            // ext v0.<8b|16b>, v1.<8b|16b>, v2.<8b|16b>, #imm4
 
-    // SVE (croi/kernel/arch/arm64/cpu.S subset)
+    // SVE (the VectraOS kernel/arch/arm64/cpu.S subset)
     case sveLdrStrZ         // ldr/str zN, [xBase, #simm9, mul vl]
     case sveLdrStrP         // ldr/str pN, [xBase, #simm9, mul vl]
     case sveAddVlPl         // addvl/addpl xRd, xRn, #simm6
@@ -2185,7 +2185,7 @@ public enum A64InstructionTable {
         A64InstrDesc(id: .simdTbx, mnemonic: "tbx", format: .simdTbl, opcodeMask: 0xBFE0_9C00, opcodeBits: 0x0E00_1000, arrangements: A64Variants.bytes),
         A64InstrDesc(id: .simdExt, mnemonic: "ext", format: .simdExt, opcodeMask: 0xBFE0_8400, opcodeBits: 0x2E00_0000, arrangements: A64Variants.bytes),
 
-        // --- 7. SVE (`croi/kernel/arch/arm64/cpu.S`) ---
+        // --- 7. SVE (VectraOS `kernel/arch/arm64/cpu.S`) ---
         A64InstrDesc(id: .sveLdrZ,  mnemonic: "ldr",   format: .sveLdrStrZ, opcodeMask: 0xFFC0_E000, opcodeBits: 0x8580_4000),
         A64InstrDesc(id: .sveStrZ,  mnemonic: "str",   format: .sveLdrStrZ, opcodeMask: 0xFFC0_E000, opcodeBits: 0xE580_4000),
         A64InstrDesc(id: .sveLdrP,  mnemonic: "ldr",   format: .sveLdrStrP, opcodeMask: 0xFFC0_E010, opcodeBits: 0x8580_0000),

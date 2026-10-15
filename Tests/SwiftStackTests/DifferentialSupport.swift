@@ -364,10 +364,30 @@ enum DifferentialAssembly {
         let clangFlags: [String]
     }
 
-    /// Assembles `path` with Swift-Stack and returns the serialized object plus error diagnostics count.
+    /// The `-DNAME[=VALUE]` flags of `flags` as preprocessor definitions (`VALUE` defaults to `1`, as in clang).
+    static func defines(in flags: [String]) -> [(name: String, value: String)] {
+        flags.filter { $0.hasPrefix("-D") }.map { flag in
+            let def = flag.dropFirst(2)
+            guard let eq = def.firstIndex(of: "=") else { return (String(def), "1") }
+            return (String(def[..<eq]), String(def[def.index(after: eq)...]))
+        }
+    }
+
+    /// The RISC-V assembler state clang's driver derives from `flags`: `-march`, PIC from `-fPIC`/`-fPIE`, and linker
+    /// relaxation, which clang enables unless `-mno-relax` is given.
+    static func riscvOptions(for flags: [String]) -> RVAsmOptions {
+        guard let march = flags.last(where: { $0.hasPrefix("-march=") }) else { return RVAsmOptions() }
+        let pic = flags.contains { ["-fPIC", "-fPIE", "-fpic", "-fpie"].contains($0) }
+        return RVAsmOptions(march: String(march.dropFirst("-march=".count)), pic: pic, relax: !flags.contains("-mno-relax"))
+    }
+
+    /// Assembles `path` with Swift-Stack and returns the serialized object plus error diagnostics count. The
+    /// target's `-D` flags are applied, and for RISC-V its ISA, PIC and relaxation flags, as clang applies them.
     static func assembleOurs(path: String, target: Target, includePaths: [String]) throws -> (elf: TestELF, errors: Int) {
         var diags = DiagnosticBag()
-        let obj = try Assembler.assembleFile(path: path, arch: target.arch, includePaths: includePaths, diagnostics: &diags)
+        let obj = try Assembler.assembleFile(
+            path: path, arch: target.arch, includePaths: includePaths, defines: defines(in: target.clangFlags),
+            riscvOptions: riscvOptions(for: target.clangFlags), diagnostics: &diags)
         let bytes = ELFObjectWriter.write(obj)
         return (try TestELF(bytes: bytes), diags.errorCount)
     }
@@ -383,12 +403,12 @@ enum DifferentialAssembly {
     }
 
     /// x86-64 only: GNU `as` (via `gcc -c`, which runs `cpp` then the host GNU assembler).
-    static func assembleWithGNU(path: String, includePaths: [String]) throws -> TestELF {
+    static func assembleWithGNU(path: String, includePaths: [String], defines: [String] = []) throws -> TestELF {
         guard let gcc = ExternalTool.find("gcc") else { throw TestELF.FormatError(description: "gcc not found") }
         let out = ExternalTool.temporaryPath(".o")
         defer { try? FileManager.default.removeItem(atPath: out) }
         // `-mx86-used-note=no`: Fedora's GNU `as` otherwise adds a `.note.gnu.property` ISA note not present in the source.
-        let r = try ExternalTool.run(gcc, ["-c", path, "-o", out, "-Wa,-mx86-used-note=no"] + includePaths.map { "-I\($0)" })
+        let r = try ExternalTool.run(gcc, ["-c", path, "-o", out, "-Wa,-mx86-used-note=no"] + includePaths.map { "-I\($0)" } + defines)
         guard r.status == 0 else { throw TestELF.FormatError(description: "gcc/as failed on \(path): \(r.stderr)") }
         return try TestELF(path: out)
     }

@@ -7,7 +7,7 @@
 
 ## 1. Summary
 
-Swift macros (SE-0382, SE-0389, SE-0397, SE-0402, SE-0415) are a goal, and **Todhchai OS is the first-party use case**. Its IPC system and audio SDK are built on macros, and they compile as Tier 0 Embedded Swift, so macro support is on the critical path for milestone M4 ([09](09-roadmap.md)).
+Swift macros (SE-0382, SE-0389, SE-0397, SE-0402, SE-0415) are a goal, and **VectraOS is the first-party use case**. Its typed IPC (the Node protocol's `@IPCLibrary` interfaces) and its SDK's real-time audio callbacks are built on macros, and they compile as Tier 0 Embedded Swift, so macro support is on the critical path for milestone M4 ([09](09-roadmap.md)).
 
 Swift-Stack supports macros through the **out-of-process compiler-plugin protocol**. Each macro implementation is a separate plugin executable. The compiler sends it source text and context as JSON over a pipe and receives expanded source text back. Then:
 
@@ -15,24 +15,24 @@ Swift-Stack supports macros through the **out-of-process compiler-plugin protoco
 - the compiler never links swift-syntax;
 - the process boundary means a plugin's ABI doesn't matter, so plugins built by the host `swiftc` work unchanged (D1).
 
-## 2. First-party requirements (Todhchai)
+## 2. First-party requirements (VectraOS)
 
-The following use was surveyed from the Todhchai source tree (pinned swift-syntax `604.0.0`).
+VectraOS has no macro uses in its tree yet: its 171 Swift files are the kernel, the UEFI loader, `userboot`, test programs and host tools. Its roadmap brings the macros in with the components that use them: the IPC system with `@IPCLibrary` and `idlc` in V2 (its decision D3: typed `@IPCLibrary` interfaces generating zero-allocation, Embedded-safe stubs), and the SDK with `@AudioRenderer` in V6. The roles below were surveyed in the macro sources VectraOS lifts (pinned swift-syntax `604.0.0`); they are re-checked against VectraOS's tree when it lifts them.
 
 | Macro | Roles | What it does | Used by |
 |---|---|---|---|
-| `@IPCLibrary(id:version:)` | `@attached(member, names: arbitrary)` | Generates `PClient`, `PHandler`, `PServer`, `PEvent`, `PEventSender` for each protocol `P` in an IPC library enum | `fs`, `node`, `keyring`, `router`, `pty`, `script`, `radharc`, graphics buffers, … |
+| `@IPCLibrary(id:version:)` | `@attached(member, names: arbitrary)` | Generates `PClient`, `PHandler`, `PServer`, `PEvent`, `PEventSender` for each protocol `P` in an IPC library enum | VectraOS's Node protocol services from V2 on: namespaces, launch, the Taisce file system service, router, keyring, the pty service, Radharc, … |
 | `@oneway`, `@event`, `@since(_:)` | `@attached(peer)` (marker: expands to nothing) | Annotations read by `@IPCLibrary` from the attached declaration's syntax | IPC protocol declarations |
-| `@AudioRenderer` | `@attached(memberAttribute)`, `@attached(extension, conformances: AudioRenderer, names: named(_realtimeChecked))` | Adds `@_noAllocation` to `render` methods; adds the `AudioRenderer` conformance | Audio SDK clients |
-| swift-testing `@Test`, `@Suite`, `#expect`, `#require` | attached peer/member, freestanding expression | Test declaration and assertions | ~166 test files |
+| `@AudioRenderer` | `@attached(memberAttribute)`, `@attached(extension, conformances: AudioRenderer, names: named(_realtimeChecked))` | Adds `@_noAllocation` to `render` methods; adds the `AudioRenderer` conformance | SDK audio clients (V6); VectraOS's performance contracts name it as the compile-time contract for real-time callbacks |
+| swift-testing `@Test`, `@Suite`, `#expect`, `#require` | attached peer/member, freestanding expression | Test declaration and assertions | VectraOS's SwiftPM host tests (`BenchTests`, `ImageFormatsTests`); its on-device tests are Embedded Swift suites without macros |
 
-Todhchai's Embedded CMake build passes `-load-plugin-executable <path>#<Module>`, with plugins built by host SwiftPM. Swift-Stack's `swiftc` compatibility personality must accept the same flag ([15](15-driver-and-diagnostics.md) §4.1).
+An Embedded CMake build that uses these macros passes `-load-plugin-executable <path>#<Module>`, with plugins built by host SwiftPM; VectraOS's build drives `swiftc` from CMake in the same way. Swift-Stack's `swiftc` compatibility personality must accept the same flag ([15](15-driver-and-diagnostics.md) §4.1).
 
 `@AudioRenderer` exists only to attach `@_noAllocation`. Its value depends on the compiler enforcing that attribute. That is specified in [03](03-intermediate-representation.md) §4.3 (performance-annotation checking).
 
 ## 3. Goals
 
-- Every macro role: freestanding `expression` and `declaration`, and attached `peer`, `member`, `memberAttribute`, `accessor`, `extension` and `body`. Experimental roles (`codeItem`, `preamble`) are deferred until Todhchai or the stdlib needs them.
+- Every macro role: freestanding `expression` and `declaration`, and attached `peer`, `member`, `memberAttribute`, `accessor`, `extension` and `body`. Experimental roles (`codeItem`, `preamble`) are deferred until VectraOS or the stdlib needs them.
 - Executable plugins via `-load-plugin-executable <path>#<module>` and plugin search paths (`-plugin-path`).
 - **Compatibility:** expanded source text identical to `swiftc`'s for the same plugin and input (differential-tested, §5.9). Name lookup and type-checking behavior around macros MUST match `swiftc` (D5).
 - Macros usable from Tier 0 and Tier 1 code. Expansion happens on the build host and is independent of the target tier.
@@ -114,7 +114,7 @@ The driver owns plugin processes ([15](15-driver-and-diagnostics.md) §4.4):
   - Framing is a length-prefixed JSON message on stdin/stdout.
 - **Concurrency.** One plugin process handles one request at a time. The host keeps a small pool per plugin, up to `min(jobs, 4)` processes by default, started lazily. Requests are dispatched from worker threads, and results are attached to the expansion site, so arrival order never affects output (D6).
 - **Failure handling.** If a plugin crashes, times out (default 30 s, configurable) or sends a malformed reply, the expansion fails with a diagnostic naming the plugin and the macro, and the process is restarted for later requests. A plugin failure never crashes the compiler.
-- **Sandboxing (deferred).** v1 runs plugins **unsandboxed**, as `swiftc` does on Linux: a plugin is trusted build-time code, like any other tool in the build. Per-OS confinement is deferred until a concrete need appears (open question 5). Candidates are Capsicum `cap_enter` on FreeBSD, Landlock plus seccomp on Linux, the system sandbox profile on macOS, and on Todhchai a process holding only its two channel handles.
+- **Sandboxing (deferred).** v1 runs plugins **unsandboxed**, as `swiftc` does on Linux: a plugin is trusted build-time code, like any other tool in the build. Per-OS confinement is deferred until a concrete need appears (open question 5). Candidates are Capsicum `cap_enter` on FreeBSD, Landlock plus seccomp on Linux, the system sandbox profile on macOS, and on VectraOS a process holding only its two channel handles (VectraOS principle 26: capabilities, not ambient authority).
 
 ### 5.6 Built-in macros
 
@@ -144,24 +144,24 @@ When `#fileID`, `#line` and the others are used as default arguments, they expan
 
 ### 5.9 Testing
 
-- **Differential expansion.** For each macro use in the Todhchai corpus and a synthetic per-role suite, the expanded text from Swift-Stack must equal the text from `swiftc -Xfrontend -dump-macro-expansions` with the same plugin (exact flag to be verified). After that, the usual execution differential applies ([09](09-roadmap.md) §6).
+- **Differential expansion.** For each macro use in the VectraOS corpus (once it carries macros) and a synthetic per-role suite, the expanded text from Swift-Stack must equal the text from `swiftc -Xfrontend -dump-macro-expansions` with the same plugin (exact flag to be verified). After that, the usual execution differential applies ([09](09-roadmap.md) §6).
 - **Protocol conformance.** A fake plugin produces scripted replies, including malformed ones, crashes and timeouts, to exercise the host's error paths.
 - **Name-lookup ordering tests:** `arbitrary` names, `named` names, macros on extensions, nested expansions, and cycles.
-- **Plugin unit tests** (e.g. Todhchai's `SwiftSyntaxMacrosGenericTestSupport` suites) test the plugins, not the compiler. They are run, but they are not evidence of compiler correctness.
+- **Plugin unit tests** (e.g. `SwiftSyntaxMacrosGenericTestSupport` suites shipped with the plugins) test the plugins, not the compiler. They are run, but they are not evidence of compiler correctness.
 
 ## 6. Alternatives considered
 
 | Alternative | Why not |
 |---|---|
-| Make macros a non-goal (earlier draft of D4) | Todhchai's IPC and audio SDK depend on them; without macros, M4 can't compile `fs`. |
+| Make macros a non-goal (earlier draft of D4) | VectraOS's IPC and SDK depend on them; without macros, Swift-Stack couldn't build VectraOS's services once its userland lands (V2). |
 | Natively reimplement each needed macro | Doesn't scale to user macros, duplicates plugin logic, and diverges from the plugins' real behavior. |
 | Reimplement swift-syntax's API inside the compiler and run plugins in-process | Needs `swiftc` ABI compatibility or a Swift-Stack-built swift-syntax. Large, and it couples the compiler's memory model to swift-syntax's object graph. |
-| In-process library plugins | Same ABI problem (D1). Executable plugins are what SwiftPM and Todhchai's CMake already use. |
+| In-process library plugins | Same ABI problem (D1). Executable plugins are what SwiftPM and `swiftc`-driving CMake builds already use. |
 
 ## 7. Open questions
 
 1. Does the plugin protocol's lexical-context field need full declaration text for every enclosing context? This affects request size for deeply nested `@IPCLibrary` enums. Measure under [14](14-measurement-methodology.md) B12.
-2. ~~Should Swift-Stack build Todhchai's plugins itself?~~ Resolved: yes, from M6 ([09](09-roadmap.md) M6 deliverables). Until then the host `swiftc` builds them.
+2. ~~Should Swift-Stack build VectraOS's plugins itself?~~ Resolved: yes, from M6 ([09](09-roadmap.md) M6 deliverables). Until then the host `swiftc` builds them.
 3. Is a `swiftc`-compatible `-dump-macro-expansions` format worth matching byte-for-byte, or is only the expanded text compared?
-4. How does swift-testing discover tests at runtime on Linux and Todhchai (a section-based record or metadata scanning)? This is needed for running Todhchai's test suites ([12](12-standard-library-strategy.md)).
-5. Should plugins be sandboxed per OS (`--plugin-sandbox`), and if so by default or opt-in? v1 runs them unsandboxed (§5.5). The case for sandboxing grows if Swift-Stack is used on untrusted packages, or if Todhchai-hosted builds want capability confinement by default.
+4. How does swift-testing discover tests at runtime on Linux and VectraOS (a section-based record or metadata scanning)? This is needed for running VectraOS's swift-testing suites ([12](12-standard-library-strategy.md)).
+5. Should plugins be sandboxed per OS (`--plugin-sandbox`), and if so by default or opt-in? v1 runs them unsandboxed (§5.5). The case for sandboxing grows if Swift-Stack is used on untrusted packages, or if builds hosted on VectraOS want capability confinement by default.

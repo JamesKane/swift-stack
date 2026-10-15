@@ -892,7 +892,7 @@ public enum AsmMacroEngine {
                 }
             case UInt8(ascii: ";"):
                 // `;` separates statements on the same line for all three targets (LLVM MC `SeparatorString`)
-                // (e.g. `1: wfe; b 1b` in croi/kernel/arch/arm64/smp.S).
+                // (e.g. `1: wfe; b 1b`).
                 flush()
                 i += 1
                 continue
@@ -2265,6 +2265,7 @@ public enum Assembler {
         arch: AssemblerArch,
         includePaths: [String] = [],
         defines: [(name: String, value: String)] = [],
+        riscvOptions: RVAsmOptions = RVAsmOptions(),
         sourceManager: SourceManager? = nil,
         diagnostics: inout DiagnosticBag
     ) throws -> RelocatableObject {
@@ -2274,10 +2275,10 @@ public enum Assembler {
         sourceMap.register(fileId)
         if path.hasSuffix(".S") {
             let text = preprocess(fileId: fileId, sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines, diagnostics: &diagnostics)
-            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, diagnostics: &diagnostics)
+            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions, diagnostics: &diagnostics)
         }
         let text = String(decoding: sourceMap.bytes(of: fileId), as: UTF8.self)
-        return assembleText(text, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, diagnostics: &diagnostics)
+        return assembleText(text, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions, diagnostics: &diagnostics)
     }
 
     /// Runs the `assembler-with-cpp` preprocessor: target-architecture predefined macros replace the host
@@ -2311,6 +2312,7 @@ public enum Assembler {
         preprocess runPreprocessor: Bool = false,
         includePaths: [String] = [],
         defines: [(name: String, value: String)] = [],
+        riscvOptions: RVAsmOptions = RVAsmOptions(),
         sourceManager: SourceManager? = nil,
         diagnostics: inout DiagnosticBag
     ) -> RelocatableObject {
@@ -2320,9 +2322,9 @@ public enum Assembler {
         sourceMap.register(fileId)
         if runPreprocessor {
             let text = preprocess(fileId: fileId, sourceManager: sm, arch: arch, includePaths: includePaths, defines: defines, diagnostics: &diagnostics)
-            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, diagnostics: &diagnostics)
+            return assembleText(text, physicalFile: nil, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions, diagnostics: &diagnostics)
         }
-        return assembleText(source, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, diagnostics: &diagnostics)
+        return assembleText(source, physicalFile: fileId, arch: arch, sourceMap: sourceMap, includePaths: includePaths, riscvOptions: riscvOptions, diagnostics: &diagnostics)
     }
 
     private static func assembleText(
@@ -2331,6 +2333,7 @@ public enum Assembler {
         arch: AssemblerArch,
         sourceMap: AsmSourceMap,
         includePaths: [String],
+        riscvOptions: RVAsmOptions,
         diagnostics: inout DiagnosticBag
     ) -> RelocatableObject {
         let statements = AsmMacroEngine.expandStatements(
@@ -2342,6 +2345,7 @@ public enum Assembler {
             diagnostics: &diagnostics
         )
         let session = AsmSession(arch: arch, sourceMap: sourceMap, includePaths: includePaths)
+        session.rvOptions = riscvOptions
         session.processStatements(statements, diagnostics: &diagnostics)
         return session.buildRelocatableObject(diagnostics: &diagnostics)
     }
@@ -2637,8 +2641,7 @@ internal final class AsmSession {
                alignBytes > 0 {
                 let fill: UInt8? = (parts.count >= 2) ? AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue.map { UInt8(truncatingIfNeeded: $0) } : nil
                 let maxB: Int = (parts.count >= 3) ? Int(AsmExprEvaluator.evaluate(parts[2], constants: constants)?.constantValue ?? 0) : 0
-                currentSection.fragments.append(.align(alignBytes: Int(alignBytes), fillByte: fill, maxBytes: maxB))
-                currentSection.recordAlignment(alignBytes: Int(alignBytes))
+                appendAlignment(alignBytes: Int(alignBytes), fillByte: fill, maxBytes: maxB)
             }
 
         case ".p2align":
@@ -2649,8 +2652,7 @@ internal final class AsmSession {
                 let alignBytes = 1 << Int(pow2)
                 let fill: UInt8? = (parts.count >= 2 && !parts[1].isEmpty) ? AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue.map { UInt8(truncatingIfNeeded: $0) } : nil
                 let maxB: Int = (parts.count >= 3) ? Int(AsmExprEvaluator.evaluate(parts[2], constants: constants)?.constantValue ?? 0) : 0
-                currentSection.fragments.append(.align(alignBytes: alignBytes, fillByte: fill, maxBytes: maxB))
-                currentSection.recordAlignment(alignBytes: alignBytes)
+                appendAlignment(alignBytes: alignBytes, fillByte: fill, maxBytes: maxB)
             }
 
         case ".align":
@@ -2661,8 +2663,7 @@ internal final class AsmSession {
                 let alignBytes = arch.alignDirectiveIsBytes ? max(1, Int(val)) : (1 << Int(val))
                 let fill: UInt8? = (parts.count >= 2 && !parts[1].isEmpty) ? AsmExprEvaluator.evaluate(parts[1], constants: constants)?.constantValue.map { UInt8(truncatingIfNeeded: $0) } : nil
                 let maxB: Int = (parts.count >= 3) ? Int(AsmExprEvaluator.evaluate(parts[2], constants: constants)?.constantValue ?? 0) : 0
-                currentSection.fragments.append(.align(alignBytes: alignBytes, fillByte: fill, maxBytes: maxB))
-                currentSection.recordAlignment(alignBytes: alignBytes)
+                appendAlignment(alignBytes: alignBytes, fillByte: fill, maxBytes: maxB)
             }
 
         case ".byte", ".1byte":
@@ -2974,6 +2975,56 @@ internal final class AsmSession {
         return (kind, flags, defaultAlignLog2)
     }
 
+    /// Appends an alignment directive. RISC-V code alignment under linker relaxation (no fill value, an executable
+    /// section) is LLVM MC's `shouldInsertExtraNopBytesForCodeAlign`: the worst-case padding, `align` minus the
+    /// smallest instruction, as NOPs plus an `R_RISCV_ALIGN` whose addend is that size, so the linker can trim it
+    /// after relaxing. The padding is emitted even where the offset is already aligned.
+    func appendAlignment(alignBytes: Int, fillByte: UInt8?, maxBytes: Int) {
+        let sec = currentSection
+        sec.recordAlignment(alignBytes: alignBytes)
+        let minNop = rvOptions.rvcEnabled ? 2 : 4
+        if arch == .riscv64 && rvOptions.relaxEnabled && fillByte == nil && sec.flags.contains(.execInstr) && alignBytes > minNop {
+            let pad = alignBytes - minNop
+            var nops: [UInt8] = []
+            appendRISCVNops(&nops, count: pad, rvc: rvOptions.rvcEnabled)
+            sec.emitBytes(nops, fixups: [AsmInstFixup(offsetInInst: 0, kind: .riscv_align, symbol: "", addend: Int64(pad), width: 0)])
+            return
+        }
+        sec.fragments.append(.align(alignBytes: alignBytes, fillByte: fillByte, maxBytes: maxBytes))
+    }
+
+    /// RISC-V NOP padding as LLVM MC writes it (`RISCVAsmBackend::writeNopData`): a zero byte to reach an even
+    /// offset, then one `c.nop` (two zero bytes without C) if the count is 2 mod 4, then 4-byte `nop`s.
+    func appendRISCVNops(_ bytes: inout [UInt8], count: Int, rvc: Bool) {
+        var rem = count
+        if (rem & 1) != 0 {
+            bytes.append(0)
+            rem -= 1
+        }
+        if rem % 4 == 2 {
+            bytes.append(contentsOf: rvc ? [0x01, 0x00] : [0x00, 0x00])
+            rem -= 2
+        }
+        while rem >= 4 {
+            bytes.append(contentsOf: [0x13, 0x00, 0x00, 0x00])
+            rem -= 4
+        }
+    }
+
+    /// Fragment indices of RISC-V linker-relaxation barriers in `sec`: instructions with an `R_RISCV_RELAX` marker
+    /// and relaxed code alignments. A PC-relative difference spanning one cannot be folded at assembly time (LLVM
+    /// MC `attemptToFoldSymbolOffsetDifference`), since the linker may change the distance.
+    func relaxBarriers(_ sec: AsmSectionBuilder) -> [Int] {
+        guard arch == .riscv64 else { return [] }
+        var out: [Int] = []
+        for (i, frag) in sec.fragments.enumerated() {
+            if case .inst(_, let fixups, _) = frag, fixups.contains(where: { $0.kind == .riscv_relax || $0.kind == .riscv_align }) {
+                out.append(i)
+            }
+        }
+        return out
+    }
+
     // MARK: - 9. Fixpoint Layout, Branch Relaxation & `RelocatableObject` Construction (`05-assembler.md` §4.5)
 
     func buildRelocatableObject(diagnostics: inout DiagnosticBag) -> RelocatableObject {
@@ -3084,10 +3135,28 @@ internal final class AsmSession {
         }
         var pendingRelocs: [PendingReloc] = []
 
+        // RISC-V linker relaxation: per section, the barrier fragments and the fragment index of each label.
+        let barriersBySection = sections.map { relaxBarriers($0) }
+        let labelIndexBySection: [[String: Int]] = sections.indices.map { i in
+            guard !barriersBySection[i].isEmpty else { return [:] }
+            var out: [String: Int] = [:]
+            for (fi, frag) in sections[i].fragments.enumerated() {
+                if case .label(let name) = frag { out[name] = fi }
+            }
+            return out
+        }
+        /// True when a RISC-V relaxation barrier lies between fragment positions `a` and `b` of `section`.
+        func spansRelaxBarrier(_ section: Int, _ a: Int?, _ b: Int?) -> Bool {
+            guard let a, let b, !barriersBySection[section].isEmpty else { return false }
+            let lo = min(a, b), hi = max(a, b)
+            return barriersBySection[section].contains { $0 > lo && $0 < hi }
+        }
+
         for secIdx in 0..<sections.count {
             let sec = sections[secIdx]
             let localLabels = sectionSymbolOffsets[secIdx]
             let sHandle = objSectionIndices[secIdx]
+            let labelIndex = labelIndexBySection[secIdx]
 
             if sec.kind.isNobits {
                 obj.setNobitsSectionSize(sHandle, size: UInt32(sectionTotalSizes[secIdx]))
@@ -3097,7 +3166,7 @@ internal final class AsmSession {
             var bytes: [UInt8] = []
             bytes.reserveCapacity(sectionTotalSizes[secIdx])
 
-            for frag in sec.fragments {
+            for (fragIndex, frag) in sec.fragments.enumerated() {
                 let fragOffset = bytes.count
                 switch frag {
                 case .label:
@@ -3107,6 +3176,18 @@ internal final class AsmSession {
                     var patched = instBytes
                     var resolvedPCRelHi20 = false
                     for fix in fixups {
+                        if fix.kind == .riscv_relax {
+                            // Follows the relocation it marks; nothing to mark if that fixup was folded.
+                            let at = UInt64(fragOffset + fix.offsetInInst)
+                            if let last = pendingRelocs.last, last.sectionIndex == secIdx, last.offset == at, last.kind != .riscv_relax {
+                                pendingRelocs.append(PendingReloc(sectionIndex: secIdx, offset: at, kind: .riscv_relax, symbol: "", addend: 0))
+                            }
+                            continue
+                        }
+                        if fix.kind == .riscv_align {
+                            pendingRelocs.append(PendingReloc(sectionIndex: secIdx, offset: UInt64(fragOffset), kind: .riscv_align, symbol: "", addend: fix.addend))
+                            continue
+                        }
                         if let minusSym = fix.minusSymbol,
                            let pDef = definedLabels[fix.symbol],
                            let mDef = definedLabels[minusSym],
@@ -3182,6 +3263,15 @@ internal final class AsmSession {
                     bytes.append(contentsOf: patched)
 
                 case .relaxable(let branch, let form, let loc):
+                    if case .rvBranch(let baseInst, _, let targetSym, let addend) = branch,
+                       spansRelaxBarrier(secIdx, fragIndex, labelIndex[targetSym]) {
+                        // The linker may change the distance: keep the form chosen by distance, with a relocation.
+                        let (instBytes, r) = encodeUnresolvedRVBranch(baseInst: baseInst, form: form, targetSymbol: targetSym, addend: addend)
+                        noteSymbol(targetSym)
+                        pendingRelocs.append(PendingReloc(sectionIndex: secIdx, offset: UInt64(fragOffset + r.offsetInInst), kind: r.kind, symbol: targetSym, addend: addend))
+                        bytes.append(contentsOf: instBytes)
+                        break
+                    }
                     var outOfRange = false
                     let (instBytes, relocOpt) = encodeRelaxedBranch(
                         branch: branch,
@@ -3218,11 +3308,17 @@ internal final class AsmSession {
                     // PC-relative relocation; differences against same-section labels still fold.
                     var dotLabels = localLabels
                     dotLabels["."] = Int64(fragOffset)
-                    let valOpt = AsmExprEvaluator.evaluate(
+                    var valOpt = AsmExprEvaluator.evaluate(
                         exprStr,
                         constants: constants,
                         currentSectionSymbols: dotLabels
                     )
+                    // Under RISC-V linker relaxation a label difference folds only if no barrier lies between
+                    // the labels: keep it symbolic so the `.symbolDiff` case below decides.
+                    if case .constant = valOpt, barriersBySection.contains(where: { !$0.isEmpty }),
+                       case .symbolDiff? = AsmExprEvaluator.evaluate(exprStr, constants: constants) {
+                        valOpt = AsmExprEvaluator.evaluate(exprStr, constants: constants)
+                    }
                     func dotLabel() -> String {
                         let name = ".Ldot_\(secIdx)_\(fragOffset)"
                         noteSymbol(name)
@@ -3249,7 +3345,9 @@ internal final class AsmSession {
                     case .symbolDiff(let plusSym, let minusSym, let addend):
                         if let pDef = definedLabels[plusSym],
                            let mDef = (minusSym == "." ? (sectionIndex: secIdx, offset: Int64(fragOffset)) : definedLabels[minusSym]),
-                           pDef.sectionIndex == mDef.sectionIndex {
+                           pDef.sectionIndex == mDef.sectionIndex,
+                           !spansRelaxBarrier(pDef.sectionIndex, labelIndexBySection[pDef.sectionIndex][plusSym],
+                                              minusSym == "." ? fragIndex : labelIndexBySection[mDef.sectionIndex][minusSym]) {
                             appendLittleEndian((pDef.offset - mDef.offset) + addend, width: width, to: &bytes)
                         } else if arch == .riscv64, let addKind = riscvPairKinds(width: width) {
                             // RISC-V encodes symbol differences as an ADD/SUB relocation pair (as GNU `as`/LLVM do).
@@ -3258,6 +3356,13 @@ internal final class AsmSession {
                             appendLittleEndian(0, width: width, to: &bytes)
                         } else if minusSym == ".", let kind = dataRelocKind(width: width, isPCRel: true) {
                             addReloc(kind, plusSym, addend)
+                            appendLittleEndian(0, width: width, to: &bytes)
+                        } else if let mDef = definedLabels[minusSym], mDef.sectionIndex == secIdx,
+                                  let kind = dataRelocKind(width: width, isPCRel: true) {
+                            // `A - B` with `B` in this section is `A - P + (P - B)`: LLVM MC emits a PC-relative
+                            // relocation against `A` with `P - B` folded into the addend (e.g. the vDSO header's
+                            // `.long <entry point> - vdso_header` in VectraOS user/vdso/header.S).
+                            addReloc(kind, plusSym, addend + Int64(fragOffset) - mDef.offset)
                             appendLittleEndian(0, width: width, to: &bytes)
                         } else {
                             reportInvalid()
@@ -3357,9 +3462,9 @@ internal final class AsmSession {
             symHandleByName[symName] = handle
         }
 
-        // 5. Attach Relocations to Sections
+        // 5. Attach Relocations to Sections (`R_RISCV_RELAX`/`R_RISCV_ALIGN` have no symbol)
         for pr in pendingRelocs {
-            guard let symHandle = symHandleByName[pr.symbol] else { continue }
+            guard let symHandle = pr.symbol.isEmpty ? SymbolIndex.nilId : symHandleByName[pr.symbol] else { continue }
             let sHandle = objSectionIndices[pr.sectionIndex]
             obj.addRelocation(
                 to: sHandle,
@@ -3499,21 +3604,7 @@ internal final class AsmSession {
                 bytes.append(contentsOf: repeatElement(UInt8(0), count: rem))
             }
         case .riscv64:
-            var rem = count
-            if (rem & 1) != 0 {
-                bytes.append(0)
-                rem -= 1
-            }
-            while rem >= 4 {
-                // RV64 ADDI x0, x0, 0 = 0x00000013
-                bytes.append(contentsOf: [0x13, 0x00, 0x00, 0x00])
-                rem -= 4
-            }
-            while rem >= 2 {
-                // RVC c.nop = 0x0001
-                bytes.append(contentsOf: [0x01, 0x00])
-                rem -= 2
-            }
+            appendRISCVNops(&bytes, count: count, rvc: rvOptions.rvcEnabled)
         }
     }
 
@@ -3713,6 +3804,29 @@ internal final class AsmSession {
         }
     }
 
+    /// A RISC-V branch or jump whose target is in the same section but across a linker-relaxation barrier: the
+    /// form already chosen by distance (LLVM MC keeps `c.j`/`c.beqz` with `R_RISCV_RVC_*`), with a zero immediate.
+    private func encodeUnresolvedRVBranch(baseInst: RV64Instruction, form: Int, targetSymbol: String, addend: Int64) -> ([UInt8], AsmInstFixup) {
+        switch form {
+        case 0:
+            var inst = baseInst
+            inst.imm = 0
+            let kind: RelocKind = inst.opcode == .c_j ? .riscv_rvc_jump : .riscv_rvc_branch
+            return (RV64Encoder.encode(inst, rvcEnabled: true), AsmInstFixup(offsetInInst: 0, kind: kind, symbol: targetSymbol, addend: addend))
+        case 1:
+            var inst = Self.rvUncompressed(baseInst)
+            inst.imm = 0
+            let kind: RelocKind = inst.opcode == .jal ? .riscv_jal : .riscv_branch
+            return (RV64Encoder.encode(inst, rvcEnabled: false), AsmInstFixup(offsetInInst: 0, kind: kind, symbol: targetSymbol, addend: addend))
+        default:
+            let wide = Self.rvUncompressed(baseInst)
+            let skip = RV64Instruction(opcode: Self.rvInvertedBranch(wide.opcode), rs1: wide.rs1, rs2: wide.rs2, imm: 8)
+            let jal = RV64Instruction(opcode: .jal, rd: RVGPR.zero.rawValue, imm: 0)
+            return (RV64Encoder.encode(skip, rvcEnabled: false) + RV64Encoder.encode(jal, rvcEnabled: false),
+                    AsmInstFixup(offsetInInst: 4, kind: .riscv_jal, symbol: targetSymbol, addend: addend))
+        }
+    }
+
     private func patchSameSectionFixup(
         _ bytes: inout [UInt8],
         fixup: AsmInstFixup,
@@ -3856,11 +3970,31 @@ internal final class AsmSession {
     }
 }
 
-/// Mutable options state for RV64 `.option` directives.
+/// Mutable options state for RV64 `.option` directives, and the initial state a driver sets from the target
+/// (`-march`, `-fPIC`/`-fPIE`, `-mrelax`/`-mno-relax`). The default is Swift-Stack's RVA23 baseline without
+/// linker relaxation; clang's default enables relaxation.
 public struct RVAsmOptions: Sendable {
     public var rvcEnabled: Bool = true
+    /// Linker relaxation (`.option relax`): relaxable relocations get an `R_RISCV_RELAX` companion, code alignment
+    /// emits worst-case NOPs plus `R_RISCV_ALIGN`, and PC-relative differences that span either stay relocations.
     public var relaxEnabled: Bool = false
     public var picEnabled: Bool = false
+    /// Zbs is available, so `li` may materialize a single high bit with `bseti` (LLVM `RISCVMatInt`).
+    public var zbsEnabled: Bool = true
 
     public init() {}
+
+    /// Options for `-march=<isa>` (e.g. `rv64imac_zicsr_zifencei`, `rv64gc`, `rv64gcb_zbs`): the C extension enables
+    /// compression and Zbs (or B) enables `bseti` in `li`. `pic` and `relax` give the initial `.option` state.
+    public init(march: String, pic: Bool = false, relax: Bool = false) {
+        let isa = march.lowercased()
+        var parts = isa.split(separator: "_").map(String.init)
+        let base = parts.isEmpty ? "" : parts.removeFirst()
+        // Single-letter extensions follow `rv64`; `g` is `imafd_zicsr_zifencei`.
+        let letters = base.hasPrefix("rv64") ? Set(base.dropFirst(4)) : []
+        rvcEnabled = letters.contains("c") || parts.contains("zca")
+        zbsEnabled = letters.contains("b") || parts.contains("zbs")
+        picEnabled = pic
+        relaxEnabled = relax
+    }
 }

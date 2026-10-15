@@ -7,9 +7,9 @@
   - **Encoders/disassemblers (`Encode/`)** are table-driven for **x86-64** (VEX, `.code16`/`.code32`/`.code64`), **AArch64** (NEON, SVE) and **RV64** (RVC, RVV 1.0, Zba/Zbb/Zbs, Zicond, Zicbom/Zicboz). Every table sample is round-tripped and checked against `llvm-mc`. ISA coverage is still partial; the [M2 Report](docs/architecture/milestones/M2-encoders-object-assemblers.md) lists the gaps.
   - **Object files (`Object/`):** a deterministic (`D6`) ELF64 `ET_REL` reader and writer.
   - **Assemblers (`Asm/`):** `.s`/`.S` with C23 preprocessing, macro and conditional expansion, and branch relaxation.
-  - **Verification:** all Todhchai floor entry stubs and all 21 Croi `kernel/arch/*/*.S` files match `clang -c` in section bytes, relocations and symbols. The x86-64 files match GNU `as` except for the three encoding choices documented in [05 §4.11](docs/architecture/05-assembler.md).
+  - **Verification:** all 26 **VectraOS** `.S` files, each assembled for its architecture with the flags of VectraOS's own build (30 objects, 10 per architecture; RV64 with linker relaxation), match `clang -c` in section bytes, relocations and symbols. The x86-64 files match GNU `as` except for the encoding choices documented in [05 §4.11](docs/architecture/05-assembler.md).
 - **C23 Frontend & Real-World Corpora (M1):** preprocessing, a postorder SoA `ParseTree`, and type-checking into `SemIR`. Accept/reject is compared file by file with `clang -std=c23 -fsyntax-only`:
-  - **Real-world sources:** the **SQLite amalgamation**, **Lua 5.4** (35/35), and every **Todhchai** C source Clang accepts (28/28).
+  - **Real-world sources:** the **SQLite amalgamation**, **Lua 5.4** (35/35), and all 12 **VectraOS** C sources for each of its three architectures (36/36, freestanding, with its build's flags), plus each of its 37 headers on its own (111/111).
   - **Headers:** every top-level **glibc** header Clang accepts (176/176).
   - **c-testsuite:** 211/220 match, with the remaining divergences listed in `M1DifferentialTests.swift`.
 - **Vertical Slice & Verification (M0 / M0.5):** Compiles, links, and runs the C subset corpus end-to-end to standalone static Linux x86-64 executables with zero external dependencies, passes the automated test suite in release mode (with zero warnings), and enforces all 5 CI verification gates. See [M0.5 Vertical Slice Report](docs/architecture/milestones/M0.5-vertical-slice.md) and [Baselines](Benchmarks/baselines/M0.5-vertical-slice.md).
@@ -26,7 +26,7 @@ The bet is that this layout, together with a deliberately small optimizer, gives
 
 1. **Languages.**
    - Swift 6.x in two tiers: Tier 0, the Embedded subset; Tier 1, full Swift within the stated non-goals.
-   - Swift macros, through executable compiler plugins. Todhchai's IPC and audio SDK are the first-party users.
+   - Swift macros, through executable compiler plugins. VectraOS's typed IPC (`@IPCLibrary`) and SDK macros (`@AudioRenderer`) are the first-party users.
    - Portable SIMD (`SIMDn<T>`, C vector extensions) lowered to native vector code on every target. Auto-vectorization is an optional add-on.
    - ISO/IEC 9899:2024 (C23), plus the GNU/Clang extensions needed to parse system headers.
 2. **A self-contained toolchain.** Built-in assemblers (x86-64, AArch64, RV64) and linker. No LLVM, GNU `as` or external linker.
@@ -38,7 +38,7 @@ The bet is that this layout, together with a deliberately small optimizer, gives
 
 ### Targets
 
-- **Primary:** Todhchai OS on the croi capability microkernel (x86-64, AArch64, RV64). Static ELF images at `0x1000000`, port-driven Swift concurrency.
+- **Primary:** [VectraOS](docs/architecture/00-overview-and-principles.md#primary-vectraos), a capability microkernel OS for edge hardware in Embedded Swift and C23 (x86-64, AArch64, RV64). Static ELF images (`ET_EXEC` at `0x1000000` or static PIE), one wait port per thread.
 - **Secondary / hosts:** Linux, FreeBSD, macOS.
 - **ISA floors:** x86-64 at the 2013 Mac Pro (Ivy Bridge) class, i.e. `x86-64-v2` + AVX; AArch64 `armv8-a`; RV64 RVA23.
 
@@ -93,7 +93,7 @@ C++, Objective-C interop, Windows, binary compatibility with `swiftc`-built Swif
 │ LINKER                                                                       06 │
 │ In-memory objects + foreign .o/.a · optional link-time type checks              │
 │ Parallel per-input-section relocation · deterministic layout                    │
-│ Todhchai static ELF · Linux/FreeBSD ELF · macOS Mach-O                          │
+│ VectraOS static ELF · Linux/FreeBSD ELF · macOS Mach-O                          │
 └─────────────────────────────────────────────────────────────────────────────────┘
         │                                               │
         ▼                                               ▼
@@ -101,7 +101,7 @@ C++, Objective-C interop, Windows, binary compatibility with `swiftc`-built Swif
 │ RUNTIMES & STDLIB            08 · 12 │   │ DEBUGGING                         07 │
 │ Tier 0 (Embedded) · Tier 1 (Full)    │   │ SDI (.ss_debug), mmap-able           │
 │ Upstream stdlib sources as input     │   │ Compact unwind descriptors (CUD)     │
-│ Executor: croi port/kqueue/epoll     │   │ DWARF for host debuggers             │
+│ Executor: VectraOS port/kqueue/epoll │   │ DWARF for host debuggers             │
 └──────────────────────────────────────┘   └──────────────────────────────────────┘
 ```
 
@@ -115,7 +115,7 @@ All chapters are in [`docs/architecture/`](docs/architecture/). Each one has a S
 |---|---|---|
 | 00 | [Overview, Principles, and Key Decisions](docs/architecture/00-overview-and-principles.md) | Goals, non-goals, decision log D1–D11, DOD principles (layout follows transforms, zero is nil, hot-path rules), `Column` storage, targets, execution model |
 | 01 | [Frontend](docs/architecture/01-frontend.md) | Source buffers, SWAR lexing, SoA tokens, C23 preprocessor and `#embed`, postorder parse tree |
-| 02 | [Semantic Analysis](docs/architecture/02-semantic-analysis.md) | TypePool, C23 semantics, Swift staged type checking, Todhchai feature profile, strict concurrency, C/Swift interop |
+| 02 | [Semantic Analysis](docs/architecture/02-semantic-analysis.md) | TypePool, C23 semantics, Swift staged type checking, VectraOS feature profile, strict concurrency, C/Swift interop |
 | 03 | [AIR and Optimizer](docs/architecture/03-intermediate-representation.md) | Flat SSA IR, mandatory lowering (ownership, lifetime, performance-annotation checks), optimization pipeline, `-Osize` |
 | 04 | [Backend](docs/architecture/04-backend.md) | LIR, instruction selection, register allocation, calling conventions, encoders |
 | 05 | [Assemblers](docs/architecture/05-assembler.md) | x86-64, AArch64, RV64 assemblers; directives, macros, relaxation |
@@ -129,7 +129,7 @@ All chapters are in [`docs/architecture/`](docs/architecture/). Each one has a S
 | 13 | [Modules and Incremental Builds](docs/architecture/13-modules-and-incremental-builds.md) | `.ssmodule` format, separate compilation, dependency tracking, caching |
 | 14 | [Measurement Methodology](docs/architecture/14-measurement-methodology.md) | Budgets, metric definitions, corpora, CI gates |
 | 15 | [Driver and Diagnostics](docs/architecture/15-driver-and-diagnostics.md) | Personalities, job scheduling, plugin host, diagnostics engine, build-system integration |
-| 16 | [Swift Macros](docs/architecture/16-macros.md) | Plugin protocol, expansion buffers, lookup ordering, caching, Todhchai use cases |
+| 16 | [Swift Macros](docs/architecture/16-macros.md) | Plugin protocol, expansion buffers, lookup ordering, caching, VectraOS use cases |
 | 17 | [SIMD and Vectorization](docs/architecture/17-simd-and-vectorization.md) | ISA floors, portable SIMD lowering, legalization tables, loop idioms, optional auto-vectorizer |
 | 18 | [Data Catalog](docs/architecture/18-data-catalog.md) | Every persistent table: producers, consumers, access patterns, sizes, layout choice (hypotheses until measured) |
 
@@ -142,7 +142,7 @@ Budgets from [14](docs/architecture/14-measurement-methodology.md) are tracked c
 | ID | Metric | Budget Target | Measured Swift-Stack | Baseline Comparison | Status |
 |---|---|---|---|---|---|
 | **B1** | Lexing throughput (single core) | ≥ 600 MB/s (≤ 5.8 cyc/B) | **520.4 MB/s** (C23 single-pass)<br>774 MB/s (C23 rep-tester best-of-50)* | `swiftc`: ~11.6 MB/s<br>`clang -E`: ~65.6 MB/s | **NOT MET (PARTIAL)** (Single-pass falls short of 600 MB/s budget; rep-tester subject to boost noise) |
-| **B2** | Lex + parse throughput (single core) | ≥ 300 MB/s (≤ 11.7 cyc/B) | Full C23 preprocessor + postorder `ParseTree` + `SemIR` active across `synth_50k.c`, `sqlite3.c` (268K LOC), Lua, and Todhchai | `clang -fsyntax-only`: ~45 MB/s | **ACTIVE (M1)** |
+| **B2** | Lex + parse throughput (single core) | ≥ 300 MB/s (≤ 11.7 cyc/B) | Full C23 preprocessor + postorder `ParseTree` + `SemIR` active across `synth_50k.c`, `sqlite3.c` (268K LOC), Lua, and VectraOS | `clang -fsyntax-only`: ~45 MB/s | **ACTIVE (M1)** |
 | **B3** | End-to-end debug build (single core) | ≥ 100,000 lines/s (≤ 35,000 cyc/line) | **13.5 – 14.4 ms** total ($1.5 – 2.0\text{ ms}$ in-process pipeline) | `clang -O0` + external linker: 23 – 28 ms | **PROVISIONAL** ($1.7\times$ faster than Clang on micro-programs; full C23 codegen in M3) |
 | **B5** | Link time, system-service image | < 50 ms | **< 1 ms** (in-process static ELF writer) | External `ld.bfd` / `ld.lld` | **MET** (slice) |
 | **B8** | Peak RSS (100K-line build) | < 256 MB | **21.3 MB** RSS (cold) | `swiftc` + LLVM (> 500 MB) | **MET** (slice) |
@@ -164,7 +164,7 @@ swift build -c release
 bash Scripts/fetch-external.sh   # optional: pinned third-party corpora (c-testsuite) into External/
 swift test
 ```
-Differential tests compare against `clang`, GNU `as` and `llvm-mc` when installed, and against external corpora (SQLite, Lua, Todhchai, Croi) located by `SWIFTSTACK_*` environment variables; anything unavailable is reported as skipped.
+Differential tests compare against `clang`, GNU `as` and `llvm-mc` when installed, and against external corpora (SQLite, Lua, VectraOS) located by `SWIFTSTACK_*` environment variables (`SWIFTSTACK_VECTRAOS_ROOT` for VectraOS); anything unavailable is reported as skipped.
 
 ### Run Continuous Integration (all 5 gates)
 ```sh
