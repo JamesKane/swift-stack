@@ -42,7 +42,8 @@ enum EncoderOracle {
         case .x86_64:  return ["-triple=x86_64"]
         case .aarch64: return ["-triple=aarch64", "-mattr=+all"]
         case .riscv64:
-            return ["-triple=riscv64", "-mattr=+m,+a,+f,+d,+c,+v,+zba,+zbb,+zbs,+zicbom,+zicboz,+zicond,+zcb,+zfa,+zfhmin,+zicsr,+zifencei,+zihintpause,+zawrs,+zimop,+zcmop,+zvbb,+zvfhmin"]
+            // The ratified RVA23S64 profile: every RVA23U64 extension plus Zifencei, Svinval, H (Sha), Sstc, ...
+            return ["-triple=riscv64", "-mattr=+rva23s64"]
         }
     }
 
