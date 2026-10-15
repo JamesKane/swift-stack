@@ -254,12 +254,23 @@ public struct CParser: ~Copyable {
                 }
                 if emit { parseTree.appendLeaf(kind: .attributeSpec, token: anchor) }
             } else if currentKind == .kwAlignas {
+                // `alignas ( type-name )` or `alignas ( constant-expression )`: the operand is the node's child
+                let start = parseTree.count
                 let anchor = advance()
-                skipBalancedParens()
-                if emit { parseTree.appendLeaf(kind: .attributeSpec, token: anchor) }
+                guard emit, currentKind == .lParen else {
+                    skipBalancedParens()
+                    if emit { parseTree.appendLeaf(kind: .attributeSpec, token: anchor) }
+                    continue
+                }
+                advance()
+                if isTypeStart() { _ = parseTypeName() } else { _ = parseConditionalExpression() }
+                expect(.rParen)
+                parseTree.append(kind: .attributeSpec, token: anchor, subtreeSize: parseTree.count - start + 1)
             } else if currentKind == .identifier && isReservedOrAsm(currentTokenId) {
                 let tok = currentTokenId
-                if token(tok, is: "__attribute__") || token(tok, is: "__attribute") || token(tok, is: "__declspec") ||
+                if emit && (token(tok, is: "__attribute__") || token(tok, is: "__attribute")) {
+                    parseGNUAttribute()
+                } else if token(tok, is: "__attribute__") || token(tok, is: "__attribute") || token(tok, is: "__declspec") ||
                    token(tok, is: "__asm__") || token(tok, is: "__asm") || token(tok, is: "asm") {
                     let anchor = advance()
                     skipBalancedParens()
@@ -273,6 +284,39 @@ public struct CParser: ~Copyable {
                 break
             }
         }
+    }
+
+    /// `__attribute__((a, b(args), ...))`: one `attributeSpec` node anchored at `__attribute__`. The argument of an
+    /// `aligned` attribute is parsed as the node's child (a constant expression), so that sema can evaluate it;
+    /// other arguments are skipped.
+    private mutating func parseGNUAttribute() {
+        let start = parseTree.count
+        let anchor = advance()
+        guard currentKind == .lParen, peekKind() == .lParen else {
+            skipBalancedParens()
+            parseTree.appendLeaf(kind: .attributeSpec, token: anchor)
+            return
+        }
+        advance()
+        advance()
+        while !isAtEnd && currentKind != .rParen {
+            let name = currentTokenId
+            advance()
+            if currentKind == .lParen {
+                if token(name, is: "aligned") || token(name, is: "__aligned__") {
+                    advance()
+                    _ = parseConditionalExpression()
+                    expect(.rParen)
+                } else {
+                    skipBalancedParens()
+                }
+            }
+            guard currentKind == .comma else { break }
+            advance()
+        }
+        expect(.rParen)
+        expect(.rParen)
+        parseTree.append(kind: .attributeSpec, token: anchor, subtreeSize: parseTree.count - start + 1)
     }
 
     /// Skips a parenthesized group `( ... )` if one starts at the cursor.

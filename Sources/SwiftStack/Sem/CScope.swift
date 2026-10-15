@@ -1,12 +1,17 @@
 // Sources/SwiftStack/Sem/CScope.swift
 import Foundation
 
-/// Storage duration and linkage of a symbol in C (02-semantic-analysis.md §4.2).
+/// Storage duration and linkage of a symbol in C (02-semantic-analysis.md §4.2). Sema assigns no frame
+/// locations: AIR lowering places parameters and locals.
 public enum CSymbolStorage: Equatable, Sendable {
+    /// A file-scope object, or a block-scope `extern` one.
     case global(name: String)
     case function(name: String)
-    case param(index: Int, offset: Int32)
-    case local(offset: Int32)
+    case param(index: Int)
+    /// A block-scope object with automatic storage.
+    case local
+    /// A block-scope `static` object: static storage, no linkage.
+    case staticLocal
     case typedef
     case enumConstant(value: Int64)
 }

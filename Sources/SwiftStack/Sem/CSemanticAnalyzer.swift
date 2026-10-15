@@ -1,120 +1,6 @@
 // Sources/SwiftStack/Sem/CSemanticAnalyzer.swift
 import Foundation
 
-public final class SemInstBlockContainer: @unchecked Sendable {
-    public var block: SemInstBlock
-    public init(block: consuming SemInstBlock) {
-        self.block = block
-    }
-}
-
-public final class SemModule: @unchecked Sendable {
-    public var declTable: DeclTable
-    public var instBlocks: [SemInstBlockContainer]
-    public let typePool: TypePool
-    public var diagnosticBag: DiagnosticBag
-
-    public init(
-        declTable: consuming DeclTable,
-        instBlocks: [SemInstBlockContainer],
-        typePool: TypePool,
-        diagnosticBag: consuming DiagnosticBag
-    ) {
-        self.declTable = declTable
-        self.instBlocks = instBlocks
-        self.typePool = typePool
-        self.diagnosticBag = diagnosticBag
-    }
-
-    public func dump() {
-        print("=== SemIR DeclTable (\(declTable.count - 1) declarations) ===")
-        print("DeclId | DeclKind       | Name             | Type")
-        print("-------+----------------+------------------+---------------------")
-        for i in 1..<Int(declTable.count) {
-            let did = DeclId(UInt32(i))
-            let k = String(describing: declTable.kind(of: did))
-            let name = declTable.name(of: did)
-            let type = declTable.type(of: did)
-            let kPad = k.padding(toLength: 14, withPad: " ", startingAt: 0)
-            let nPad = name.padding(toLength: 16, withPad: " ", startingAt: 0)
-            print(String(format: "%6d | %@ | %@ | %@", i, kPad, nPad, "\(type)"))
-        }
-
-        print("\n=== SemIR Instruction Blocks (\(instBlocks.count - 1) bodies) ===")
-        for (idx, container) in instBlocks.enumerated() {
-            guard idx > 0 else { continue }
-            print("--- Block #\(idx) (\(container.block.count - 1) instructions) ---")
-            for j in 1..<Int(container.block.count) {
-                let sid = SemInstId(UInt32(j))
-                let k = String(describing: container.block.kind(of: sid))
-                let t = container.block.type(of: sid)
-                let a0 = container.block.arg0[sid]
-                let a1 = container.block.arg1[sid]
-                print(String(format: "  %%%d = %@ : %@ (arg0: %u, arg1: %u)", j, k, "\(t)", a0, a1))
-            }
-        }
-    }
-}
-
-public struct FunctionSignature: Sendable {
-    public let name: String
-    public let returnType: TypeId
-    public let paramNames: [String]
-    public let paramTypes: [TypeId]
-    public let bodyNode: NodeId // compoundStmt node
-    public let stackFrameSize: Int32
-    public let declId: DeclId
-    public let blockId: InstBlockId
-
-    public init(
-        name: String,
-        returnType: TypeId,
-        paramNames: [String],
-        paramTypes: [TypeId],
-        bodyNode: NodeId,
-        stackFrameSize: Int32,
-        declId: DeclId = .nilId,
-        blockId: InstBlockId = .nilId
-    ) {
-        self.name = name
-        self.returnType = returnType
-        self.paramNames = paramNames
-        self.paramTypes = paramTypes
-        self.bodyNode = bodyNode
-        self.stackFrameSize = stackFrameSize
-        self.declId = declId
-        self.blockId = blockId
-    }
-}
-
-public struct SemResult: @unchecked Sendable {
-    public let nodeTypes: [NodeId: TypeId]
-    public let symbolRefs: [NodeId: CSymbol]
-    public let functions: [String: FunctionSignature]
-    public let functionOrder: [String]
-    public let stringLiterals: [String: Int]
-    public let diagnostics: [String]
-    public let semModule: SemModule
-
-    public init(
-        nodeTypes: [NodeId: TypeId],
-        symbolRefs: [NodeId: CSymbol],
-        functions: [String: FunctionSignature],
-        functionOrder: [String],
-        stringLiterals: [String: Int],
-        diagnostics: [String],
-        semModule: SemModule
-    ) {
-        self.nodeTypes = nodeTypes
-        self.symbolRefs = symbolRefs
-        self.functions = functions
-        self.functionOrder = functionOrder
-        self.stringLiterals = stringLiterals
-        self.diagnostics = diagnostics
-        self.semModule = semModule
-    }
-}
-
 /// Comprehensive ISO C23 semantic analysis, type checking, and SemIR builder (02-semantic-analysis.md, 10-semantic-ir-and-name-resolution.md).
 extension DiagId {
     public static let semaInvalidDeclaration    = DiagId(74)
@@ -127,11 +13,19 @@ public struct CSemanticAnalyzer: ~Copyable {
     private let sourceBuffer: UnsafePointer<UInt8>
     private let sourceLength: Int
     private let sourceManager: SourceManager?
+    private var dataLayout: DataLayout { typePool.dataLayout }
 
     // Module-wide SemIR structures
     private var declTable: DeclTable
     private var instBlocks: [SemInstBlockContainer] = []
     private var diagnosticBag: DiagnosticBag
+    private var semFunctions: [SemFunction] = []
+    private var semGlobals: [SemGlobal] = []
+    /// Index into `semGlobals` of each file-scope object name's definition (or tentative definition).
+    private var globalIndexByName: [String: Int] = [:]
+    private var staticSymbols: [DeclId: String] = [:]
+    /// Explicit alignments (`alignas`, `aligned`) of objects.
+    private var objectAlignments: [DeclId: Int] = [:]
 
     // Backwards-compatible mappings for M0.5 AIRLowering
     private var nodeTypes: [NodeId: TypeId] = [:]
@@ -144,12 +38,16 @@ public struct CSemanticAnalyzer: ~Copyable {
 
     // Scope and function tracking
     private var currentScope: CScope
-    private var currentStackOffset: Int32 = 0
     private var currentReturnType: QualType = .void
     private var currentBlockContainer: SemInstBlockContainer? = nil
+    private var currentBlockId: InstBlockId = .nilId
+    private var currentFunctionDecl: DeclId = .nilId
+    /// Nesting of operands that are not evaluated (`sizeof`, `alignof`, `typeof`, `_Generic`'s controlling
+    /// expression): their instructions are discarded, so they must not register objects.
+    private var unevaluatedDepth = 0
     /// Instructions of expressions outside function bodies (initializers, `typeof`, `sizeof` operands), so that
-    /// they are typed and checked like any other; not part of the module's instruction blocks.
-    private let fileScopeContainer = SemInstBlockContainer(block: SemInstBlock())
+    /// they are typed and checked like any other; the module's `fileScopeBlock`.
+    private let fileScopeContainer = SemInstBlockContainer(block: SemInstBlock(reservedCapacity: 1 << 23))
     /// Resolved parameter lists by `paramList` node.
     private var parameterLists: [NodeId: ParameterList] = [:]
     /// Values of `constexpr` objects of integer type, which are integer constant expressions.
@@ -158,17 +56,33 @@ public struct CSemanticAnalyzer: ~Copyable {
     private var constantDivisionByZero = false
     /// File-scope object definitions without an initializer whose type is incomplete where they are declared.
     private var tentativeDefinitions: [(name: String, type: QualType, tok: TokenId)] = []
+    /// Lengths of the variable length array types elaborated since the last declaration took them: (VLA type, length
+    /// as `size_t`), outermost first.
+    private var pendingVLALengths: [(type: TypeId, length: SemInstId)] = []
 
     // Constraint-checking state (C23 6.8.4.2 switch, 6.8.6 jumps, 6.9 external definitions)
     private var loopDepth: Int = 0
-    private var switchStack: [(values: Set<Int64>, hasDefault: Bool)] = []
+    private var switchStack: [SwitchContext] = []
     private var functionLabels: [String: TokenId] = [:]
+    /// Label numbers of the current function (`SemInstKind.label`), by name; `labelNames[n]` is label n's name.
+    private var labelNumbers: [String: UInt32] = [:]
+    private var labelNames: [String] = [""]
     private var pendingGotos: [(name: String, tok: TokenId)] = []
     private var definedFunctions: Set<String> = []
     private var initializedGlobals: Set<String> = []
     private var currentFunctionName: String = ""
     /// Names of the compiler-provided declarations (`write`, `exit`), which headers may redeclare.
     private var builtinNames: Set<String> = ["write", "exit"]
+
+    /// A `switch` being analyzed: the case values seen (for duplicates), its labels, and the promoted type of its
+    /// controlling expression.
+    private struct SwitchContext {
+        var values: Set<Int64> = []
+        var hasDefault = false
+        var cases: [UInt32] = []
+        var defaultLabel: SemInstId = .nilId
+        var controlType: QualType = .int
+    }
 
     public init(
         typePool: TypePool,
@@ -186,7 +100,7 @@ public struct CSemanticAnalyzer: ~Copyable {
         self.currentScope = CScope()
 
         // Nil instruction block at index 0
-        let nilBlock = SemInstBlock()
+        let nilBlock = SemInstBlock(reservedCapacity: 16)
         self.instBlocks.append(SemInstBlockContainer(block: nilBlock))
         self.currentBlockContainer = fileScopeContainer
         _ = Self.diagnosticsRegistered
@@ -206,12 +120,14 @@ public struct CSemanticAnalyzer: ~Copyable {
         // long write(int fd, const void *buf, unsigned long count)
         let voidPtr = typePool.pointerTo(.void)
         let writeType = typePool.functionType(returnType: .long, paramTypes: [.int, QualType(typeId: voidPtr), .ulong])
-        let writeDecl = declTable.append(kind: .function, name: "write", type: QualType(typeId: writeType))
+        let writeDecl = declTable.append(kind: .function, name: "write", type: QualType(typeId: writeType),
+                                         attrs: DeclAttributes(storage: .external).rawValue)
         currentScope.insertOrdinary(symbol: CSymbol(name: "write", declId: writeDecl, type: QualType(typeId: writeType), storage: .function(name: "write")))
 
         // void exit(int status)
         let exitType = typePool.functionType(returnType: .void, paramTypes: [.int])
-        let exitDecl = declTable.append(kind: .function, name: "exit", type: QualType(typeId: exitType))
+        let exitDecl = declTable.append(kind: .function, name: "exit", type: QualType(typeId: exitType),
+                                        attrs: DeclAttributes(storage: .external).rawValue)
         currentScope.insertOrdinary(symbol: CSymbol(name: "exit", declId: exitDecl, type: QualType(typeId: exitType), storage: .function(name: "exit")))
     }
 
@@ -253,7 +169,8 @@ public struct CSemanticAnalyzer: ~Copyable {
             case .functionDecl:
                 analyzeFunctionDefinition(decl, tree: tree, tokens: tokens)
             case .varDecl, .typedefDecl:
-                analyzeDeclaration(decl, isFileScope: true, tree: tree, tokens: tokens)
+                var none: [UInt32] = []
+                analyzeDeclaration(decl, isFileScope: true, into: &none, tree: tree, tokens: tokens)
             case .staticAssertDecl:
                 analyzeStaticAssert(decl, tree: tree, tokens: tokens)
             default:
@@ -271,8 +188,30 @@ public struct CSemanticAnalyzer: ~Copyable {
             declTable: consume declTable,
             instBlocks: instBlocks,
             typePool: typePool,
-            diagnosticBag: consume diagnosticBag
+            diagnosticBag: consume diagnosticBag,
+            fileScopeBlock: fileScopeContainer
         )
+        finalMod.functions = semFunctions
+        finalMod.globals = semGlobals
+        finalMod.staticSymbols = staticSymbols
+
+        // Data images of the static-storage objects (C23 6.7.10p10)
+        var evaluator = StaticInitializerEvaluator(module: finalMod)
+        for i in finalMod.globals.indices {
+            switch evaluator.evaluate(finalMod.globals[i]) {
+            case .image(let image):
+                finalMod.globals[i].image = image
+            case .notConstant(let reason, let node):
+                finalMod.globals[i].unsupportedReason = reason
+                let tok = tree.token(of: node)
+                let loc = tok.isValid ? tokens.start(of: tok) : .zero
+                diagnostics.append("initializer element is not a compile-time constant")
+                finalMod.diagnosticBag.report(.semaConstantExprNotConstant, at: GlobalLocation(unitId: UnitId(1), location: loc), args: [])
+            case .unsupported(let reason):
+                finalMod.globals[i].unsupportedReason = reason
+            }
+        }
+        finalMod.staticStrings = evaluator.staticStrings
 
         return SemResult(
             nodeTypes: nodeTypes,
@@ -303,6 +242,7 @@ public struct CSemanticAnalyzer: ~Copyable {
         var isExtern = false
         var isStatic = false
         var isConstexpr = false
+        var isThreadLocal = false
         /// C23 `auto` (or GNU `__auto_type`) without a type specifier: the type is that of the initializer.
         var infersType = false
     }
@@ -336,13 +276,8 @@ public struct CSemanticAnalyzer: ~Copyable {
 
         case .typeofType, .typeofUnqualType:
             guard let first = tree.children(of: typeNode).first(where: { tree.kind(of: $0) != .attributeSpec }) else { return .error }
-            let t: QualType
-            if isTypeNode(tree.kind(of: first)) {
-                t = resolveType(from: first, tree: tree, tokens: tokens)
-            } else {
-                let inst = analyzeExpression(first, tree: tree, tokens: tokens)
-                t = isTyped(inst) ? typeOf(inst) : .error
-            }
+            // The operand is not evaluated (C23 6.7.3.6p4): its instructions are discarded
+            let t = sizeofOperandType(first, tree: tree, tokens: tokens) ?? .error
             return (kind == .typeofUnqualType) ? t.unqualified() : t
 
         case .atomicType:
@@ -387,6 +322,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                 case .kwExtern: spec.isExtern = true; continue
                 case .kwStatic: spec.isStatic = true; continue
                 case .kwConstexpr: spec.isConstexpr = true; continue
+                case .kwThreadLocal: spec.isThreadLocal = true; continue
                 case .kwAuto: auto = true; continue
                 case .identifier:
                     let name = spelling(of: tok, in: tokens)
@@ -400,8 +336,10 @@ public struct CSemanticAnalyzer: ~Copyable {
                     case "__uint128_t": int128 = true; unsigned = true
                     case "_Complex", "__complex__", "__complex", "_Imaginary": complex = true
                     case "__auto_type": auto = true; continue
-                    case "__builtin_va_list", "__gnuc_va_list", "_Decimal32", "_Decimal64", "_Decimal128":
-                        named = .error  // target-specific or unsupported: unmodeled, so no check relies on it
+                    case "__builtin_va_list", "__gnuc_va_list":
+                        named = QualType(typeId: typePool.builtinVaListType())
+                    case "_Decimal32", "_Decimal64", "_Decimal128":
+                        named = .error  // unsupported: unmodeled, so no check relies on it
                     default:
                         if let sym = currentScope.lookupOrdinary(name), case .typedef = sym.storage {
                             named = sym.type
@@ -435,13 +373,14 @@ public struct CSemanticAnalyzer: ~Copyable {
         if complex {
             base = .error  // complex types are not modeled
         } else if let (width, tok) = bitIntWidth {
-            // C23 6.7.3.1: `_BitInt(N)` needs N >= 2 (N >= 1 if unsigned), up to BITINT_MAXWIDTH (8192, 02 §4.2.2)
-            if let width, width >= (unsigned ? 1 : 2), width <= 8192 {
+            // C23 6.7.3.1: `_BitInt(N)` needs N >= 2 (N >= 1 if unsigned), up to the target's BITINT_MAXWIDTH (02 §4.2.2)
+            let maxWidth = dataLayout.bitIntMaxWidth
+            if let width, width >= (unsigned ? 1 : 2), width <= maxWidth {
                 base = QualType(typeId: typePool.integerType(width: width, isSigned: !unsigned))
             } else {
                 if width != nil {
                     reportError("invalid _BitInt width", diagId: .semaInvalidDeclaration, at: tok, in: tokens,
-                                args: ["\(unsigned ? "unsigned" : "signed") _BitInt must have a bit size of at least \(unsigned ? 1 : 2) and at most 8192"])
+                                args: ["\(unsigned ? "unsigned" : "signed") _BitInt must have a bit size of at least \(unsigned ? 1 : 2) and at most \(maxWidth)"])
                 }
                 base = .error
             }
@@ -575,7 +514,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             return .error
         }
         var count: UInt64 = 0
-        if let sizeNode = tree.children(of: suffix).first(where: { tree.kind(of: $0) != .specifier }) {
+        if let sizeNode = tree.children(of: suffix).first(where: { tree.kind(of: $0) != .specifier && tree.kind(of: $0) != .attributeSpec }) {
             constantDivisionByZero = false
             if let size = constantValue(sizeNode, tree: tree, tokens: tokens) {
                 if size.isNegative {
@@ -584,8 +523,16 @@ public struct CSemanticAnalyzer: ~Copyable {
                 }
                 count = size.bits
             } else {
-                if constantDivisionByZero || refersToRuntimeValue(sizeNode, tree: tree, tokens: tokens) { isVariableLength = true }
-                _ = analyzeExpression(sizeNode, tree: tree, tokens: tokens)  // a variable length: type-check the size
+                let isVLA = constantDivisionByZero || refersToRuntimeValue(sizeNode, tree: tree, tokens: tokens)
+                // A variable length: type-check the size, which the declaration evaluates
+                let length = analyzeExpression(sizeNode, tree: tree, tokens: tokens)
+                if isVLA {
+                    isVariableLength = true
+                    let vla = typePool.variableLengthArrayType(elementType: element)
+                    pendingVLALengths.append((vla, convertImplicitly(rvalue(length), to: QualType(typeId: dataLayout.sizeType),
+                                                                     reason: .assignConvert, node: sizeNode)))
+                    return QualType(typeId: vla)
+                }
             }
         }
         return QualType(typeId: typePool.arrayType(elementType: element, count: count))
@@ -629,7 +576,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                 if prototypeScope.lookupLocalOrdinary(name) != nil {
                     reportError("redefinition of parameter '\(name)'", diagId: .semaRedefinition, at: info.name, in: tokens, args: [name])
                 }
-                prototypeScope.insertOrdinary(symbol: CSymbol(name: name, type: type, storage: .param(index: result.types.count - 1, offset: 0)))
+                prototypeScope.insertOrdinary(symbol: CSymbol(name: name, type: type, storage: .param(index: result.types.count - 1)))
             }
         }
         if result.types.count == 1, !result.names[0].isValid, typePool.canonical(of: result.types[0].typeId) == .void {
@@ -642,8 +589,10 @@ public struct CSemanticAnalyzer: ~Copyable {
 
     // MARK: - Declarations
 
-    /// A declaration (C23 6.7): `declSpecs`, then each declarator followed by its initializer, if any.
-    private mutating func analyzeDeclaration(_ node: NodeId, isFileScope: Bool, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) {
+    /// A declaration (C23 6.7): `declSpecs`, then each declarator followed by its initializer, if any. At block scope,
+    /// the statements it executes (a `declLocal` per automatic object) are appended to `stmts`.
+    private mutating func analyzeDeclaration(_ node: NodeId, isFileScope: Bool, into stmts: inout [UInt32], tree: borrowing ParseTree,
+                                             tokens: borrowing TokenBuffer) {
         let children = tree.children(of: node)
         guard let specsNode = children.first(where: { tree.kind(of: $0) == .declSpecs }) else { return }
         let hasDeclarators = children.contains { tree.kind(of: $0) == .declarator }
@@ -667,6 +616,7 @@ public struct CSemanticAnalyzer: ~Copyable {
                 initializer = children[i]
                 i += 1
             }
+            pendingVLALengths.removeAll()
             let info = applyDeclarator(declarator, to: spec.type, tree: tree, tokens: tokens)
             let (type, nameTok) = (applyMachineMode(info.type, attributes: attributes, tree: tree, tokens: tokens), info.name)
             guard nameTok.isValid, CTokenKind(rawValue: tokens.kind(of: nameTok)) == .identifier else { continue }
@@ -677,19 +627,33 @@ public struct CSemanticAnalyzer: ~Copyable {
                             args: [isFileScope ? "variable length array declaration not allowed at file scope"
                                                : "variable length array declaration cannot have 'extern' or 'static' storage"])
             }
+            let alignment = explicitAlignment(attributes, tree: tree, tokens: tokens)
             if spec.isTypedef {
-                declareTypedef(name, type: type, at: nameTok, tokens: tokens)
+                let declId = declareTypedef(name, type: type, alignment: alignment, at: nameTok, tokens: tokens)
+                // A variably modified typedef evaluates its lengths where it is declared (C23 6.7.8p3)
+                if !isFileScope && !pendingVLALengths.isEmpty {
+                    stmts.append(emitLocalDeclaration(declId, initializer: .nilId, node: declarator).rawIndex)
+                }
             } else if isFunctionType(type) {
                 if let initializer {
                     reportError("illegal initializer", diagId: .semaInvalidDeclaration, at: tree.token(of: initializer), in: tokens,
                                 args: ["illegal initializer (only variables can be initialized)"])
                 }
-                _ = declareFunction(name, type: type, at: nameTok, tokens: tokens)
+                _ = declareFunction(name, type: type, isStatic: spec.isStatic, at: nameTok, tokens: tokens)
             } else {
                 declareVariable(name, type: type, spec: spec, declarator: declarator, initializer: initializer, isFileScope: isFileScope,
-                                at: nameTok, tree: tree, tokens: tokens)
+                                alignment: alignment, at: nameTok, into: &stmts, tree: tree, tokens: tokens)
             }
         }
+        pendingVLALengths.removeAll()
+    }
+
+    /// A `declLocal` statement for `decl`, taking the VLA lengths elaborated by its declarator.
+    private mutating func emitLocalDeclaration(_ decl: DeclId, initializer: SemInstId, node: NodeId) -> SemInstId {
+        var items: [UInt32] = [initializer.rawIndex, UInt32(pendingVLALengths.count)]
+        for (type, length) in pendingVLALengths { items += [type.rawIndex, length.rawIndex] }
+        pendingVLALengths.removeAll()
+        return emitList(.declLocal, .void, arg0: decl.rawIndex, items: items, node: node)
     }
 
     /// GNU `__attribute__((mode(M)))` on an integer declaration selects the integer type of machine mode `M`
@@ -724,8 +688,51 @@ public struct CSemanticAnalyzer: ~Copyable {
         return type
     }
 
-    private mutating func declareTypedef(_ name: String, type: QualType, at nameTok: TokenId, tokens: borrowing TokenBuffer) {
-        let typedefTypeId = typePool.typedefType(name: name, underlying: type)
+    /// The alignment requested by `alignas(N)`, `alignas(T)` or `__attribute__((aligned(N)))` among `attributes` (the
+    /// largest; a bare `aligned` is the target's largest alignment), or nil if none is.
+    private mutating func explicitAlignment(_ attributes: [NodeId], tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> Int? {
+        var result: Int? = nil
+        func raise(_ n: Int) { if n > 0 { result = max(result ?? 1, n) } }
+        for attr in attributes where tree.kind(of: attr) == .attributeSpec {
+            let anchor = tree.token(of: attr)
+            if CTokenKind(rawValue: tokens.kind(of: anchor)) == .kwAlignas {
+                guard let operand = tree.children(of: attr).first else { continue }
+                if tree.kind(of: operand) == .typeName {
+                    let t = resolveType(from: operand, tree: tree, tokens: tokens)
+                    if !t.isError { raise(typePool.alignment(of: t.typeId)) }
+                } else if let n = constantValue(operand, tree: tree, tokens: tokens), !n.isNegative {
+                    raise(Int(clamping: n.bits))
+                }
+                continue
+            }
+            // `__attribute__((aligned(N)))`: each argument is a child; `aligned` without one is the largest alignment
+            for operand in tree.children(of: attr) {
+                if let n = constantValue(operand, tree: tree, tokens: tokens), !n.isNegative { raise(Int(clamping: n.bits)) }
+            }
+            var i = Int(anchor.rawIndex) + 1
+            var depth = 0
+            repeat {
+                guard i + 1 < tokens.count else { break }
+                let tok = TokenId(UInt32(i))
+                switch CTokenKind(rawValue: tokens.kind(of: tok)) {
+                case .lParen: depth += 1
+                case .rParen: depth -= 1
+                case .identifier:
+                    let word = spelling(of: tok, in: tokens)
+                    if (word == "aligned" || word == "__aligned__") && CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(i + 1)))) != .lParen {
+                        raise(dataLayout.maxAlignment)
+                    }
+                default: break
+                }
+                i += 1
+            } while depth > 0
+        }
+        return result
+    }
+
+    @discardableResult
+    private mutating func declareTypedef(_ name: String, type: QualType, alignment: Int? = nil, at nameTok: TokenId, tokens: borrowing TokenBuffer) -> DeclId {
+        let typedefTypeId = typePool.typedefType(name: name, underlying: type, alignment: alignment)
         let typedefQualType = QualType(typeId: typedefTypeId, qualifiers: type.qualifiers)
 
         // C23 6.7p3: a typedef may be redefined in the same scope only to denote the same type
@@ -744,42 +751,68 @@ public struct CSemanticAnalyzer: ~Copyable {
             origin: GlobalLocation(unitId: UnitId(1), location: tokens.start(of: nameTok))
         )
         currentScope.insertOrdinary(symbol: CSymbol(name: name, declId: declId, type: typedefQualType, storage: .typedef))
+        return declId
     }
 
     /// Declares a function; redeclarations in the same scope must have compatible types (C23 6.7p4).
-    private mutating func declareFunction(_ name: String, type: QualType, at nameTok: TokenId, tokens: borrowing TokenBuffer) -> DeclId {
-        if !builtinNames.contains(name), let prior = currentScope.lookupLocalOrdinary(name), !typesCompatible(prior.type, type) {
-            reportError("conflicting types for '\(name)'", diagId: .semaRedeclaration, at: nameTok, in: tokens, args: [name])
+    private mutating func declareFunction(_ name: String, type: QualType, isStatic: Bool, isDefinition: Bool = false, at nameTok: TokenId,
+                                          tokens: borrowing TokenBuffer) -> DeclId {
+        var isStatic = isStatic
+        if !builtinNames.contains(name), let prior = currentScope.lookupLocalOrdinary(name) {
+            if !typesCompatible(prior.type, type) {
+                reportError("conflicting types for '\(name)'", diagId: .semaRedeclaration, at: nameTok, in: tokens, args: [name])
+            }
+            // A redeclaration keeps the linkage of the prior declaration (C23 6.2.2p5)
+            if case .function = prior.storage, DeclAttributes(rawValue: declTable.attrs[prior.declId]).storage == .internalStatic {
+                isStatic = true
+            }
         }
         let declId = declTable.append(
             kind: .function,
             name: name,
             type: type,
-            origin: GlobalLocation(unitId: UnitId(1), location: tokens.start(of: nameTok))
+            origin: GlobalLocation(unitId: UnitId(1), location: tokens.start(of: nameTok)),
+            attrs: DeclAttributes(storage: isStatic ? .internalStatic : .external, isDefinition: isDefinition).rawValue
         )
         currentScope.insertOrdinary(symbol: CSymbol(name: name, declId: declId, type: type, storage: .function(name: name)))
         return declId
     }
 
+    /// Records a file-scope object definition or tentative definition, keeping one per name: a definition replaces
+    /// a tentative one (C23 6.9.2p2).
+    private mutating func registerFileScopeObject(_ global: SemGlobal) {
+        if let i = globalIndexByName[global.symbol] {
+            if semGlobals[i].isTentative && !global.isTentative { semGlobals[i] = global }
+            return
+        }
+        globalIndexByName[global.symbol] = semGlobals.count
+        semGlobals.append(global)
+    }
+
     private mutating func declareVariable(_ name: String, type declaredType: QualType, spec: DeclSpecs, declarator: NodeId, initializer: NodeId?,
-                                          isFileScope: Bool, at nameTok: TokenId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) {
+                                          isFileScope: Bool, alignment: Int?, at nameTok: TokenId, into stmts: inout [UInt32],
+                                          tree: borrowing ParseTree, tokens: borrowing TokenBuffer) {
         var varType = declaredType
         // An array of unknown size is completed by its initializer (C23 6.7.10p22)
-        if let initializer, case .array(let element, 0) = canonicalKind(varType),
+        if let initializer, case .array(let element, 0) = canonicalKind(varType), !typePool.isVariableLengthArray(varType.typeId),
            let count = initializerLength(initializer, element: element, tree: tree, tokens: tokens) {
             varType = QualType(typeId: typePool.arrayType(elementType: element, count: count), qualifiers: varType.qualifiers)
         }
         let isVoid = !varType.isError && typePool.canonical(of: varType.typeId) == .void
         let isIncomplete = !spec.infersType && !varType.isError && !typePool.isComplete(varType.typeId)
+        let origin = GlobalLocation(unitId: UnitId(1), location: tokens.start(of: nameTok))
+        let objectAlignment = max(alignment ?? 1, varType.isError ? 1 : typePool.alignment(of: varType.typeId))
 
         if isFileScope {
             // C23 6.7p4 / 6.9.2: redeclarations must have compatible types; at most one external definition
+            var isStatic = spec.isStatic
             if let prior = currentScope.lookupLocalOrdinary(name), !builtinNames.contains(name) {
                 switch prior.storage {
                 case .global, .function:
                     if !typesCompatible(prior.type.unqualified(), varType.unqualified()) {
                         reportError("redefinition of '\(name)' with a different type", diagId: .semaRedeclaration, at: nameTok, in: tokens, args: [name])
                     }
+                    if DeclAttributes(rawValue: declTable.attrs[prior.declId]).storage == .internalStatic { isStatic = true }
                 case .typedef, .enumConstant:
                     reportError("redefinition of '\(name)'", diagId: .semaRedefinition, at: nameTok, in: tokens, args: [name])
                 default:
@@ -792,31 +825,36 @@ public struct CSemanticAnalyzer: ~Copyable {
             } else if !spec.isExtern && isIncomplete && !isArrayType(varType) {
                 tentativeDefinitions.append((name, varType, nameTok))
             }
+            let attrs = DeclAttributes(storage: isStatic ? .internalStatic : .external, isThreadLocal: spec.isThreadLocal,
+                                       isDefinition: initializer != nil || !spec.isExtern)
+            let declId = declTable.append(kind: .variable, name: name, type: varType, origin: origin, attrs: attrs.rawValue)
+            if let alignment { objectAlignments[declId] = alignment }
+            var initInst = SemInstId.nilId
             if let initializer {
                 if !initializedGlobals.insert(name).inserted {
                     reportError("redefinition of '\(name)'", diagId: .semaRedefinition, at: nameTok, in: tokens, args: [name])
                 }
                 // The identifier is in scope in its own initializer: `void *__dso_handle = &__dso_handle;`
                 if !spec.infersType && currentScope.lookupLocalOrdinary(name) == nil {
-                    currentScope.insertOrdinary(symbol: CSymbol(name: name, declId: .nilId, type: varType, storage: .global(name: name)))
+                    currentScope.insertOrdinary(symbol: CSymbol(name: name, declId: declId, type: varType, storage: .global(name: name)))
                 }
-                let initInst = analyzeExpression(initializer, tree: tree, tokens: tokens)
+                let resolved = resolveVariableInitializer(initializer, type: varType, infersType: spec.infersType, tree: tree, tokens: tokens)
+                initInst = resolved.inst
                 if !isConstantInitializer(initializer, tree: tree, tokens: tokens) {
                     reportError("initializer element is not a compile-time constant", diagId: .semaConstantExprNotConstant, at: tree.token(of: initializer), in: tokens)
+                    initInst = .nilId  // diagnosed: no image
                 } else if tree.kind(of: initializer) != .initList && !spec.infersType {
-                    checkAssignment(to: varType, from: initInst, rhsNode: initializer, tree: tree, tokens: tokens)
+                    checkAssignment(to: varType, from: resolved.raw, rhsNode: initializer, tree: tree, tokens: tokens)
                 }
-                if spec.infersType {
-                    varType = isTyped(initInst) ? decayed(typeOf(initInst)).unqualified() : .error
-                }
+                varType = resolved.type
+                declTable.setType(for: declId, type: varType)
+            }
+            if initializer != nil || !spec.isExtern {
+                registerFileScopeObject(SemGlobal(
+                    declId: declId, symbol: name, type: varType, isExternal: !isStatic, isThreadLocal: spec.isThreadLocal,
+                    alignment: max(objectAlignment, alignment ?? 1), initBlock: .nilId, initInst: initInst, isTentative: initializer == nil))
             }
 
-            let declId = declTable.append(
-                kind: .variable,
-                name: name,
-                type: varType,
-                origin: GlobalLocation(unitId: UnitId(1), location: tokens.start(of: nameTok))
-            )
             let sym = CSymbol(name: name, declId: declId, type: varType, storage: .global(name: name))
             currentScope.insertOrdinary(symbol: sym)
             symbolRefs[declarator] = sym
@@ -825,8 +863,8 @@ public struct CSemanticAnalyzer: ~Copyable {
         }
 
         if spec.isExtern {
-            let declId = declTable.append(kind: .variable, name: name, type: varType,
-                                          origin: GlobalLocation(unitId: UnitId(1), location: tokens.start(of: nameTok)))
+            let declId = declTable.append(kind: .variable, name: name, type: varType, origin: origin,
+                                          attrs: DeclAttributes(storage: .external, isThreadLocal: spec.isThreadLocal).rawValue)
             currentScope.insertOrdinary(symbol: CSymbol(name: name, declId: declId, type: varType, storage: .global(name: name)))
             return
         }
@@ -835,45 +873,64 @@ public struct CSemanticAnalyzer: ~Copyable {
             reportError("variable has incomplete type", diagId: .semaIncompleteType, at: nameTok, in: tokens, args: [typeName(varType)])
         }
 
+        let storage: CSymbolStorage = spec.isStatic ? .staticLocal : .local
+        let attrs = DeclAttributes(storage: spec.isStatic ? .internalStatic : .automatic, isThreadLocal: spec.isThreadLocal, isDefinition: true)
+        let declId = declTable.append(kind: .variable, name: name, parent: currentFunctionDecl, type: varType, origin: origin, attrs: attrs.rawValue)
+        if let alignment { objectAlignments[declId] = alignment }
+        let vlaLengths = pendingVLALengths
+        pendingVLALengths.removeAll()
+
         // Pre-insert the symbol so `int *p = malloc(sizeof *p)` resolves `p` in its own initializer
         if !spec.infersType {
-            currentScope.insertOrdinary(symbol: CSymbol(name: name, declId: .nilId, type: varType, storage: .local(offset: 0)))
+            currentScope.insertOrdinary(symbol: CSymbol(name: name, declId: declId, type: varType, storage: storage))
         }
 
-        var initInst: SemInstId? = nil
+        var initInst = SemInstId.nilId
         if let initializer {
-            let inst = analyzeExpression(initializer, tree: tree, tokens: tokens)
-            initInst = inst
+            let resolved = resolveVariableInitializer(initializer, type: varType, infersType: spec.infersType, tree: tree, tokens: tokens)
+            initInst = resolved.inst
             if spec.isStatic && !isConstantInitializer(initializer, tree: tree, tokens: tokens) {
                 reportError("initializer element is not a compile-time constant", diagId: .semaConstantExprNotConstant, at: tree.token(of: initializer), in: tokens)
+                initInst = .nilId
             }
-            if spec.infersType {
-                varType = isTyped(inst) ? decayed(typeOf(inst)).unqualified() : .error
-            } else if tree.kind(of: initializer) != .initList {
-                checkAssignment(to: varType, from: inst, rhsNode: initializer, tree: tree, tokens: tokens)
+            if !spec.infersType && tree.kind(of: initializer) != .initList {
+                checkAssignment(to: varType, from: resolved.raw, rhsNode: initializer, tree: tree, tokens: tokens)
             }
+            varType = resolved.type
+            declTable.setType(for: declId, type: varType)
         }
 
-        let sz = max(8, typePool.size(of: varType.typeId))
-        currentStackOffset += Int32((sz + 7) & ~7)
-        let offset = -currentStackOffset
-
-        let declId = declTable.append(
-            kind: .variable,
-            name: name,
-            type: varType,
-            origin: GlobalLocation(unitId: UnitId(1), location: tokens.start(of: nameTok))
-        )
-        let sym = CSymbol(name: name, declId: declId, type: varType, storage: .local(offset: offset))
+        let sym = CSymbol(name: name, declId: declId, type: varType, storage: storage)
         currentScope.insertOrdinary(symbol: sym)
         symbolRefs[declarator] = sym
         nodeTypes[declarator] = varType.typeId
         recordConstexprValue(declId, spec: spec, type: varType, initializer: initializer, tree: tree, tokens: tokens)
 
-        if let initInst, let container = currentBlockContainer {
-            let lhsInst = container.block.append(kind: .declRef, type: varType, arg0: declId.rawIndex, node: declarator)
-            _ = container.block.append(kind: .assign, type: varType, arg0: lhsInst.rawIndex, arg1: initInst.rawIndex, node: declarator)
+        if spec.isStatic {
+            // A block-scope static is an object of the unit, initialized before program startup
+            let symbol = "\(currentFunctionName).\(name)"
+            staticSymbols[declId] = symbol
+            semGlobals.append(SemGlobal(
+                declId: declId, symbol: symbol, type: varType, isExternal: false, isThreadLocal: spec.isThreadLocal,
+                alignment: max(objectAlignment, varType.isError ? 1 : typePool.alignment(of: varType.typeId)),
+                initBlock: currentBlockId, initInst: initInst, isTentative: false))
+        } else {
+            pendingVLALengths = vlaLengths
+            stmts.append(emitLocalDeclaration(declId, initializer: initInst, node: declarator).rawIndex)
         }
+    }
+
+    /// The initializer of a variable: resolved against its type (`resolveInitializer`), or, for C23 `auto`, the value
+    /// whose type the variable takes (after lvalue conversion and decay, unqualified). `raw` is the analyzed
+    /// expression of a non-braced initializer, for the assignment constraints.
+    private mutating func resolveVariableInitializer(_ initializer: NodeId, type: QualType, infersType: Bool, tree: borrowing ParseTree,
+                                                     tokens: borrowing TokenBuffer) -> (inst: SemInstId, raw: SemInstId, type: QualType) {
+        if infersType {
+            let raw = analyzeExpression(initializer, tree: tree, tokens: tokens)
+            let inferred = isTyped(raw) ? decayed(typeOf(raw)).unqualified() : QualType.error
+            return (rvalue(raw), raw, inferred)
+        }
+        return resolveInitializer(initializer, type: type, tree: tree, tokens: tokens)
     }
 
     /// A `constexpr` object of integer type is a named constant (C23 6.6p7): record its value for constant evaluation.
@@ -921,59 +978,57 @@ public struct CSemanticAnalyzer: ~Copyable {
               let bodyNode = children.last, tree.kind(of: bodyNode) == .compoundStmt else { return }
         let spec = resolveDeclSpecs(specsNode, tree: tree, tokens: tokens)
         let info = applyDeclarator(declarator, to: spec.type, tree: tree, tokens: tokens)
+        pendingVLALengths.removeAll()  // parameter VLA lengths: the parameters are pointers
         let (fnType, fnTok, paramsNode) = (info.type, info.name, info.params)
         guard case .function(let returnType, _, _) = canonicalKind(fnType), let paramsNode,
               CTokenKind(rawValue: tokens.kind(of: fnTok)) == .identifier else { return }
         let fnName = spelling(of: fnTok, in: tokens)
         let signature = resolveParameters(paramsNode, tree: tree, tokens: tokens)
-        let fnDeclId = declareFunction(fnName, type: fnType, at: fnTok, tokens: tokens)
+        let fnDeclId = declareFunction(fnName, type: fnType, isStatic: spec.isStatic, isDefinition: true, at: fnTok, tokens: tokens)
         if !definedFunctions.insert(fnName).inserted {
             reportError("redefinition of '\(fnName)'", diagId: .semaRedefinition, at: fnTok, in: tokens, args: [fnName])
         }
 
         self.currentReturnType = returnType
         currentFunctionName = fnName
+        currentFunctionDecl = fnDeclId
         functionLabels = [:]
+        labelNumbers = [:]
+        labelNames = [""]
         pendingGotos = []
         let fnScope = CScope(parent: currentScope)
         self.currentScope = fnScope
-        self.currentStackOffset = 0
 
         let blockContainer = SemInstBlockContainer(block: SemInstBlock())
         self.currentBlockContainer = blockContainer
         let blockId = InstBlockId(UInt32(instBlocks.count))
+        currentBlockId = blockId
         instBlocks.append(blockContainer)
         declTable.setBody(for: fnDeclId, blockId: blockId.rawIndex)
 
-        // Allocate and bind parameters
+        // Bind the parameters; each has a declaration (an unnamed one too), in order
         let paramNames = signature.names.map { $0.isValid ? spelling(of: $0, in: tokens) : "" }
+        var paramDecls: [DeclId] = []
         for (idx, pName) in paramNames.enumerated() {
             let pType = signature.types[idx]
-            let sz = max(8, typePool.size(of: pType.typeId))
-            currentStackOffset += Int32((sz + 7) & ~7)
-            let offset = -currentStackOffset
-            guard !pName.isEmpty else { continue }
-            if currentScope.lookupLocalOrdinary(pName) != nil {
+            if !pName.isEmpty, currentScope.lookupLocalOrdinary(pName) != nil {
                 reportError("redefinition of parameter '\(pName)'", diagId: .semaRedefinition, at: signature.names[idx], in: tokens, args: [pName])
             }
-            let pDecl = declTable.append(
-                kind: .parameter,
-                name: pName,
-                parent: fnDeclId,
-                type: pType
-            )
-            currentScope.insertOrdinary(symbol: CSymbol(name: pName, declId: pDecl, type: pType, storage: .param(index: idx, offset: offset)))
+            let pDecl = declTable.append(kind: .parameter, name: pName, parent: fnDeclId, type: pType,
+                                         attrs: DeclAttributes(storage: .parameter).rawValue)
+            paramDecls.append(pDecl)
+            guard !pName.isEmpty else { continue }
+            currentScope.insertOrdinary(symbol: CSymbol(name: pName, declId: pDecl, type: pType, storage: .param(index: idx)))
         }
 
-        analyzeStatement(bodyNode, tree: tree, tokens: tokens)
+        // The body's `compound` is the block's last instruction, its root
+        _ = analyzeCompound(bodyNode, tree: tree, tokens: tokens)
         self.currentBlockContainer = fileScopeContainer
+        currentBlockId = .nilId
+        currentFunctionDecl = .nilId
         for g in pendingGotos where functionLabels[g.name] == nil {
             reportError("use of undeclared label '\(g.name)'", diagId: .semaUndefinedLabel, at: g.tok, in: tokens, args: [g.name])
         }
-
-        // 16-byte align stack frame
-        let rawFrame = currentStackOffset
-        let alignedFrame = (rawFrame + 15) & ~15
 
         if !functionOrder.contains(fnName) {
             functionOrder.append(fnName)
@@ -984,10 +1039,13 @@ public struct CSemanticAnalyzer: ~Copyable {
             paramNames: paramNames,
             paramTypes: signature.types.map { $0.typeId },
             bodyNode: bodyNode,
-            stackFrameSize: alignedFrame,
             declId: fnDeclId,
-            blockId: blockId
+            blockId: blockId,
+            paramDecls: paramDecls
         )
+        semFunctions.append(SemFunction(declId: fnDeclId, name: fnName, blockId: blockId, params: paramDecls, labels: labelNames,
+                                        isExternal: DeclAttributes(rawValue: declTable.attrs[fnDeclId]).storage == .external))
+        currentFunctionName = ""
 
         self.currentScope = fnScope.parent ?? CScope()
     }
@@ -1036,12 +1094,15 @@ public struct CSemanticAnalyzer: ~Copyable {
             let mChildren = tree.children(of: member)
             guard let specsNode = mChildren.first(where: { tree.kind(of: $0) == .declSpecs }) else { continue }
             let spec = resolveDeclSpecs(specsNode, tree: tree, tokens: tokens)
+            let specAttributes = tree.children(of: specsNode).filter { tree.kind(of: $0) == .attributeSpec }
             if !mChildren.contains(where: { tree.kind(of: $0) == .declarator }) {
                 // C11 anonymous struct or union member; a named tag here only declares the tag
                 let specChildren = tree.children(of: specsNode)
                 if let tag = specChildren.first(where: { tree.kind(of: $0) == .structType || tree.kind(of: $0) == .unionType }),
                    [.kwStruct, .kwUnion].contains(CTokenKind(rawValue: tokens.kind(of: tree.token(of: tag)))) {
-                    members.append(StructMemberDecl(name: "", type: spec.type))
+                    let attributes = specAttributes + mChildren.filter { tree.kind(of: $0) == .attributeSpec }
+                    members.append(StructMemberDecl(name: "", type: spec.type, alignment: explicitAlignment(attributes, tree: tree, tokens: tokens),
+                                                    isPacked: hasPackedAttribute(attributes, tree: tree, tokens: tokens)))
                 }
                 continue
             }
@@ -1050,9 +1111,19 @@ public struct CSemanticAnalyzer: ~Copyable {
                 let declarator = mChildren[i]
                 i += 1
                 guard tree.kind(of: declarator) == .declarator else { continue }
+                // The declarator's attributes, its bit-field width, then attributes after the width
+                var attributes = specAttributes + tree.children(of: declarator).filter { tree.kind(of: $0) == .attributeSpec }
+                while i < mChildren.count, tree.kind(of: mChildren[i]) == .attributeSpec {
+                    attributes.append(mChildren[i])
+                    i += 1
+                }
                 var widthNode: NodeId? = nil
                 if i < mChildren.count, tree.kind(of: mChildren[i]) != .declarator, tree.kind(of: mChildren[i]) != .attributeSpec {
                     widthNode = mChildren[i]
+                    i += 1
+                }
+                while i < mChildren.count, tree.kind(of: mChildren[i]) == .attributeSpec {
+                    attributes.append(mChildren[i])
                     i += 1
                 }
                 let info = applyDeclarator(declarator, to: spec.type, tree: tree, tokens: tokens)
@@ -1078,11 +1149,16 @@ public struct CSemanticAnalyzer: ~Copyable {
                 if let widthNode {
                     bitWidth = checkBitFieldWidth(widthNode, type: type, name: mName, at: loc, tree: tree, tokens: tokens)
                 }
-                members.append(StructMemberDecl(name: mName, type: type, bitWidth: bitWidth))
+                let memberType = applyMachineMode(type, attributes: attributes, tree: tree, tokens: tokens)
+                members.append(StructMemberDecl(name: mName, type: memberType, bitWidth: bitWidth,
+                                                alignment: explicitAlignment(attributes, tree: tree, tokens: tokens),
+                                                isPacked: hasPackedAttribute(attributes, tree: tree, tokens: tokens)))
             }
         }
 
-        typePool.completeStruct(structTypeId, fields: members, isPacked: hasPackedAttribute(children, tree: tree, tokens: tokens))
+        let typeAttributes = children.filter { tree.kind(of: $0) == .attributeSpec }
+        typePool.completeStruct(structTypeId, fields: members, isPacked: hasPackedAttribute(typeAttributes, tree: tree, tokens: tokens),
+                                alignment: explicitAlignment(typeAttributes, tree: tree, tokens: tokens))
         if !name.isEmpty {
             _ = declTable.append(kind: isUnion ? .unionDecl : .structDecl, name: name, type: QualType(typeId: structTypeId))
         }
@@ -1119,12 +1195,7 @@ public struct CSemanticAnalyzer: ~Copyable {
 
     /// The width in bits of an integer type (`bool` has 1).
     private func integerWidth(_ type: TypeId) -> Int {
-        switch typePool.typeInfo(of: typePool.canonical(of: type)).kind {
-        case .int(let width, _): return width
-        case .bool: return 1
-        case .enum(_, let underlying, _): return integerWidth(underlying)
-        default: return typePool.size(of: type) * 8
-        }
+        typePool.integerWidth(type)
     }
 
     /// Whether a struct or union specifier carries GNU `__attribute__((packed))`.
@@ -1306,40 +1377,7 @@ public struct CSemanticAnalyzer: ~Copyable {
 
     /// The C spelling of a type, for diagnostics: `const char *`, `struct S`, `int (*)[4]`, `void (int, ...)`.
     private func typeName(_ t: QualType, declarator: String = "") -> String {
-        let quals = [(t.isConst, "const"), (t.isVolatile, "volatile"), (t.isRestrict, "restrict")].filter(\.0).map(\.1).joined(separator: " ")
-        func named(_ base: String) -> String {
-            let spelled = quals.isEmpty ? base : quals + " " + base
-            return declarator.isEmpty ? spelled : spelled + " " + declarator
-        }
-        switch typePool.typeInfo(of: t.typeId).kind {
-        case .typedef(let name, _):
-            return named(name)
-        case .pointer(let pointee):
-            let inner = "*" + quals + (declarator.isEmpty || quals.isEmpty ? "" : " ") + declarator
-            return typeName(pointee, declarator: isArrayOrFunction(pointee) ? "(\(inner))" : inner)
-        case .array(let element, let count):
-            return typeName(element, declarator: declarator + "[\(count == 0 ? "" : String(count))]")
-        case .function(let returnType, let params, let isVariadic):
-            let list = params.map { typeName($0) } + (isVariadic ? ["..."] : [])
-            return typeName(returnType, declarator: declarator + "(" + (list.isEmpty ? "void" : list.joined(separator: ", ")) + ")")
-        case .struct(let name, _, let isUnion):
-            return named((isUnion ? "union " : "struct ") + (name.isEmpty ? "(unnamed)" : name))
-        case .enum(let name, _, _):
-            return named("enum " + (name.isEmpty ? "(unnamed)" : name))
-        case .int(let width, let isSigned):
-            let builtin: [TypeId: String] = [.char: "char", .schar: "signed char", .uchar: "unsigned char", .short: "short",
-                                             .ushort: "unsigned short", .int: "int", .uint: "unsigned int", .long: "long",
-                                             .ulong: "unsigned long", .longlong: "long long", .ulonglong: "unsigned long long",
-                                             .int128: "__int128"]
-            return named(builtin[typePool.canonical(of: t.typeId)] ?? "\(isSigned ? "" : "unsigned ")_BitInt(\(width))")
-        case .float:
-            let can = typePool.canonical(of: t.typeId)
-            return named(can == .float ? "float" : can == .double ? "double" : "long double")
-        case .bool: return named("bool")
-        case .void: return named("void")
-        case .nullptr: return named("nullptr_t")
-        case .error: return named("<unknown type>")
-        }
+        typePool.name(of: t, declarator: declarator)
     }
 
     private func isStructOrUnion(_ t: QualType) -> Bool {
@@ -1379,7 +1417,7 @@ public struct CSemanticAnalyzer: ~Copyable {
     /// Array-to-pointer and function-to-pointer conversion (C23 6.3.2.1p3-4); other types are unchanged.
     private func decayed(_ t: QualType) -> QualType {
         switch canonicalKind(t) {
-        case .array(let element, _): return QualType(typeId: typePool.pointerTo(element))
+        case .array(let element, _): return QualType(typeId: typePool.pointerTo(QualType(rawValue: element.rawValue | UInt32(t.qualifiers))))
         case .function: return QualType(typeId: typePool.pointerTo(t.unqualified()))
         default: return t
         }
@@ -1417,7 +1455,7 @@ public struct CSemanticAnalyzer: ~Copyable {
     private mutating func checkBlockScopeRedefinition(_ name: String, at tok: TokenId, tokens: borrowing TokenBuffer) {
         guard let prior = currentScope.lookupLocalOrdinary(name), prior.declId.isValid else { return }
         switch prior.storage {
-        case .local, .param, .typedef, .enumConstant:
+        case .local, .staticLocal, .param, .typedef, .enumConstant:
             reportError("redefinition of '\(name)'", diagId: .semaRedefinition, at: tok, in: tokens, args: [name])
         default:
             break
@@ -1430,7 +1468,7 @@ public struct CSemanticAnalyzer: ~Copyable {
         case .identExpr:
             guard let sym = symbolRefs[node] else { return true }
             switch sym.storage {
-            case .local, .param, .global: return true
+            case .local, .staticLocal, .param, .global: return true
             default: return false
             }
         case .memberExpr:
@@ -1551,7 +1589,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             guard let sym = currentScope.lookupOrdinary(spelling(of: tree.token(of: node), in: tokens)),
                   constexprValues[sym.declId] == nil else { return false }
             switch sym.storage {
-            case .global, .local, .param, .function: return true
+            case .global, .local, .staticLocal, .param, .function: return true
             default: return false
             }
         case .unaryExpr:
@@ -1580,7 +1618,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             switch sym.storage {
             case .enumConstant, .function: return true
             // Arrays/functions decay to address constants; const-qualified objects fold (a Clang/GCC extension)
-            case .global: return isArrayOrFunction(sym.type) || sym.type.isConst || sym.type.isError
+            case .global, .staticLocal: return isArrayOrFunction(sym.type) || sym.type.isConst || sym.type.isError
             case .local, .param: return false
             case .typedef: return true
             }
@@ -1618,21 +1656,246 @@ public struct CSemanticAnalyzer: ~Copyable {
         return tree.children(of: node).contains { refersToAutomaticObject($0, tree: tree, tokens: tokens) }
     }
 
+    // MARK: - SemIR Emission
+
+    /// The block instructions are emitted into: the current function body's, or the file-scope block.
+    private var block: SemInstBlockContainer { currentBlockContainer ?? fileScopeContainer }
+
+    @discardableResult
+    private func emit(_ kind: SemInstKind, _ type: QualType, _ arg0: UInt32 = 0, _ arg1: UInt32 = 0, node: NodeId) -> SemInstId {
+        block.block.append(kind: kind, type: type, arg0: arg0, arg1: arg1, node: node)
+    }
+
+    @discardableResult
+    private func emitList(_ kind: SemInstKind, _ type: QualType, arg0: UInt32 = 0, items: [UInt32], node: NodeId) -> SemInstId {
+        let offset = block.block.appendList(items)
+        return block.block.append(kind: kind, type: type, arg0: arg0, arg1: offset, node: node)
+    }
+
+    private func kindOf(_ inst: SemInstId) -> SemInstKind {
+        block.block.kind(of: inst)
+    }
+
+    private func nodeOf(_ inst: SemInstId) -> NodeId {
+        NodeId(block.block.nodes[inst])
+    }
+
+    /// The value of an expression (C23 6.3.2.1p2-4): an lvalue is loaded (lvalue conversion, which drops the
+    /// qualifiers), an array decays to a pointer to its first element, and a function designator to a pointer to the
+    /// function. Rvalues, and expressions sema does not model, are returned unchanged.
+    private func rvalue(_ inst: SemInstId) -> SemInstId {
+        guard inst.isValid, isTyped(inst) else { return inst }
+        let k = kindOf(inst), t = typeOf(inst)
+        guard k.isLvalue else { return inst }
+        switch canonicalKind(t) {
+        case .array:
+            return emit(.arrayToPointer, decayed(t), inst.rawIndex, node: nodeOf(inst))
+        case .function:
+            return emit(.functionToPointer, decayed(t), inst.rawIndex, node: nodeOf(inst))
+        default:
+            return emit(.lvalueToRvalue, t.unqualified(), inst.rawIndex, node: nodeOf(inst))
+        }
+    }
+
+    /// The operation converting a value of type `from` to type `to`, or nil if C has none.
+    private func castKind(from: QualType, to: QualType) -> CastKind? {
+        let s = typePool.canonical(of: from.typeId), d = typePool.canonical(of: to.typeId)
+        if d == .void || d == .cVoid { return .toVoid }
+        if s == d { return .noop }
+        let sk = typePool.typeInfo(of: s).kind, dk = typePool.typeInfo(of: d).kind
+        let sInt = typePool.isInteger(type: s), sFloat = typePool.isFloating(type: s)
+        var sPtr = false, sNull = false
+        if case .pointer = sk { sPtr = true }
+        if case .nullptr = sk { sNull = true }
+        switch dk {
+        case .bool:
+            return (sInt || sFloat || sPtr || sNull) ? .toBool : nil
+        case .int, .enum:
+            if sInt {
+                // An enumeration and its underlying type, or two types of one width and signedness, share a representation
+                let same = typePool.integerWidth(s) == typePool.integerWidth(d)
+                    && typePool.isSignedInteger(type: s) == typePool.isSignedInteger(type: d) && !(typePool.canonical(of: s) == .bool)
+                return same ? .noop : .intToInt
+            }
+            if sFloat { return .floatToInt }
+            if sPtr { return .pointerToInt }
+            return nil
+        case .float:
+            if sInt { return .intToFloat }
+            if sFloat { return typePool.size(of: s) == typePool.size(of: d) && sk == dk ? .noop : .floatToFloat }
+            return nil
+        case .pointer:
+            if sPtr { return .pointerToPointer }
+            if sNull { return .nullToPointer }
+            if sInt { return .intToPointer }
+            return nil
+        case .nullptr:
+            return sNull ? .noop : nil
+        case .struct(_, let fields, let isUnion):
+            if typesCompatible(QualType(typeId: s), QualType(typeId: d)) { return .noop }
+            if isUnion && fields.contains(where: { typesCompatible($0.type.unqualified(), from.unqualified()) }) { return .toUnion }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    /// The conversion of rvalue `value` to `type` for `reason` (a conversion kind), or `value` itself if it already
+    /// has that type. A value whose type sema does not model is returned unchanged; one that cannot be converted
+    /// (a constraint violation, diagnosed elsewhere) becomes an `errorInst`.
+    private func convertImplicitly(_ value: SemInstId, to type: QualType, reason: SemInstKind, node: NodeId) -> SemInstId {
+        guard value.isValid, isTyped(value), !type.isError else { return value }
+        let target = type.unqualified()
+        let from = typeOf(value)
+        if typePool.canonical(of: from.typeId) == typePool.canonical(of: target.typeId) { return value }
+        guard let kind = castKind(from: from, to: target) else {
+            return emit(.errorInst, target, value.rawIndex, node: node)
+        }
+        return emit(reason, target, value.rawIndex, kind.rawValue, node: node)
+    }
+
+    /// `raw` converted as if by assignment to `type` (C23 6.5.16.1p2): its value, with a null pointer constant (an
+    /// integer constant 0, or `nullptr`) becoming a null pointer of the type.
+    private mutating func convertForAssignment(_ raw: SemInstId, node: NodeId, to type: QualType, tree: borrowing ParseTree,
+                                               tokens: borrowing TokenBuffer) -> SemInstId {
+        let value = rvalue(raw)
+        if isTyped(value), !type.isError, case .pointer = canonicalKind(type), let npc = nullPointerConversion(value, node: node, to: type, tree: tree, tokens: tokens) {
+            return npc
+        }
+        return convertImplicitly(value, to: type, reason: .assignConvert, node: node)
+    }
+
+    /// A `nullPointerConvert` of `value` to pointer type `type` if `value` is a null pointer constant, else nil.
+    private mutating func nullPointerConversion(_ value: SemInstId, node: NodeId, to type: QualType, tree: borrowing ParseTree,
+                                                tokens: borrowing TokenBuffer) -> SemInstId? {
+        let src = canonicalKind(typeOf(value))
+        var isNull = false
+        if case .nullptr = src { isNull = true }
+        if !isNull && typePool.isInteger(type: typeOf(value).typeId) { isNull = isNullPointerConstant(node, tree: tree, tokens: tokens) }
+        guard isNull else { return nil }
+        return emit(.nullPointerConvert, type.unqualified(), value.rawIndex, CastKind.nullToPointer.rawValue, node: node)
+    }
+
+    /// The integer promotions (C23 6.3.1.1p2) of rvalue `value`; a bit-field narrower than `int` promotes to `int`.
+    private func promoted(_ value: SemInstId, reason: SemInstKind = .intPromotion) -> SemInstId {
+        guard isTyped(value), typePool.isInteger(type: typeOf(value).typeId) else { return value }
+        return convertImplicitly(value, to: promotedType(of: value), reason: reason, node: nodeOf(value))
+    }
+
+    private func promotedType(of value: SemInstId) -> QualType {
+        let t = typeOf(value)
+        guard typePool.isInteger(type: t.typeId) else { return t.unqualified() }
+        let promotedId = typePool.promote(type: t.typeId)
+        // A bit-field of a type whose promoted type is `int` or `unsigned int` promotes to `int` if `int` can
+        // represent all its values (C23 6.3.1.1p2)
+        if kindOf(value) == .lvalueToRvalue, (promotedId == .int || promotedId == .uint) {
+            let operand = SemInstId(block.block.arg0[value])
+            if kindOf(operand) == .bitField, let width = block.block.extra(of: operand).dropFirst(2).first, width < 32 {
+                return .int
+            }
+        }
+        return QualType(typeId: promotedId)
+    }
+
+    /// The default argument promotions (C23 6.5.2.2p6): `float` (and `_Float16`) to `double`, and the integer
+    /// promotions.
+    private func argumentPromoted(_ value: SemInstId) -> SemInstId {
+        guard isTyped(value) else { return value }
+        let t = typeOf(value)
+        if typePool.isFloating(type: t.typeId), typePool.size(of: typePool.canonical(of: t.typeId)) < 8 {
+            return convertImplicitly(value, to: .double, reason: .argPromotion, node: nodeOf(value))
+        }
+        return promoted(value, reason: .argPromotion)
+    }
+
+    /// An expression used as a condition (`if`, loops, `?:`, `!`, `&&`, `||`): its value compared against 0, as `bool`.
+    private func conditionValue(_ raw: SemInstId) -> SemInstId {
+        let value = rvalue(raw)
+        guard isTyped(value), typePool.isScalar(type: typeOf(value).typeId) else { return value }
+        if typePool.canonical(of: typeOf(value).typeId) == .bool { return value }
+        return emit(.boolConvert, .bool, value.rawIndex, CastKind.toBool.rawValue, node: nodeOf(value))
+    }
+
+    /// An integer operand of pointer arithmetic, converted to `ptrdiff_t`.
+    private func pointerIndex(_ value: SemInstId) -> SemInstId {
+        convertImplicitly(value, to: QualType(typeId: dataLayout.ptrdiffType), reason: .arithmeticConvert, node: nodeOf(value))
+    }
+
+    /// The number of a label in the current function (1-based), allocated on first use.
+    private mutating func labelNumber(_ name: String) -> UInt32 {
+        if let n = labelNumbers[name] { return n }
+        let n = UInt32(labelNames.count)
+        labelNames.append(name)
+        labelNumbers[name] = n
+        return n
+    }
+
+    /// Positions of the two `;` of a `for` statement's header, to tell which clause each child is.
+    private func forHeaderSemicolons(_ forTok: TokenId, tokens: borrowing TokenBuffer) -> (UInt32, UInt32) {
+        var depth = 0
+        var semis: [UInt32] = []
+        var i = Int(forTok.rawIndex) + 1
+        scan: while i < tokens.count && semis.count < 2 {
+            switch CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(i)))) {
+            case .lParen, .lBracket, .lBrace: depth += 1
+            case .rParen, .rBracket, .rBrace:
+                depth -= 1
+                if depth == 0 { break scan }
+            case .semicolon where depth == 1: semis.append(UInt32(i))
+            default: break
+            }
+            i += 1
+        }
+        return (semis.first ?? .max, semis.count > 1 ? semis[1] : .max)
+    }
+
     // MARK: - Statements
 
-    private mutating func analyzeStatement(_ stmtNode: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) {
+    /// A compound statement (C23 6.8.3): a scope, and its statements in order.
+    private mutating func analyzeCompound(_ node: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> SemInstId {
+        let blockScope = CScope(parent: currentScope)
+        self.currentScope = blockScope
+        var stmts: [UInt32] = []
+        for child in tree.children(of: node) {
+            analyzeStatement(child, into: &stmts, tree: tree, tokens: tokens)
+        }
+        self.currentScope = blockScope.parent ?? CScope()
+        return emitList(.compound, .void, items: stmts, node: node)
+    }
+
+    /// A statement in a position that holds exactly one (a branch or a loop body): several (a declaration with many
+    /// declarators) become a `compound`, none a `nullStmt`.
+    private mutating func analyzeSubStatement(_ node: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> SemInstId {
+        var stmts: [UInt32] = []
+        analyzeStatement(node, into: &stmts, tree: tree, tokens: tokens)
+        if stmts.count == 1 { return SemInstId(stmts[0]) }
+        if stmts.isEmpty { return emit(.nullStmt, .void, node: node) }
+        return emitList(.compound, .void, items: stmts, node: node)
+    }
+
+    private func isDeclarationNode(_ node: NodeId, tree: borrowing ParseTree) -> Bool {
+        switch tree.kind(of: node) {
+        case .varDecl, .typedefDecl, .staticAssertDecl: return true
+        default: return false
+        }
+    }
+
+    /// The labeled statement of a `label:`, `case v:` or `default:` (its children after `skip`): nil when the label
+    /// precedes a declaration (C23 6.8.2), which then stays in the enclosing block; 0 when it ends the block.
+    private mutating func labeledStatement(of node: NodeId, skip: Int, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> SemInstId? {
+        guard let child = tree.children(of: node).dropFirst(skip).first else { return .nilId }
+        if isDeclarationNode(child, tree: tree) { return nil }
+        return analyzeSubStatement(child, tree: tree, tokens: tokens)
+    }
+
+    private mutating func analyzeStatement(_ stmtNode: NodeId, into stmts: inout [UInt32], tree: borrowing ParseTree, tokens: borrowing TokenBuffer) {
         let kind = tree.kind(of: stmtNode)
         switch kind {
         case .compoundStmt:
-            let blockScope = CScope(parent: currentScope)
-            self.currentScope = blockScope
-            for child in tree.children(of: stmtNode) {
-                analyzeStatement(child, tree: tree, tokens: tokens)
-            }
-            self.currentScope = blockScope.parent ?? CScope()
+            stmts.append(analyzeCompound(stmtNode, tree: tree, tokens: tokens).rawIndex)
 
         case .varDecl, .typedefDecl:
-            analyzeDeclaration(stmtNode, isFileScope: false, tree: tree, tokens: tokens)
+            analyzeDeclaration(stmtNode, isFileScope: false, into: &stmts, tree: tree, tokens: tokens)
 
         case .staticAssertDecl:
             analyzeStaticAssert(stmtNode, tree: tree, tokens: tokens)
@@ -1644,47 +1907,60 @@ public struct CSemanticAnalyzer: ~Copyable {
                 reportError("redefinition of label '\(label)'", diagId: .semaRedefinition, at: labelTok, in: tokens, args: [label])
             }
             functionLabels[label] = labelTok
-            for child in tree.children(of: stmtNode) {
-                analyzeStatement(child, tree: tree, tokens: tokens)
+            let number = labelNumber(label)
+            if let sub = labeledStatement(of: stmtNode, skip: 0, tree: tree, tokens: tokens) {
+                stmts.append(emit(.label, .void, sub.rawIndex, number, node: stmtNode).rawIndex)
+            } else {
+                stmts.append(emit(.label, .void, 0, number, node: stmtNode).rawIndex)
+                for child in tree.children(of: stmtNode) { analyzeStatement(child, into: &stmts, tree: tree, tokens: tokens) }
             }
 
         case .gotoStmt:
             let gotoTok = tree.token(of: stmtNode)
             let labelTok = TokenId(gotoTok.rawIndex + 1)
-            if Int(labelTok.rawIndex) < tokens.count, CTokenKind(rawValue: tokens.kind(of: labelTok)) == .identifier {
-                pendingGotos.append((spelling(of: labelTok, in: tokens), labelTok))
-            }
-            for child in tree.children(of: stmtNode) {
-                _ = analyzeExpression(child, tree: tree, tokens: tokens)  // `goto *expr` (GNU computed goto)
+            let children = tree.children(of: stmtNode)
+            if let target = children.first {
+                // `goto *expr` (GNU computed goto)
+                let address = rvalue(analyzeExpression(target, tree: tree, tokens: tokens))
+                stmts.append(emit(.indirectGoto, .void, address.rawIndex, node: stmtNode).rawIndex)
+            } else if Int(labelTok.rawIndex) < tokens.count, CTokenKind(rawValue: tokens.kind(of: labelTok)) == .identifier {
+                let name = spelling(of: labelTok, in: tokens)
+                pendingGotos.append((name, labelTok))
+                stmts.append(emit(.gotoStmt, .void, labelNumber(name), node: stmtNode).rawIndex)
             }
 
         case .breakStmt:
             if loopDepth == 0 && switchStack.isEmpty {
                 reportError("'break' statement not in loop or switch statement", diagId: .semaJumpOutsideLoop, at: tree.token(of: stmtNode), in: tokens, args: ["break", "loop or switch statement"])
             }
+            stmts.append(emit(.breakStmt, .void, node: stmtNode).rawIndex)
 
         case .continueStmt:
             if loopDepth == 0 {
                 reportError("'continue' statement not in loop statement", diagId: .semaJumpOutsideLoop, at: tree.token(of: stmtNode), in: tokens, args: ["continue", "loop statement"])
             }
+            stmts.append(emit(.continueStmt, .void, node: stmtNode).rawIndex)
 
         case .returnStmt:
             let children = tree.children(of: stmtNode)
             if let expr = children.first {
                 let retInst = analyzeExpression(expr, tree: tree, tokens: tokens)
                 let retType = currentBlockContainer?.block.type(of: retInst) ?? currentReturnType
+                let value: SemInstId
                 if typePool.canonical(of: currentReturnType.typeId) == .void {
                     if isTyped(retInst) && typePool.canonical(of: retType.typeId) != .void {
                         reportError("void function '\(currentFunctionName)' should not return a value", diagId: .semaVoidReturnValue, at: tree.token(of: stmtNode), in: tokens, args: [currentFunctionName])
                     }
+                    value = rvalue(retInst)  // `return f();` of a `void` expression
                 } else {
                     checkAssignment(to: currentReturnType, from: retInst, rhsNode: expr, tree: tree, tokens: tokens)
+                    value = convertForAssignment(retInst, node: expr, to: currentReturnType, tree: tree, tokens: tokens)
                 }
                 nodeTypes[stmtNode] = retType.typeId
-                currentBlockContainer?.block.append(kind: .returnInst, type: retType, arg0: retInst.rawIndex, node: stmtNode)
+                stmts.append(emit(.returnStmt, .void, value.rawIndex, node: stmtNode).rawIndex)
             } else {
                 nodeTypes[stmtNode] = .void
-                currentBlockContainer?.block.append(kind: .returnInst, type: .void, node: stmtNode)
+                stmts.append(emit(.returnStmt, .void, node: stmtNode).rawIndex)
             }
 
         case .ifStmt:
@@ -1692,11 +1968,10 @@ public struct CSemanticAnalyzer: ~Copyable {
             guard children.count >= 2 else { return }
             let condInst = analyzeExpression(children[0], tree: tree, tokens: tokens)
             checkScalarCondition(condInst, at: tree.token(of: stmtNode), tokens: tokens)
-            currentBlockContainer?.block.append(kind: .branchCond, type: .void, arg0: condInst.rawIndex, node: stmtNode)
-            analyzeStatement(children[1], tree: tree, tokens: tokens)
-            if children.count >= 3 {
-                analyzeStatement(children[2], tree: tree, tokens: tokens)
-            }
+            let cond = conditionValue(condInst)
+            let thenStmt = analyzeSubStatement(children[1], tree: tree, tokens: tokens)
+            let elseStmt = children.count >= 3 ? analyzeSubStatement(children[2], tree: tree, tokens: tokens) : .nilId
+            stmts.append(emitList(.ifStmt, .void, arg0: cond.rawIndex, items: [thenStmt.rawIndex, elseStmt.rawIndex], node: stmtNode).rawIndex)
 
         case .whileStmt, .doWhileStmt:
             let children = tree.children(of: stmtNode)
@@ -1704,41 +1979,67 @@ public struct CSemanticAnalyzer: ~Copyable {
             // `while (c) s` stores (c, s); `do s while (c)` stores (s, c)
             let (condNode, bodyNode) = kind == .whileStmt ? (children[0], children[1]) : (children[1], children[0])
             loopDepth += 1
-            if kind == .doWhileStmt { analyzeStatement(bodyNode, tree: tree, tokens: tokens) }
+            var body = SemInstId.nilId
+            if kind == .doWhileStmt { body = analyzeSubStatement(bodyNode, tree: tree, tokens: tokens) }
             let condInst = analyzeExpression(condNode, tree: tree, tokens: tokens)
             checkScalarCondition(condInst, at: tree.token(of: stmtNode), tokens: tokens)
-            currentBlockContainer?.block.append(kind: .branchCond, type: .void, arg0: condInst.rawIndex, node: stmtNode)
-            if kind == .whileStmt { analyzeStatement(bodyNode, tree: tree, tokens: tokens) }
+            let cond = conditionValue(condInst)
+            if kind == .whileStmt { body = analyzeSubStatement(bodyNode, tree: tree, tokens: tokens) }
             loopDepth -= 1
+            if kind == .whileStmt {
+                stmts.append(emit(.whileStmt, .void, cond.rawIndex, body.rawIndex, node: stmtNode).rawIndex)
+            } else {
+                stmts.append(emit(.doWhileStmt, .void, body.rawIndex, cond.rawIndex, node: stmtNode).rawIndex)
+            }
 
         case .forStmt:
             let forScope = CScope(parent: currentScope)
             self.currentScope = forScope
             loopDepth += 1
-            defer { loopDepth -= 1 }
-            // Children: the clauses present (a declaration or expressions), then the body
+            // Children: the clauses present (a declaration or expressions), then the body; a clause's position
+            // relative to the header's semicolons tells which one it is
             let children = tree.children(of: stmtNode)
+            let (semi1, semi2) = forHeaderSemicolons(tree.token(of: stmtNode), tokens: tokens)
+            var initStmt = SemInstId.nilId, cond = SemInstId.nilId, step = SemInstId.nilId, body = SemInstId.nilId
             for (idx, child) in children.enumerated() {
-                let ck = tree.kind(of: child)
-                if idx == children.count - 1 || ck == .varDecl || ck == .typedefDecl || ck == .staticAssertDecl {
-                    analyzeStatement(child, tree: tree, tokens: tokens)
+                if idx == children.count - 1 {
+                    body = analyzeSubStatement(child, tree: tree, tokens: tokens)
+                } else if isDeclarationNode(child, tree: tree) {
+                    var decls: [UInt32] = []
+                    analyzeStatement(child, into: &decls, tree: tree, tokens: tokens)
+                    initStmt = emitList(.compound, .void, items: decls, node: child)
                 } else {
-                    _ = analyzeExpression(child, tree: tree, tokens: tokens)
+                    let position = tree.token(of: child).rawIndex
+                    let e = analyzeExpression(child, tree: tree, tokens: tokens)
+                    if position < semi1 {
+                        initStmt = emit(.exprStmt, .void, e.rawIndex, node: child)
+                    } else if position < semi2 {
+                        checkScalarCondition(e, at: tree.token(of: stmtNode), tokens: tokens)
+                        cond = conditionValue(e)
+                    } else {
+                        step = e
+                    }
                 }
             }
+            loopDepth -= 1
             self.currentScope = forScope.parent ?? CScope()
+            stmts.append(emitList(.forStmt, .void, items: [initStmt.rawIndex, cond.rawIndex, step.rawIndex, body.rawIndex], node: stmtNode).rawIndex)
 
         case .switchStmt:
             let children = tree.children(of: stmtNode)
             guard children.count >= 2 else { return }
-            _ = analyzeExpression(children[0], tree: tree, tokens: tokens)
-            switchStack.append((values: [], hasDefault: false))
-            analyzeStatement(children[1], tree: tree, tokens: tokens)
-            switchStack.removeLast()
+            // The controlling expression undergoes the integer promotions (C23 6.8.5.3p5)
+            let control = promoted(rvalue(analyzeExpression(children[0], tree: tree, tokens: tokens)))
+            switchStack.append(SwitchContext(controlType: isTyped(control) ? typeOf(control) : .int))
+            let body = analyzeSubStatement(children[1], tree: tree, tokens: tokens)
+            let context = switchStack.removeLast()
+            stmts.append(emitList(.switchStmt, .void, arg0: control.rawIndex, items: [body.rawIndex, context.defaultLabel.rawIndex] + context.cases,
+                                  node: stmtNode).rawIndex)
 
         case .caseStmt:
             let children = tree.children(of: stmtNode)
             let caseTok = tree.token(of: stmtNode)
+            var value: Int64 = 0
             if let valueNode = children.first {
                 if switchStack.isEmpty {
                     reportError("'case' statement not in switch statement", diagId: .semaJumpOutsideLoop, at: caseTok, in: tokens, args: ["case", "switch statement"])
@@ -1749,23 +2050,37 @@ public struct CSemanticAnalyzer: ~Copyable {
                     if switchStack[switchStack.count - 1].values.insert(v).inserted == false {
                         reportError("duplicate case value '\(v)'", diagId: .semaDuplicateCase, at: tree.token(of: valueNode), in: tokens, args: ["case value '\(v)'"])
                     }
+                    // The value converted to the promoted type of the controlling expression (C23 6.8.5.3p5)
+                    let controlType = switchStack[switchStack.count - 1].controlType.typeId
+                    value = integerTraits(controlType) != nil ? makeConst(UInt64(bitPattern: v), controlType).signedValue : v
                 }
             }
-            for child in children.dropFirst() {
-                analyzeStatement(child, tree: tree, tokens: tokens)
+            let constant = block.block.addIntConstant(value)
+            let sub = labeledStatement(of: stmtNode, skip: 1, tree: tree, tokens: tokens)
+            let label = emit(.caseLabel, .void, (sub ?? .nilId).rawIndex, constant, node: stmtNode)
+            if !switchStack.isEmpty { switchStack[switchStack.count - 1].cases.append(label.rawIndex) }
+            stmts.append(label.rawIndex)
+            if sub == nil {
+                for child in children.dropFirst() { analyzeStatement(child, into: &stmts, tree: tree, tokens: tokens) }
             }
 
         case .defaultStmt:
             let defaultTok = tree.token(of: stmtNode)
+            var isFirstDefault = false
             if switchStack.isEmpty {
                 reportError("'default' statement not in switch statement", diagId: .semaJumpOutsideLoop, at: defaultTok, in: tokens, args: ["default", "switch statement"])
             } else if switchStack[switchStack.count - 1].hasDefault {
                 reportError("multiple default labels in one switch", diagId: .semaDuplicateCase, at: defaultTok, in: tokens, args: ["default label"])
             } else {
                 switchStack[switchStack.count - 1].hasDefault = true
+                isFirstDefault = true
             }
-            for child in tree.children(of: stmtNode) {
-                analyzeStatement(child, tree: tree, tokens: tokens)
+            let sub = labeledStatement(of: stmtNode, skip: 0, tree: tree, tokens: tokens)
+            let label = emit(.defaultLabel, .void, (sub ?? .nilId).rawIndex, node: stmtNode)
+            if isFirstDefault { switchStack[switchStack.count - 1].defaultLabel = label }
+            stmts.append(label.rawIndex)
+            if sub == nil {
+                for child in tree.children(of: stmtNode) { analyzeStatement(child, into: &stmts, tree: tree, tokens: tokens) }
             }
 
         case .exprStmt:
@@ -1774,8 +2089,14 @@ public struct CSemanticAnalyzer: ~Copyable {
             }
             let children = tree.children(of: stmtNode)
             if let expr = children.first {
-                _ = analyzeExpression(expr, tree: tree, tokens: tokens)
+                let e = analyzeExpression(expr, tree: tree, tokens: tokens)
+                stmts.append(emit(.exprStmt, .void, e.rawIndex, node: stmtNode).rawIndex)
+            } else {
+                stmts.append(emit(.nullStmt, .void, node: stmtNode).rawIndex)
             }
+
+        case .asmStmt:
+            stmts.append(emit(.asmStmt, .void, node: stmtNode).rawIndex)
 
         default:
             break
@@ -1806,6 +2127,9 @@ public struct CSemanticAnalyzer: ~Copyable {
 
     // MARK: - Expressions
 
+    /// Analyzes an expression and emits its instructions. The result is the expression itself: an lvalue for an
+    /// expression that designates an object or function (C23 6.3.2.1), which the context converts with `rvalue`,
+    /// or else an rvalue.
     private mutating func analyzeExpression(_ exprNode: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> SemInstId {
         let kind = tree.kind(of: exprNode)
         guard let container = currentBlockContainer else {
@@ -1835,8 +2159,10 @@ public struct CSemanticAnalyzer: ~Copyable {
                 nodeTypes[exprNode] = .double
                 return container.block.append(kind: .errorInst, type: .double, node: exprNode)
             }
-            let val = Double(txt.replacingOccurrences(of: "'", with: "").trimmingCharacters(in: CharacterSet(charactersIn: "fFlL"))) ?? 0.0
-            let res = container.block.appendFloatLiteral(value: val, type: QualType(typeId: type), node: exprNode)
+            // The value correctly rounded to the type's format, as clang's APFloat parses it
+            let format = floatFormat(of: type) ?? .double
+            let value = SoftFloat.parse(floatingConstantBody(txt), format: format) ?? .zero(format)
+            let res = container.block.appendFloatLiteral(value: value.constant, type: QualType(typeId: type), node: exprNode)
             nodeTypes[exprNode] = type
             return res
 
@@ -1848,9 +2174,10 @@ public struct CSemanticAnalyzer: ~Copyable {
                 stringCounter += 1
             }
             // An array of the encoding's code units, including the terminator (C23 6.4.5p6)
+            let constant = stringLiteralConstant(tok, tokens: tokens)
             let info = stringLiteralInfo(tok, tokens: tokens)
             let arrayType = typePool.arrayType(elementType: QualType(typeId: info.element), count: info.length)
-            let res = container.block.appendStringLiteral(value: unescaped, type: QualType(typeId: arrayType), node: exprNode)
+            let res = container.block.appendStringLiteral(value: constant, type: QualType(typeId: arrayType), node: exprNode)
             nodeTypes[exprNode] = arrayType
             return res
 
@@ -1876,22 +2203,27 @@ public struct CSemanticAnalyzer: ~Copyable {
                 switch sym.storage {
                 case .enumConstant(let val):
                     return container.block.appendIntLiteral(value: val, type: sym.type, node: exprNode)
+                case .typedef:
+                    return container.block.append(kind: .errorInst, type: .error, node: exprNode)
                 default:
                     return container.block.append(kind: .declRef, type: sym.type, arg0: sym.declId.rawIndex, node: exprNode)
                 }
             } else if isBuiltinFunctionName(name) ||
                       name == "asm" || name == "__asm__" || name == "__asm" {
                 let fnType = QualType(typeId: typePool.functionType(returnType: .long, paramTypes: [], isVariadic: true))
-                let declId = declTable.append(kind: .function, name: name, type: fnType)
+                let declId = declTable.append(kind: .function, name: name, type: fnType, attrs: DeclAttributes(storage: .external).rawValue)
                 let sym = CSymbol(name: name, declId: declId, type: fnType, storage: .function(name: name))
                 currentScope.insertOrdinary(symbol: sym)
                 symbolRefs[exprNode] = sym
                 nodeTypes[exprNode] = fnType.typeId
                 return container.block.append(kind: .declRef, type: fnType, arg0: declId.rawIndex, node: exprNode)
             } else if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
-                let ptrChar = typePool.pointerTo(.char)
-                let res = container.block.appendStringLiteral(value: name, type: QualType(typeId: ptrChar), node: exprNode)
-                nodeTypes[exprNode] = ptrChar
+                // `static const char __func__[] = "function-name";` (C23 6.4.2.2)
+                let bytes = Array(currentFunctionName.utf8) + [0]
+                let arrayType = typePool.arrayType(elementType: QualType.char.withConst(), count: UInt64(bytes.count))
+                let res = container.block.appendStringLiteral(value: StringConstant(bytes: bytes, elementSize: 1, encoding: .ordinary),
+                                                              type: QualType(typeId: arrayType), node: exprNode)
+                nodeTypes[exprNode] = typePool.pointerTo(.char)
                 return res
             } else {
                 reportError("use of undeclared identifier '\(name)'", diagId: .semaUndeclaredIdentifier, at: tok, in: tokens, args: [name])
@@ -1910,8 +2242,14 @@ public struct CSemanticAnalyzer: ~Copyable {
 
             let opTok = tree.token(of: exprNode)
             let opKind = CTokenKind(rawValue: tokens.kind(of: opTok)) ?? .errorToken
+            // The structure object: `*p` for `p->m`; a temporary for a member of an rvalue (`f().m`)
+            var object = baseInst
             if opKind == .arrow {
                 baseType = typePool.pointeeType(of: baseType.typeId)
+                let pointer = rvalue(baseInst)
+                if isTyped(pointer) { object = emit(.deref, baseType, pointer.rawIndex, node: exprNode) }
+            } else if isTyped(baseInst) && !kindOf(baseInst).isLvalue {
+                object = emit(.materialize, baseType.unqualified(), baseInst.rawIndex, node: baseNode)
             }
 
             let memberTok = (children.count > 1) ? tree.token(of: children[1]) : opTok
@@ -1921,7 +2259,13 @@ public struct CSemanticAnalyzer: ~Copyable {
                 // A member of a const- or volatile-qualified structure is so qualified (C23 6.5.2.3p3)
                 let fieldType = QualType(rawValue: field.type.rawValue | UInt32(baseType.qualifiers & 0b011))
                 nodeTypes[exprNode] = fieldType.typeId
-                return container.block.append(kind: .memberRef, type: fieldType, arg0: baseInst.rawIndex, arg1: field.offset, node: exprNode)
+                if let width = field.bitWidth {
+                    let isSigned = typePool.isSignedInteger(type: field.type.typeId)
+                    let unitBytes = UInt32(typePool.size(of: field.type.typeId))
+                    return emitList(.bitField, fieldType, arg0: object.rawIndex,
+                                    items: [field.offset, UInt32(field.bitOffset), UInt32(width), isSigned ? 1 : 0, unitBytes], node: exprNode)
+                }
+                return emit(.member, fieldType, object.rawIndex, field.offset, node: exprNode)
             } else if !isTyped(baseInst) || baseType.isError {
                 nodeTypes[exprNode] = .int
                 return container.block.append(kind: .errorInst, type: .int, node: exprNode)
@@ -1940,208 +2284,75 @@ public struct CSemanticAnalyzer: ~Copyable {
             let rhs = analyzeExpression(children[1], tree: tree, tokens: tokens)
             let lhsType = container.block.type(of: lhs)
             let assignTok = tree.token(of: exprNode)
+            let assignKind = CTokenKind(rawValue: tokens.kind(of: assignTok)) ?? .equal
             // C23 6.5.16p2: the left operand shall be a modifiable lvalue
             if !isLvalue(children[0], tree: tree, tokens: tokens) {
                 reportError("expression is not assignable", diagId: .semaNotAssignable, at: assignTok, in: tokens, args: [""])
             } else if isTyped(lhs) && (isArrayOrFunction(lhsType) || lhsType.isConst) {
                 reportError("expression is not assignable", diagId: .semaNotAssignable, at: assignTok, in: tokens, args: [lhsType.isConst ? " (const-qualified)" : ""])
-            } else if CTokenKind(rawValue: tokens.kind(of: assignTok)) == .equal {
+            } else if assignKind == .equal {
                 checkAssignment(to: lhsType, from: rhs, rhsNode: children[1], tree: tree, tokens: tokens)
             } else if isTyped(lhs) && isTyped(rhs) && (isStructOrUnion(lhsType) || isStructOrUnion(typeOf(rhs))) {
                 reportError("invalid operands to compound assignment", diagId: .semaInvalidOperands, at: assignTok, in: tokens, args: [spelling(of: assignTok, in: tokens), "\(lhsType)", "\(typeOf(rhs))"])
             }
             nodeTypes[exprNode] = lhsType.typeId
-            return container.block.append(kind: .assign, type: lhsType, arg0: lhs.rawIndex, arg1: rhs.rawIndex, node: exprNode)
+            let resultType = lhsType.unqualified()
+            if assignKind == .equal {
+                let value = convertForAssignment(rhs, node: children[1], to: lhsType, tree: tree, tokens: tokens)
+                return emit(.assign, resultType, lhs.rawIndex, value.rawIndex, node: exprNode)
+            }
+            // `lhs op= rhs` (C23 6.5.16.2): the operation in the type of `lhs op rhs`, the result converted back
+            let op = Self.compoundAssignmentOperator(assignKind)
+            var value = rvalue(rhs)
+            var opcode = op.kind
+            var computation = resultType
+            if isTyped(lhs) && isTyped(value) {
+                if isPointerLike(lhsType) && (opcode == .add || opcode == .sub) {
+                    opcode = opcode == .add ? .ptrAdd : .ptrSub
+                    value = pointerIndex(value)
+                } else if opcode == .shl || opcode == .shr {
+                    computation = QualType(typeId: typePool.promote(type: lhsType.typeId))
+                    value = promoted(value)
+                } else if typePool.isArithmetic(type: lhsType.typeId) && typePool.isArithmetic(type: typeOf(value).typeId) {
+                    computation = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, typeOf(value).typeId))
+                    value = convertImplicitly(value, to: computation, reason: .arithmeticConvert, node: children[1])
+                }
+            }
+            return emitList(.compoundAssign, resultType, arg0: lhs.rawIndex,
+                            items: [UInt32(opcode.rawValue), value.rawIndex, computation.rawValue, computation.rawValue], node: exprNode)
 
         case .binaryExpr:
-            let children = tree.children(of: exprNode)
-            guard children.count == 2 else {
-                return container.block.append(kind: .errorInst, type: .int, node: exprNode)
-            }
-            let lhs = analyzeExpression(children[0], tree: tree, tokens: tokens)
-            let rhs = analyzeExpression(children[1], tree: tree, tokens: tokens)
-            let lhsType = container.block.type(of: lhs)
-            let rhsType = container.block.type(of: rhs)
-
-            let opTok = tree.token(of: exprNode)
-            let opKind = CTokenKind(rawValue: tokens.kind(of: opTok)) ?? .errorToken
-            if isTyped(lhs) && isTyped(rhs) && !binaryOperandsValid(opKind, lhsType, rhsType) {
-                reportError("invalid operands to binary expression", diagId: .semaInvalidOperands, at: opTok, in: tokens, args: [spelling(of: opTok, in: tokens), "\(lhsType)", "\(rhsType)"])
-            }
-
-            var resType: QualType
-            let semKind: SemInstKind
-
-            switch opKind {
-            case .plus:
-                semKind = .add
-                if isPointerLike(lhsType) {
-                    resType = decayed(lhsType)
-                } else if isPointerLike(rhsType) {
-                    resType = decayed(rhsType)
-                } else {
-                    resType = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
-                }
-            case .minus:
-                semKind = .sub
-                if isPointerLike(lhsType) && isPointerLike(rhsType) {
-                    resType = .long // ptrdiff_t
-                } else if isPointerLike(lhsType) {
-                    resType = decayed(lhsType)
-                } else {
-                    resType = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
-                }
-            case .star: semKind = .mul; resType = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
-            case .slash: semKind = .div; resType = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
-            case .percent: semKind = .mod; resType = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
-            case .amp: semKind = .bitAnd; resType = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
-            case .pipe: semKind = .bitOr; resType = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
-            case .caret: semKind = .bitXor; resType = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
-            case .lessLess: semKind = .shl; resType = lhsType
-            case .greaterGreater: semKind = .shr; resType = lhsType
-            case .equalEqual: semKind = .eq; resType = .int
-            case .exclaimEqual: semKind = .ne; resType = .int
-            case .less: semKind = .lt; resType = .int
-            case .lessEqual: semKind = .le; resType = .int
-            case .greater: semKind = .gt; resType = .int
-            case .greaterEqual: semKind = .ge; resType = .int
-            case .ampAmp: semKind = .logicalAnd; resType = .int
-            case .pipePipe: semKind = .logicalOr; resType = .int
-            default: semKind = .add; resType = .int
-            }
-
-            // An operand of unmodeled type makes the arithmetic result unmodeled too (comparisons stay `int`)
-            let isComparisonOrLogical = [.equalEqual, .exclaimEqual, .less, .lessEqual, .greater, .greaterEqual, .ampAmp, .pipePipe].contains(opKind)
-            if !isComparisonOrLogical && (!isTyped(lhs) || !isTyped(rhs)) {
-                resType = .error
-            }
-            nodeTypes[exprNode] = resType.typeId
-            return container.block.append(kind: semKind, type: resType, arg0: lhs.rawIndex, arg1: rhs.rawIndex, node: exprNode)
+            return analyzeBinary(exprNode, tree: tree, tokens: tokens)
 
         case .unaryExpr:
-            let children = tree.children(of: exprNode)
-            guard let child = children.first else {
-                return container.block.append(kind: .errorInst, type: .int, node: exprNode)
-            }
-            let opTok = tree.token(of: exprNode)
-            let opKind = CTokenKind(rawValue: tokens.kind(of: opTok)) ?? .errorToken
-
-            if opKind == .kwSizeof || opKind == .kwAlignof {
-                let value = sizeOrAlignment(of: child, isAlignment: opKind == .kwAlignof, at: opTok, tree: tree, tokens: tokens)
-                nodeTypes[exprNode] = .ulong
-                return container.block.appendIntLiteral(value: value ?? 0, type: QualType(typeId: .ulong), node: exprNode)
-            }
-            if opKind == .ampAmp {
-                let voidPtr = QualType(typeId: typePool.pointerTo(.void))
-                nodeTypes[exprNode] = voidPtr.typeId
-                return container.block.append(kind: .addrOf, type: voidPtr, node: exprNode)
-            }
-
-            let inner = analyzeExpression(child, tree: tree, tokens: tokens)
-            let innerType = container.block.type(of: inner)
-            checkUnaryOperand(opKind, operandNode: child, operand: inner, at: opTok, tree: tree, tokens: tokens)
-
-            let resType: QualType
-            let semKind: SemInstKind
-
-            switch opKind {
-            case .minus: semKind = .unaryNeg; resType = innerType
-            case .tilde: semKind = .unaryBitNot; resType = innerType
-            case .exclaim: semKind = .unaryLogicalNot; resType = .int
-            case .amp:
-                semKind = .addrOf
-                resType = QualType(typeId: typePool.pointerTo(innerType))
-            case .star:
-                semKind = .deref
-                resType = typePool.pointeeType(of: innerType.typeId)
-            case .plusPlus: semKind = .postInc; resType = innerType
-            case .minusMinus: semKind = .postDec; resType = innerType
-            default: semKind = .unaryNeg; resType = innerType
-            }
-
-            nodeTypes[exprNode] = resType.typeId
-            return container.block.append(kind: semKind, type: resType, arg0: inner.rawIndex, node: exprNode)
+            return analyzeUnary(exprNode, tree: tree, tokens: tokens)
 
         case .castExpr:
             let children = tree.children(of: exprNode)
             guard children.count == 2 else {
                 return container.block.append(kind: .errorInst, type: .int, node: exprNode)
             }
-            var targetType = resolveType(from: children[0], tree: tree, tokens: tokens)
-            let inner = analyzeExpression(children[1], tree: tree, tokens: tokens)
+            let targetType = resolveType(from: children[0], tree: tree, tokens: tokens)
+            pendingVLALengths.removeAll()
             if tree.kind(of: children[1]) == .initList {
-                // Compound literal `(T){ ... }`: an array of unknown size takes its length from the initializer
-                if case .array(let element, 0) = canonicalKind(targetType),
-                   let count = initializerLength(children[1], element: element, tree: tree, tokens: tokens) {
-                    targetType = QualType(typeId: typePool.arrayType(elementType: element, count: count), qualifiers: targetType.qualifiers)
-                }
-            } else if isTyped(inner) && !targetType.isError {
+                // Compound literal `(T){ ... }`
+                return compoundLiteral(type: targetType, initializer: children[1], node: exprNode, tree: tree, tokens: tokens)
+            }
+            let inner = analyzeExpression(children[1], tree: tree, tokens: tokens)
+            if isTyped(inner) && !targetType.isError {
                 checkCast(from: typeOf(inner), to: targetType, at: tree.token(of: exprNode), tokens: tokens)
             }
             nodeTypes[exprNode] = targetType.typeId
-            return container.block.append(kind: .explicitCast, type: targetType, arg0: inner.rawIndex, node: exprNode)
+            let value = rvalue(inner)
+            if isTyped(value) && !targetType.isError {
+                let kind = castKind(from: typeOf(value), to: targetType) ?? .noop
+                let resultType = kind == .toVoid ? QualType.void : targetType.unqualified()
+                return emit(.explicitCast, resultType, value.rawIndex, kind.rawValue, node: exprNode)
+            }
+            return emit(.explicitCast, targetType.unqualified(), value.rawIndex, node: exprNode)
 
         case .callExpr:
-            let children = tree.children(of: exprNode)
-            guard children.count >= 1 else {
-                return container.block.append(kind: .errorInst, type: .int, node: exprNode)
-            }
-            let calleeNode = children[0]
-            let callee = analyzeExpression(calleeNode, tree: tree, tokens: tokens)
-            let calleeType = container.block.type(of: callee)
-
-            var retType: QualType = .int
-            var calleeInfo = typePool.typeInfo(of: typePool.canonical(of: calleeType.typeId))
-            if case .pointer(let pointee) = calleeInfo.kind {
-                calleeInfo = typePool.typeInfo(of: typePool.canonical(of: pointee.typeId))
-            }
-            var calleeParamCount: Int? = nil
-            var calleeVariadic = true
-            if case .function(let rType, let pTypes, let variadic) = calleeInfo.kind {
-                retType = rType
-                calleeParamCount = pTypes.count
-                calleeVariadic = variadic
-            } else if case .error = calleeInfo.kind {
-                // Callee type not modeled (e.g. a function pointer from a parenthesized declarator)
-                retType = .error
-            } else if !isTyped(callee) {
-                retType = .error
-            } else {
-                reportError("called object is not a function or function pointer", diagId: .semaNotCallable, at: tree.token(of: exprNode), in: tokens, args: ["\(calleeType)"])
-            }
-
-            let calleeName = (tree.kind(of: calleeNode) == .identExpr) ? spelling(of: tree.token(of: calleeNode), in: tokens) : ""
-            let isOffsetof = (calleeName == "__builtin_offsetof")
-
-            var argInsts: [SemInstId] = []
-            if children.count > 1 {
-                let argNodes = tree.children(of: children[1])
-                for (argIdx, arg) in argNodes.enumerated() {
-                    if isTypeNode(tree.kind(of: arg)) {
-                        let t = resolveType(from: arg, tree: tree, tokens: tokens)
-                        if calleeName == "__builtin_va_arg" && argIdx == 1 {
-                            retType = t
-                        }
-                    } else if isOffsetof && argIdx == 1 {
-                        // Second argument of __builtin_offsetof(type, member) is a member designator, not a variable
-                        continue
-                    } else {
-                        argInsts.append(analyzeExpression(arg, tree: tree, tokens: tokens))
-                    }
-                }
-            }
-
-            // Argument count against the prototype (C23 6.5.2.2p2), for calls through functions and function pointers
-            if let paramCount = calleeParamCount, !calleeName.hasPrefix("__builtin_"), !builtinNames.contains(calleeName) {
-                let argCount = children.count > 1 ? tree.children(of: children[1]).count : 0
-                if argCount < paramCount || (argCount > paramCount && !calleeVariadic) {
-                    reportError("wrong number of arguments to function call", diagId: .semaCallArgCountMismatch, at: tree.token(of: exprNode), in: tokens,
-                                args: [argCount < paramCount ? "few" : "many", "\(paramCount)", "\(argCount)"])
-                }
-            }
-
-            nodeTypes[exprNode] = retType.typeId
-            return container.block.appendCall(callee: callee, args: argInsts, type: retType, node: exprNode)
+            return analyzeCall(exprNode, tree: tree, tokens: tokens)
 
         case .subscriptExpr:
             let children = tree.children(of: exprNode)
@@ -2159,11 +2370,16 @@ public struct CSemanticAnalyzer: ~Copyable {
                     reportError("subscripted value is not an array or pointer", diagId: .semaInvalidSubscript, at: tree.token(of: exprNode), in: tokens)
                 }
             }
-            // `i[p]` is `p[i]`: the element type comes from whichever operand is the pointer
-            let pointerType = (!isPointerLike(baseType) && isTyped(idx) && isPointerLike(typeOf(idx))) ? typeOf(idx) : baseType
+            // `i[p]` is `p[i]`: the element type comes from whichever operand is the pointer; `E1[E2]` is `*(E1 + E2)`
+            let swapped = !isPointerLike(baseType) && isTyped(idx) && isPointerLike(typeOf(idx))
+            let pointerType = swapped ? typeOf(idx) : baseType
             let pointee = typePool.pointeeType(of: pointerType.typeId)
             nodeTypes[exprNode] = pointee.typeId
-            return container.block.append(kind: .subscriptOp, type: pointee, arg0: base.rawIndex, arg1: idx.rawIndex, node: exprNode)
+            let pointer = rvalue(swapped ? idx : base)
+            var index = rvalue(swapped ? base : idx)
+            if isTyped(index) { index = pointerIndex(index) }
+            let address = emit(.ptrAdd, isTyped(pointer) ? typeOf(pointer) : .error, pointer.rawIndex, index.rawIndex, node: exprNode)
+            return emit(.deref, pointee, address.rawIndex, node: exprNode)
 
         case .conditionalExpr:
             let children = tree.children(of: exprNode)
@@ -2180,15 +2396,29 @@ public struct CSemanticAnalyzer: ~Copyable {
                 thenType = conditionalResultType(typeOf(thenInst), typeOf(elseInst), at: tree.token(of: exprNode), tokens: tokens)
             }
             nodeTypes[exprNode] = thenType.typeId
-            return container.block.append(kind: .conditional, type: thenType, arg0: cond.rawIndex, arg1: thenInst.rawIndex, node: exprNode)
+            if children.count == 2 {
+                let value = rvalue(cond)
+                let other = convertArm(elseInst, node: children[1], to: thenType, tree: tree, tokens: tokens)
+                return emit(.elvis, thenType, value.rawIndex, other.rawIndex, node: exprNode)
+            }
+            let c = conditionValue(cond)
+            let t = convertArm(thenInst, node: children[1], to: thenType, tree: tree, tokens: tokens)
+            let e = convertArm(elseInst, node: children[2], to: thenType, tree: tree, tokens: tokens)
+            return emitList(.conditional, thenType, items: [c.rawIndex, t.rawIndex, e.rawIndex], node: exprNode)
 
         case .genericExpr:
             let children = tree.children(of: exprNode)
             guard children.count >= 2 else {
                 return container.block.append(kind: .errorInst, type: .int, node: exprNode)
             }
+            // The controlling expression is not evaluated; its type is taken after lvalue conversion (C23 6.5.2.1p3)
+            let mark = container.block.mark()
+            unevaluatedDepth += 1
             let ctrlInst = analyzeExpression(children[0], tree: tree, tokens: tokens)
-            let ctrlType = container.block.type(of: ctrlInst).unqualified()
+            let rawType = container.block.type(of: ctrlInst)
+            let ctrlType = (isTyped(ctrlInst) ? decayed(rawType) : rawType).unqualified()
+            unevaluatedDepth -= 1
+            container.block.truncate(to: mark)
             let ctrlCan = typePool.canonical(of: ctrlType.typeId)
 
             var selectedNode: NodeId? = nil
@@ -2211,7 +2441,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             }
 
             guard let chosen = selectedNode ?? defaultNode else {
-                // Association matching is approximate (no lvalue/array conversions yet): leave untyped
+                // Association matching is approximate (types are compared by identity, not compatibility): leave untyped
                 nodeTypes[exprNode] = .int
                 return container.block.append(kind: .errorInst, type: .int, node: exprNode)
             }
@@ -2225,29 +2455,51 @@ public struct CSemanticAnalyzer: ~Copyable {
             guard !children.isEmpty else {
                 return container.block.append(kind: .errorInst, type: .int, node: exprNode)
             }
-            var lastInst: SemInstId = .nilId
-            for child in children {
-                lastInst = analyzeExpression(child, tree: tree, tokens: tokens)
+            var result: SemInstId = .nilId
+            for (idx, child) in children.enumerated() {
+                let operand = analyzeExpression(child, tree: tree, tokens: tokens)
+                if idx == 0 {
+                    result = operand
+                } else {
+                    // The left operand is a void expression; the result is the right operand's value (C23 6.5.17)
+                    let value = rvalue(operand)
+                    result = emit(.comma, typeOf(value), result.rawIndex, value.rawIndex, node: exprNode)
+                }
             }
-            let lastType = container.block.type(of: lastInst)
-            nodeTypes[exprNode] = lastType.typeId
-            return lastInst
+            nodeTypes[exprNode] = container.block.type(of: result).typeId
+            return result
 
         case .compoundStmt:
-            // GNU statement expression `({ ... })`; its value type is not modeled
-            analyzeStatement(exprNode, tree: tree, tokens: tokens)
-            nodeTypes[exprNode] = .int
-            return container.block.append(kind: .errorInst, type: .int, node: exprNode)
+            // GNU statement expression `({ ... })`: its value is that of a final expression statement, else `void`
+            let scope = CScope(parent: currentScope)
+            currentScope = scope
+            var stmts: [UInt32] = []
+            let children = tree.children(of: exprNode)
+            var value = SemInstId.nilId
+            for (idx, child) in children.enumerated() {
+                if idx == children.count - 1, tree.kind(of: child) == .exprStmt, let e = tree.children(of: child).first {
+                    value = rvalue(analyzeExpression(e, tree: tree, tokens: tokens))
+                } else {
+                    analyzeStatement(child, into: &stmts, tree: tree, tokens: tokens)
+                }
+            }
+            currentScope = scope.parent ?? CScope()
+            let body = emitList(.compound, .void, items: stmts, node: exprNode)
+            let type: QualType = value.isValid ? (isTyped(value) ? typeOf(value) : .error) : .void
+            nodeTypes[exprNode] = type.typeId
+            return emit(.stmtExpr, type, body.rawIndex, value.rawIndex, node: exprNode)
 
         case .compoundLiteralExpr:
             let children = tree.children(of: exprNode)
-            for child in children where !isTypeNode(tree.kind(of: child)) {
-                _ = analyzeExpression(child, tree: tree, tokens: tokens)
-            }
             if let typeNode = children.first, isTypeNode(tree.kind(of: typeNode)) {
                 let t = resolveType(from: typeNode, tree: tree, tokens: tokens)
-                nodeTypes[exprNode] = t.typeId
-                return container.block.append(kind: .explicitCast, type: t, node: exprNode)
+                pendingVLALengths.removeAll()
+                if let list = children.dropFirst().first(where: { tree.kind(of: $0) == .initList }) {
+                    return compoundLiteral(type: t, initializer: list, node: exprNode, tree: tree, tokens: tokens)
+                }
+            }
+            for child in children where !isTypeNode(tree.kind(of: child)) {
+                _ = analyzeExpression(child, tree: tree, tokens: tokens)
             }
             nodeTypes[exprNode] = .int
             return container.block.append(kind: .errorInst, type: .int, node: exprNode)
@@ -2261,6 +2513,649 @@ public struct CSemanticAnalyzer: ~Copyable {
             nodeTypes[exprNode] = .int
             return container.block.append(kind: .errorInst, type: .int, node: exprNode)
         }
+    }
+
+    /// The `SemInstKind` of the operation of a compound assignment operator (`+=` → `add`).
+    private static func compoundAssignmentOperator(_ k: CTokenKind) -> (kind: SemInstKind, token: CTokenKind) {
+        switch k {
+        case .plusEqual: return (.add, .plus)
+        case .minusEqual: return (.sub, .minus)
+        case .starEqual: return (.mul, .star)
+        case .slashEqual: return (.div, .slash)
+        case .percentEqual: return (.mod, .percent)
+        case .ampEqual: return (.bitAnd, .amp)
+        case .pipeEqual: return (.bitOr, .pipe)
+        case .caretEqual: return (.bitXor, .caret)
+        case .lessLessEqual: return (.shl, .lessLess)
+        case .greaterGreaterEqual: return (.shr, .greaterGreater)
+        default: return (.add, .plus)
+        }
+    }
+
+    /// An arm of `?:` converted to the result type (C23 6.5.15p5-6): the usual arithmetic conversions, a null
+    /// pointer constant to a null pointer, a pointer to the composite pointer type, or to `void`.
+    private mutating func convertArm(_ raw: SemInstId, node: NodeId, to type: QualType, tree: borrowing ParseTree,
+                                     tokens: borrowing TokenBuffer) -> SemInstId {
+        let value = rvalue(raw)
+        guard isTyped(value), !type.isError else { return value }
+        if typePool.isArithmetic(type: type.typeId) {
+            return convertImplicitly(value, to: type, reason: .arithmeticConvert, node: node)
+        }
+        if case .pointer = canonicalKind(type), let npc = nullPointerConversion(value, node: node, to: type, tree: tree, tokens: tokens) {
+            return npc
+        }
+        return convertImplicitly(value, to: type, reason: .assignConvert, node: node)
+    }
+
+    /// A compound literal `(T){ ... }` (C23 6.5.2.5): an unnamed object, automatic in a function body and static at
+    /// file scope, initialized by the braced list. An array of unknown size takes its length from the initializer.
+    private mutating func compoundLiteral(type: QualType, initializer: NodeId, node: NodeId, tree: borrowing ParseTree,
+                                          tokens: borrowing TokenBuffer) -> SemInstId {
+        let isFileScope = currentBlockContainer === fileScopeContainer
+        let storage: DeclStorage = isFileScope ? .internalStatic : .automatic
+        let declId = declTable.append(kind: .variable, name: "", parent: currentFunctionDecl, type: type,
+                                      attrs: DeclAttributes(storage: storage, isDefinition: true).rawValue)
+        let resolved = resolveInitializer(initializer, type: type, tree: tree, tokens: tokens)
+        let objectType = type.isError ? type : QualType(typeId: resolved.type.typeId, qualifiers: type.qualifiers)
+        declTable.setType(for: declId, type: objectType)
+        if isFileScope && unevaluatedDepth == 0 {
+            staticSymbols[declId] = ".compoundliteral"
+            semGlobals.append(SemGlobal(
+                declId: declId, symbol: ".compoundliteral", type: objectType, isExternal: false, isThreadLocal: false,
+                alignment: objectType.isError ? 1 : typePool.alignment(of: objectType.typeId), initBlock: .nilId,
+                initInst: resolved.inst, isTentative: false))
+        }
+        nodeTypes[node] = objectType.typeId
+        return emit(.compoundLiteral, objectType, declId.rawIndex, resolved.inst.rawIndex, node: node)
+    }
+
+    /// A binary operator (C23 6.5.5-6.5.14): its operands converted (the usual arithmetic conversions, integer
+    /// promotions for shifts, pointer arithmetic with a `ptrdiff_t` index, conditions for `&&`/`||`).
+    private mutating func analyzeBinary(_ exprNode: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> SemInstId {
+        let children = tree.children(of: exprNode)
+        guard children.count == 2 else {
+            return emit(.errorInst, .int, node: exprNode)
+        }
+        let lhs = analyzeExpression(children[0], tree: tree, tokens: tokens)
+        let rhs = analyzeExpression(children[1], tree: tree, tokens: tokens)
+        let lhsType = typeOf(lhs)
+        let rhsType = typeOf(rhs)
+
+        let opTok = tree.token(of: exprNode)
+        let opKind = CTokenKind(rawValue: tokens.kind(of: opTok)) ?? .errorToken
+        if isTyped(lhs) && isTyped(rhs) && !binaryOperandsValid(opKind, lhsType, rhsType) {
+            reportError("invalid operands to binary expression", diagId: .semaInvalidOperands, at: opTok, in: tokens, args: [spelling(of: opTok, in: tokens), "\(lhsType)", "\(rhsType)"])
+        }
+        let typed = isTyped(lhs) && isTyped(rhs)
+
+        if opKind == .ampAmp || opKind == .pipePipe {
+            nodeTypes[exprNode] = .int
+            let l = conditionValue(lhs), r = conditionValue(rhs)
+            return emit(opKind == .ampAmp ? .logicalAnd : .logicalOr, .int, l.rawIndex, r.rawIndex, node: exprNode)
+        }
+
+        let semKind: SemInstKind
+        switch opKind {
+        case .plus: semKind = .add
+        case .minus: semKind = .sub
+        case .star: semKind = .mul
+        case .slash: semKind = .div
+        case .percent: semKind = .mod
+        case .amp: semKind = .bitAnd
+        case .pipe: semKind = .bitOr
+        case .caret: semKind = .bitXor
+        case .lessLess: semKind = .shl
+        case .greaterGreater: semKind = .shr
+        case .equalEqual: semKind = .eq
+        case .exclaimEqual: semKind = .ne
+        case .less: semKind = .lt
+        case .lessEqual: semKind = .le
+        case .greater: semKind = .gt
+        case .greaterEqual: semKind = .ge
+        default: semKind = .add
+        }
+        let isComparison = [.eq, .ne, .lt, .le, .gt, .ge].contains(semKind)
+
+        var l = rvalue(lhs), r = rvalue(rhs)
+        // An operand of unmodeled type makes the arithmetic result unmodeled too (comparisons stay `int`)
+        guard typed else {
+            let resType: QualType = isComparison ? .int : .error
+            nodeTypes[exprNode] = resType.typeId
+            return emit(semKind, resType, l.rawIndex, r.rawIndex, node: exprNode)
+        }
+        let lPtr = isPointerLike(lhsType), rPtr = isPointerLike(rhsType)
+        let lArith = typePool.isArithmetic(type: lhsType.typeId), rArith = typePool.isArithmetic(type: rhsType.typeId)
+
+        if isComparison {
+            nodeTypes[exprNode] = .int
+            if lArith && rArith {
+                let common = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
+                l = convertImplicitly(l, to: common, reason: .arithmeticConvert, node: children[0])
+                r = convertImplicitly(r, to: common, reason: .arithmeticConvert, node: children[1])
+            } else if typePool.isPointer(type: typeOf(l).typeId) || typePool.isPointer(type: typeOf(r).typeId) {
+                // Pointers are compared in the type of the pointer operand: a null pointer constant, `nullptr`, another
+                // pointer, or (a Clang extension, with a warning) an integer is converted to it
+                let lIsPointer: Bool
+                if case .pointer = canonicalKind(typeOf(l)) { lIsPointer = true } else { lIsPointer = false }
+                let target = lIsPointer ? typeOf(l) : typeOf(r)
+                if lIsPointer {
+                    r = comparisonOperand(r, node: children[1], to: target, tree: tree, tokens: tokens)
+                } else {
+                    l = comparisonOperand(l, node: children[0], to: target, tree: tree, tokens: tokens)
+                }
+            }
+            return emit(semKind, .int, l.rawIndex, r.rawIndex, node: exprNode)
+        }
+
+        switch semKind {
+        case .add where lPtr || rPtr:
+            let (pointer, index) = lPtr ? (l, r) : (r, l)
+            nodeTypes[exprNode] = typeOf(pointer).typeId
+            return emit(.ptrAdd, typeOf(pointer), pointer.rawIndex, pointerIndex(index).rawIndex, node: exprNode)
+        case .sub where lPtr && rPtr:
+            let ptrdiff = QualType(typeId: dataLayout.ptrdiffType)
+            nodeTypes[exprNode] = ptrdiff.typeId
+            return emit(.ptrDiff, ptrdiff, l.rawIndex, r.rawIndex, node: exprNode)
+        case .sub where lPtr:
+            nodeTypes[exprNode] = typeOf(l).typeId
+            return emit(.ptrSub, typeOf(l), l.rawIndex, pointerIndex(r).rawIndex, node: exprNode)
+        case .shl, .shr:
+            // Each operand is promoted on its own; the result has the promoted left operand's type (C23 6.5.7p3)
+            l = promoted(l)
+            r = promoted(r)
+            nodeTypes[exprNode] = typeOf(l).typeId
+            return emit(semKind, typeOf(l), l.rawIndex, r.rawIndex, node: exprNode)
+        default:
+            guard lArith && rArith else {
+                // A constraint violation, diagnosed above
+                nodeTypes[exprNode] = .int
+                return emit(.errorInst, .int, l.rawIndex, r.rawIndex, node: exprNode)
+            }
+            let common = QualType(typeId: typePool.commonArithmeticType(lhsType.typeId, rhsType.typeId))
+            l = convertImplicitly(l, to: common, reason: .arithmeticConvert, node: children[0])
+            r = convertImplicitly(r, to: common, reason: .arithmeticConvert, node: children[1])
+            nodeTypes[exprNode] = common.typeId
+            return emit(semKind, common, l.rawIndex, r.rawIndex, node: exprNode)
+        }
+    }
+
+    /// The other operand of a pointer comparison, converted to the pointer operand's type.
+    private mutating func comparisonOperand(_ value: SemInstId, node: NodeId, to type: QualType, tree: borrowing ParseTree,
+                                            tokens: borrowing TokenBuffer) -> SemInstId {
+        if let npc = nullPointerConversion(value, node: node, to: type, tree: tree, tokens: tokens) { return npc }
+        return convertImplicitly(value, to: type, reason: .arithmeticConvert, node: node)
+    }
+
+    /// A unary operator (C23 6.5.3): `&`, `*`, `+`, `-`, `~`, `!`, prefix and postfix `++`/`--`, `sizeof`, `alignof`,
+    /// and GNU `&&label`.
+    private mutating func analyzeUnary(_ exprNode: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> SemInstId {
+        let children = tree.children(of: exprNode)
+        guard let child = children.first else {
+            return emit(.errorInst, .int, node: exprNode)
+        }
+        let opTok = tree.token(of: exprNode)
+        let opKind = CTokenKind(rawValue: tokens.kind(of: opTok)) ?? .errorToken
+
+        if opKind == .kwSizeof || opKind == .kwAlignof {
+            let sizeType = QualType(typeId: dataLayout.sizeType)
+            nodeTypes[exprNode] = sizeType.typeId
+            let lengthsBefore = pendingVLALengths.count
+            let operandType = sizeofOperandType(child, tree: tree, tokens: tokens)
+            // `sizeof` of a variable length array is evaluated (C23 6.5.3.4p2)
+            if opKind == .kwSizeof, let t = operandType, typePool.isVariableLengthArray(t.typeId) {
+                var items: [UInt32] = []
+                for (type, length) in pendingVLALengths.dropFirst(lengthsBefore) { items += [type.rawIndex, length.rawIndex] }
+                pendingVLALengths.removeLast(pendingVLALengths.count - lengthsBefore)
+                return emitList(.vlaSizeof, sizeType, arg0: typePool.canonical(of: t.typeId).rawIndex, items: items, node: exprNode)
+            }
+            if pendingVLALengths.count > lengthsBefore { pendingVLALengths.removeLast(pendingVLALengths.count - lengthsBefore) }
+            let value = operandType.flatMap { sizeOrAlignment(ofType: $0, isAlignment: opKind == .kwAlignof, at: opTok, tokens: tokens) }
+            return block.block.appendIntLiteral(value: value ?? 0, type: sizeType, node: exprNode)
+        }
+        if opKind == .ampAmp {
+            // GNU `&&label`: the address of a label, a `void *`
+            let voidPtr = QualType(typeId: typePool.pointerTo(.void))
+            nodeTypes[exprNode] = voidPtr.typeId
+            let number = labelNumber(spelling(of: tree.token(of: child), in: tokens))
+            return emit(.labelAddress, voidPtr, number, node: exprNode)
+        }
+
+        let inner = analyzeExpression(child, tree: tree, tokens: tokens)
+        let innerType = typeOf(inner)
+        checkUnaryOperand(opKind, operandNode: child, operand: inner, at: opTok, tree: tree, tokens: tokens)
+
+        switch opKind {
+        case .minus, .tilde, .plus:
+            // The integer promotions apply to the operand, whose type the result has (C23 6.5.3.3)
+            let value = promoted(rvalue(inner))
+            let type = isTyped(value) ? typeOf(value) : innerType
+            nodeTypes[exprNode] = type.typeId
+            if opKind == .plus { return value }
+            return emit(opKind == .minus ? .neg : .bitNot, type, value.rawIndex, node: exprNode)
+        case .exclaim:
+            nodeTypes[exprNode] = .int
+            return emit(.logicalNot, .int, conditionValue(inner).rawIndex, node: exprNode)
+        case .amp:
+            let type = QualType(typeId: typePool.pointerTo(innerType))
+            nodeTypes[exprNode] = type.typeId
+            return emit(.addrOf, type, inner.rawIndex, node: exprNode)
+        case .star:
+            let type = typePool.pointeeType(of: innerType.typeId)
+            nodeTypes[exprNode] = type.typeId
+            return emit(.deref, type, rvalue(inner).rawIndex, node: exprNode)
+        case .plusPlus, .minusMinus:
+            // The operator precedes its operand's tokens when prefix, and follows them when postfix
+            let isPrefix = opTok.rawIndex < tree.token(of: child).rawIndex
+            let kind: SemInstKind = opKind == .plusPlus ? (isPrefix ? .preInc : .postInc) : (isPrefix ? .preDec : .postDec)
+            nodeTypes[exprNode] = innerType.typeId
+            return emit(kind, innerType.unqualified(), inner.rawIndex, node: exprNode)
+        default:
+            // `__real__`, `__imag__` and other GNU operators are not modeled
+            nodeTypes[exprNode] = innerType.typeId
+            return emit(.errorInst, innerType, inner.rawIndex, node: exprNode)
+        }
+    }
+
+    /// A function call (C23 6.5.2.2): the callee converted to a pointer, each argument converted as if by
+    /// assignment to its parameter's type, and the default argument promotions for the rest. Builtins that fold to
+    /// constants (`__builtin_offsetof`, ...) become them, and `__builtin_va_arg` becomes `vaArg`.
+    private mutating func analyzeCall(_ exprNode: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> SemInstId {
+        let children = tree.children(of: exprNode)
+        guard children.count >= 1 else {
+            return emit(.errorInst, .int, node: exprNode)
+        }
+        let calleeNode = children[0]
+        let calleeName = (tree.kind(of: calleeNode) == .identExpr) ? spelling(of: tree.token(of: calleeNode), in: tokens) : ""
+        let argNodes = children.count > 1 ? tree.children(of: children[1]) : []
+
+        if calleeName == "__builtin_va_arg", argNodes.count == 2, isTypeNode(tree.kind(of: argNodes[1])) {
+            let type = resolveType(from: argNodes[1], tree: tree, tokens: tokens)
+            let list = analyzeExpression(argNodes[0], tree: tree, tokens: tokens)
+            nodeTypes[exprNode] = type.typeId
+            return emit(.vaArg, type, list.rawIndex, node: exprNode)
+        }
+        if isBuiltinFunctionName(calleeName), currentScope.lookupOrdinary(calleeName) == nil || calleeName == "__builtin_offsetof",
+           let value = constantValue(exprNode, tree: tree, tokens: tokens) {
+            // `__builtin_offsetof`, `__atomic_always_lock_free`, ...: integer constants
+            _ = analyzeExpression(calleeNode, tree: tree, tokens: tokens)  // declares the builtin, as for any call
+            block.block.truncate(to: block.block.mark())
+            nodeTypes[exprNode] = value.type
+            return block.block.appendIntLiteral(value: value.signedValue, type: QualType(typeId: value.type), node: exprNode)
+        }
+
+        let callee = analyzeExpression(calleeNode, tree: tree, tokens: tokens)
+        let calleeType = typeOf(callee)
+
+        var retType: QualType = .int
+        var calleeInfo = typePool.typeInfo(of: typePool.canonical(of: calleeType.typeId))
+        if case .pointer(let pointee) = calleeInfo.kind {
+            calleeInfo = typePool.typeInfo(of: typePool.canonical(of: pointee.typeId))
+        }
+        var calleeParamCount: Int? = nil
+        var calleeVariadic = true
+        var paramTypes: [QualType] = []
+        if case .function(let rType, let pTypes, let variadic) = calleeInfo.kind {
+            retType = rType
+            calleeParamCount = pTypes.count
+            calleeVariadic = variadic
+            paramTypes = pTypes
+        } else if case .error = calleeInfo.kind {
+            // Callee type not modeled (e.g. a function pointer from a parenthesized declarator)
+            retType = .error
+        } else if !isTyped(callee) {
+            retType = .error
+        } else {
+            reportError("called object is not a function or function pointer", diagId: .semaNotCallable, at: tree.token(of: exprNode), in: tokens, args: ["\(calleeType)"])
+        }
+
+        let isOffsetof = (calleeName == "__builtin_offsetof")
+        var args: [(inst: SemInstId, node: NodeId)] = []
+        for (argIdx, arg) in argNodes.enumerated() {
+            if isTypeNode(tree.kind(of: arg)) {
+                let t = resolveType(from: arg, tree: tree, tokens: tokens)
+                pendingVLALengths.removeAll()
+                if calleeName == "__builtin_va_arg" && argIdx == 1 {
+                    retType = t
+                }
+            } else if isOffsetof && argIdx == 1 {
+                // Second argument of __builtin_offsetof(type, member) is a member designator, not a variable
+                continue
+            } else {
+                args.append((analyzeExpression(arg, tree: tree, tokens: tokens), arg))
+            }
+        }
+
+        // Argument count against the prototype (C23 6.5.2.2p2), for calls through functions and function pointers
+        if let paramCount = calleeParamCount, !calleeName.hasPrefix("__builtin_"), !builtinNames.contains(calleeName) {
+            let argCount = argNodes.count
+            if argCount < paramCount || (argCount > paramCount && !calleeVariadic) {
+                reportError("wrong number of arguments to function call", diagId: .semaCallArgCountMismatch, at: tree.token(of: exprNode), in: tokens,
+                            args: [argCount < paramCount ? "few" : "many", "\(paramCount)", "\(argCount)"])
+            }
+        }
+
+        nodeTypes[exprNode] = retType.typeId
+        let calleeValue = rvalue(callee)
+        let directDecl: DeclId
+        if kindOf(callee) == .declRef, declTable.kind(of: DeclId(block.block.arg0[callee])) == .function {
+            directDecl = DeclId(block.block.arg0[callee])
+        } else {
+            directDecl = .nilId
+        }
+        var items: [UInt32] = [directDecl.rawIndex, UInt32(paramTypes.count), UInt32(args.count)]
+        for (i, arg) in args.enumerated() {
+            let value = i < paramTypes.count
+                ? convertForAssignment(arg.inst, node: arg.node, to: paramTypes[i], tree: tree, tokens: tokens)
+                : argumentPromoted(rvalue(arg.inst))
+            items.append(value.rawIndex)
+        }
+        return emitList(.call, retType.unqualified(), arg0: calleeValue.rawIndex, items: items, node: exprNode)
+    }
+
+    // MARK: - Initializers (C23 6.7.10)
+
+    /// A subobject being initialized by a braced initializer: either a value for the whole subobject (a scalar, a
+    /// string literal for a character array, a struct or union rvalue), or initializers for its elements by index.
+    private final class InitNode {
+        let type: QualType
+        var value: SemInstId = .nilId
+        var elements: [Int: InitNode] = [:]
+        /// GNU `[lo ... hi]` designators: the number of elements the entry at an index initializes.
+        var counts: [Int: Int] = [:]
+        /// One past the highest element index initialized (an array of unknown size takes this length).
+        var length = 0
+
+        init(type: QualType) { self.type = type }
+
+        /// The node of element `index`: a fresh one if `fresh` (a braced initializer replaces the element's previous
+        /// initializer), else the existing aggregate node (a designator into it keeps its other elements).
+        func child(_ index: Int, type: QualType, fresh: Bool) -> InitNode {
+            if !fresh, let existing = elements[index], !existing.value.isValid { return existing }
+            let node = InitNode(type: type)
+            elements[index] = node
+            counts[index] = nil
+            // A later initializer overrides the part of a range it overlaps; the range keeps the elements before it
+            for (start, count) in counts where start < index && start + count > index { counts[start] = index - start }
+            length = max(length, index + 1)
+            return node
+        }
+
+        /// Makes the range `[lo, lo + count)` initialized by the entry at `lo` override the entries it overlaps: a
+        /// later range starts after it, an earlier one is cut short where it begins.
+        func claim(_ lo: Int, count: Int) {
+            counts[lo] = count
+            length = max(length, lo + count)
+            for start in elements.keys.sorted() where start != lo {
+                let end = start + (counts[start] ?? 1)
+                if start < lo && end > lo {
+                    counts[start] = lo - start
+                } else if start > lo && start < lo + count {
+                    let entry = elements.removeValue(forKey: start)
+                    counts[start] = nil
+                    if end > lo + count, let entry {
+                        elements[lo + count] = entry
+                        counts[lo + count] = end - (lo + count)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The element of an aggregate initialized at `index`: an array element, or the struct or union member with that
+    /// field ordinal (unnamed bit-fields are skipped by `nextIndex`). Nil past the end; an array of unknown size has
+    /// no end.
+    private func initElementType(of type: QualType, at index: Int) -> QualType? {
+        switch canonicalKind(type) {
+        case .array(let element, let count):
+            let unbounded = count == 0 && !typePool.isVariableLengthArray(type.typeId)
+            return unbounded || UInt64(index) < count ? QualType(rawValue: element.rawValue | UInt32(type.qualifiers)) : nil
+        case .struct(_, let fields, _):
+            guard index < fields.count else { return nil }
+            return QualType(rawValue: fields[index].type.rawValue | UInt32(type.qualifiers & 0b011))
+        default:
+            return nil
+        }
+    }
+
+    /// The first index at or after `index` that an initializer can initialize: unnamed bit-fields are skipped
+    /// (C23 6.7.10p9), and a union takes only its first member positionally.
+    private func nextIndex(of type: QualType, from index: Int, positional: Bool) -> Int {
+        guard case .struct(_, let fields, let isUnion) = canonicalKind(type) else { return index }
+        if isUnion && positional && index > 0 { return fields.count }
+        var i = index
+        while i < fields.count, fields[i].name.isEmpty, fields[i].bitWidth != nil { i += 1 }
+        return i
+    }
+
+    private func isAggregate(_ t: QualType) -> Bool {
+        switch canonicalKind(t) {
+        case .array, .struct: return true
+        default: return false
+        }
+    }
+
+    /// A character array a string literal can initialize: an array of integers of the literal's element size.
+    private func isStringInitializable(_ array: QualType, by node: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> Bool {
+        guard tree.kind(of: node) == .stringLiteral, case .array(let element, _) = canonicalKind(array),
+              typePool.isInteger(type: element.typeId) else { return false }
+        let info = stringLiteralInfo(tree.token(of: node), tokens: tokens)
+        return typePool.size(of: element.typeId) == typePool.size(of: info.element)
+    }
+
+    /// The initializer `node` of an object of `type`, resolved (C23 6.7.10): an `initList` for a braced initializer
+    /// (a scalar's too), a string literal for a character array, or the value converted as if by assignment.
+    /// Returns the instruction, the analyzed expression of a non-braced initializer (for the assignment constraints),
+    /// and the type completed by the initializer (an array of unknown size takes its length from it).
+    private mutating func resolveInitializer(_ node: NodeId, type: QualType, tree: borrowing ParseTree,
+                                             tokens: borrowing TokenBuffer) -> (inst: SemInstId, raw: SemInstId, type: QualType) {
+        if type.isError {
+            let raw = analyzeExpression(node, tree: tree, tokens: tokens)
+            return (rvalue(raw), raw, type)
+        }
+        if tree.kind(of: node) == .initList {
+            let items = tree.children(of: node)
+            // `char s[] = { "abc" }`
+            if items.count == 1, isStringInitializable(type, by: items[0], tree: tree, tokens: tokens) {
+                let s = analyzeExpression(items[0], tree: tree, tokens: tokens)
+                return (s, .nilId, completedArrayType(type, length: Int(stringLiteralInfo(tree.token(of: items[0]), tokens: tokens).length)))
+            }
+            let root = InitNode(type: type)
+            if isAggregate(type) {
+                resolveBracedList(node, into: root, tree: tree, tokens: tokens)
+            } else if let first = items.first {
+                // Braces around a scalar initializer (C23 6.7.10p11); excess initializers are diagnosed as warnings
+                let value = resolveInitializer(first, type: type, tree: tree, tokens: tokens).inst
+                for extra in items.dropFirst() { _ = analyzeExpression(extra, tree: tree, tokens: tokens) }
+                return (value, .nilId, type)
+            }
+            let completed = completedArrayType(type, length: root.length)
+            let inst = emitInitializer(root, type: completed, node: node)
+            return (inst, .nilId, completed)
+        }
+        if isStringInitializable(type, by: node, tree: tree, tokens: tokens) {
+            let s = analyzeExpression(node, tree: tree, tokens: tokens)
+            return (s, .nilId, completedArrayType(type, length: Int(stringLiteralInfo(tree.token(of: node), tokens: tokens).length)))
+        }
+        let raw = analyzeExpression(node, tree: tree, tokens: tokens)
+        return (convertForAssignment(raw, node: node, to: type, tree: tree, tokens: tokens), raw, type)
+    }
+
+    /// `type` completed to `length` elements if it is an array of unknown size.
+    private func completedArrayType(_ type: QualType, length: Int) -> QualType {
+        guard case .array(let element, 0) = canonicalKind(type), !typePool.isVariableLengthArray(type.typeId), length > 0 else { return type }
+        return QualType(typeId: typePool.arrayType(elementType: element, count: UInt64(length)), qualifiers: type.qualifiers)
+    }
+
+    /// Resolves the items of braced list `list` into `root` (C23 6.7.10p17-21): positional items initialize the next
+    /// subobject in order, descending into a sub-aggregate whose initializer has no braces (brace elision); a
+    /// designation selects the subobject from the list's object, and the items after it continue from there.
+    private mutating func resolveBracedList(_ list: NodeId, into root: InitNode, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) {
+        // The current object hierarchy: each frame's node and the index of its next subobject
+        var frames: [(node: InitNode, next: Int)] = [(root, nextIndex(of: root.type, from: 0, positional: false))]
+        for item in tree.children(of: list) {
+            guard tree.kind(of: item) == .designatedInit else {
+                placeInitializer(item, frames: &frames, designated: false, tree: tree, tokens: tokens)
+                continue
+            }
+            let children = tree.children(of: item)
+            guard let valueNode = children.last else { continue }
+            guard let path = designatorPath(item, indexNodes: Array(children.dropLast()), type: root.type, tree: tree, tokens: tokens) else {
+                // An invalid designator: the value is still checked
+                _ = analyzeExpression(valueNode, tree: tree, tokens: tokens)
+                continue
+            }
+            frames = [(root, 0)]
+            for (k, step) in path.enumerated() {
+                let top = frames[frames.count - 1]
+                frames[frames.count - 1].next = step.index
+                guard k < path.count - 1, let elementType = initElementType(of: top.node.type, at: step.index) else { break }
+                frames.append((top.node.child(step.index, type: elementType, fresh: false), 0))
+            }
+            let level = frames.count - 1
+            placeInitializer(valueNode, frames: &frames, designated: true, tree: tree, tokens: tokens)
+            if let last = path.last, last.count > 1, level < frames.count {
+                // `[lo ... hi] = v` initializes each element of the range with v (evaluated once)
+                frames[level].node.claim(last.index, count: last.count)
+                if frames.count == level + 1 { frames[level].next = max(frames[level].next, last.index + last.count) }
+            }
+        }
+    }
+
+    /// The path of a designation (`.a.b[2]`, `[lo ... hi]`): per designator, the field ordinal or array index (through
+    /// anonymous members, a field is several steps) and the number of elements of a range. Nil if a designator
+    /// names no member or index of the current object (diagnosed).
+    private mutating func designatorPath(_ item: NodeId, indexNodes: [NodeId], type: QualType, tree: borrowing ParseTree,
+                                         tokens: borrowing TokenBuffer) -> [(index: Int, count: Int)]? {
+        var path: [(index: Int, count: Int)] = []
+        var current = type
+        var nodes = indexNodes[...]
+        // The designators are tokens from the first `.` or `[` to the `=`; index expressions are the item's children
+        var i = Int(tree.token(of: item).rawIndex)
+        if CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(i)))) == .identifier { i -= 1 }  // anchored at `.a`'s name
+        while i < tokens.count {
+            let tok = TokenId(UInt32(i))
+            switch CTokenKind(rawValue: tokens.kind(of: tok)) {
+            case .period:
+                let nameTok = TokenId(UInt32(i + 1))
+                let name = spelling(of: nameTok, in: tokens)
+                guard let fieldPath = typePool.fieldPath(named: name, in: current.typeId) else {
+                    if !current.isError && isStructOrUnion(current) {
+                        reportError("field designator does not refer to any field", diagId: .semaInvalidMember, at: nameTok, in: tokens,
+                                    args: [name, typeName(current.unqualified())])
+                    }
+                    return nil
+                }
+                for index in fieldPath {
+                    guard let next = initElementType(of: current, at: index) else { return nil }
+                    path.append((index, 1))
+                    current = next
+                }
+                i += 2
+            case .lBracket:
+                guard let indexNode = nodes.popFirst(), let lo = constantValue(indexNode, tree: tree, tokens: tokens), !lo.isNegative else { return nil }
+                var count = 1
+                // A GNU range has a second index expression
+                var j = i + 1
+                var depth = 0
+                while j < tokens.count {
+                    let k = CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(j))))
+                    if k == .lBracket || k == .lParen { depth += 1 }
+                    if k == .rParen { depth -= 1 }
+                    if k == .rBracket { if depth == 0 { break }; depth -= 1 }
+                    if k == .ellipsis && depth == 0, let hiNode = nodes.popFirst(), let hi = constantValue(hiNode, tree: tree, tokens: tokens) {
+                        count = max(1, Int(clamping: hi.signedValue - lo.signedValue + 1))
+                    }
+                    j += 1
+                }
+                guard case .array = canonicalKind(current), let next = initElementType(of: current, at: Int(clamping: lo.bits)) else { return nil }
+                path.append((Int(clamping: lo.bits), count))
+                current = next
+                i = j + 1
+            default:
+                return path.isEmpty ? nil : path
+            }
+        }
+        return path.isEmpty ? nil : path
+    }
+
+    /// Places one initializer at the current position of `frames` (C23 6.7.10p20): a braced list initializes the
+    /// next subobject entirely; an expression initializes it if it is a scalar, a compatible struct or union, or a
+    /// character array initialized by a string literal; otherwise the expression initializes the subobject's first
+    /// element, recursively (brace elision). Frames whose object is exhausted are popped.
+    private mutating func placeInitializer(_ item: NodeId, frames: inout [(node: InitNode, next: Int)], designated: Bool,
+                                           tree: borrowing ParseTree, tokens: borrowing TokenBuffer) {
+        var analyzed: SemInstId? = nil
+        var isDesignatedPosition = designated
+        while true {
+            let top = frames[frames.count - 1]
+            let index = isDesignatedPosition ? top.next : nextIndex(of: top.node.type, from: top.next, positional: top.next > 0)
+            isDesignatedPosition = false
+            guard let elementType = initElementType(of: top.node.type, at: index) else {
+                if frames.count > 1 {
+                    frames.removeLast()
+                    frames[frames.count - 1].next += 1
+                    continue
+                }
+                // An excess initializer (a warning in Clang): checked, then dropped
+                if analyzed == nil && tree.kind(of: item) != .initList { _ = analyzeExpression(item, tree: tree, tokens: tokens) }
+                return
+            }
+            frames[frames.count - 1].next = index
+            if tree.kind(of: item) == .initList {
+                let child = top.node.child(index, type: elementType, fresh: true)
+                if isAggregate(elementType) {
+                    if tree.children(of: item).count == 1, isStringInitializable(elementType, by: tree.children(of: item)[0], tree: tree, tokens: tokens) {
+                        child.value = analyzeExpression(tree.children(of: item)[0], tree: tree, tokens: tokens)
+                    } else {
+                        resolveBracedList(item, into: child, tree: tree, tokens: tokens)
+                    }
+                } else {
+                    child.value = resolveInitializer(item, type: elementType, tree: tree, tokens: tokens).inst
+                }
+                frames[frames.count - 1].next = index + 1
+                return
+            }
+            if isAggregate(elementType) {
+                if isStringInitializable(elementType, by: item, tree: tree, tokens: tokens) {
+                    top.node.child(index, type: elementType, fresh: true).value = analyzed ?? analyzeExpression(item, tree: tree, tokens: tokens)
+                    frames[frames.count - 1].next = index + 1
+                    return
+                }
+                let value = analyzed ?? analyzeExpression(item, tree: tree, tokens: tokens)
+                analyzed = value
+                if isStructOrUnion(elementType), isTyped(value), typesCompatible(typeOf(value).unqualified(), elementType.unqualified()) {
+                    top.node.child(index, type: elementType, fresh: true).value = rvalue(value)
+                    frames[frames.count - 1].next = index + 1
+                    return
+                }
+                if !isTyped(value) && !isArrayType(elementType) && isStructOrUnion(elementType) && typeOf(value).isError {
+                    // An unmodeled value: assume it initializes the whole member
+                    top.node.child(index, type: elementType, fresh: true).value = value
+                    frames[frames.count - 1].next = index + 1
+                    return
+                }
+                // Brace elision: initialize the sub-aggregate's first element with this expression
+                frames.append((top.node.child(index, type: elementType, fresh: false), 0))
+                continue
+            }
+            let value = analyzed ?? analyzeExpression(item, tree: tree, tokens: tokens)
+            top.node.child(index, type: elementType, fresh: true).value =
+                convertForAssignment(value, node: item, to: elementType, tree: tree, tokens: tokens)
+            frames[frames.count - 1].next = index + 1
+            return
+        }
+    }
+
+    /// Emits the resolved initializer tree: an `initList` of (index, count, value) triples sorted by index.
+    private mutating func emitInitializer(_ node: InitNode, type: QualType, node parseNode: NodeId) -> SemInstId {
+        if node.value.isValid { return node.value }
+        var items: [UInt32] = []
+        for index in node.elements.keys.sorted() {
+            let child = node.elements[index]!
+            let value = emitInitializer(child, type: child.type, node: parseNode)
+            items += [UInt32(index), UInt32(node.counts[index] ?? 1), value.rawIndex]
+        }
+        return emitList(.initList, type, items: items, node: parseNode)
     }
 
     /// Operand constraints of binary operators (C23 6.5.5-6.5.14).
@@ -2331,27 +3226,44 @@ public struct CSemanticAnalyzer: ~Copyable {
         }
     }
 
-    /// `sizeof` / `alignof` of a type name or an expression's type (C23 6.5.3.4): not a function type (GNU: 1) nor an
-    /// incomplete type (GNU: `void` has size 1). Nil if the operand's type is not modeled.
-    private mutating func sizeOrAlignment(of operand: NodeId, isAlignment: Bool, at tok: TokenId, tree: borrowing ParseTree,
-                                          tokens: borrowing TokenBuffer) -> Int64? {
-        let type: QualType
+    /// The type of a `sizeof`/`alignof` operand: a type name, or the type of an expression, which is not evaluated
+    /// (its instructions are discarded). Nil if the expression's type is not modeled.
+    private mutating func sizeofOperandType(_ operand: NodeId, tree: borrowing ParseTree, tokens: borrowing TokenBuffer) -> QualType? {
         if isTypeNode(tree.kind(of: operand)) {
-            type = resolveType(from: operand, tree: tree, tokens: tokens)
-        } else {
-            let inner = analyzeExpression(operand, tree: tree, tokens: tokens)
-            guard isTyped(inner) else { return nil }
-            type = typeOf(inner)
+            return resolveType(from: operand, tree: tree, tokens: tokens)
         }
+        let mark = block.block.mark()
+        let lengths = pendingVLALengths.count
+        unevaluatedDepth += 1
+        let inner = analyzeExpression(operand, tree: tree, tokens: tokens)
+        let type: QualType? = isTyped(inner) ? typeOf(inner) : nil
+        unevaluatedDepth -= 1
+        block.block.truncate(to: mark)
+        if pendingVLALengths.count > lengths { pendingVLALengths.removeLast(pendingVLALengths.count - lengths) }
+        return type
+    }
+
+    /// `sizeof` / `alignof` of a type (C23 6.5.3.4): not a function type (GNU: 1) nor an incomplete type (GNU: `void`
+    /// has size 1). Nil if the type is not modeled, or for `sizeof` of a variable length array (not a constant).
+    private mutating func sizeOrAlignment(ofType type: QualType, isAlignment: Bool, at tok: TokenId, tokens: borrowing TokenBuffer) -> Int64? {
         guard !type.isError else { return nil }
         let can = typePool.canonical(of: type.typeId)
         if can == .void || isFunctionType(type) { return 1 }
+        if !isAlignment && typePool.isVariableLengthArray(can) { return nil }
         if !typePool.isComplete(can) {
             reportError("invalid application of 'sizeof' to an incomplete type", diagId: .semaInvalidExpression, at: tok, in: tokens,
                         args: ["invalid application of '\(isAlignment ? "alignof" : "sizeof")' to an incomplete type '\(typeName(type))'"])
             return nil
         }
-        return Int64(isAlignment ? typePool.alignment(of: can) : typePool.size(of: can))
+        // An aligned typedef has its own alignment, and the size of the type it names
+        return Int64(isAlignment ? typePool.alignment(of: type.typeId) : typePool.size(of: can))
+    }
+
+    /// `sizeof` / `alignof` of a type name or an expression's type, for constant evaluation.
+    private mutating func sizeOrAlignment(of operand: NodeId, isAlignment: Bool, at tok: TokenId, tree: borrowing ParseTree,
+                                          tokens: borrowing TokenBuffer) -> Int64? {
+        guard let type = sizeofOperandType(operand, tree: tree, tokens: tokens) else { return nil }
+        return sizeOrAlignment(ofType: type, isAlignment: isAlignment, at: tok, tokens: tokens)
     }
 
     /// Operand constraints of unary operators (C23 6.5.3).
@@ -2677,13 +3589,15 @@ public struct CSemanticAnalyzer: ~Copyable {
         return type
     }
 
-    /// A character constant's value and type (C23 6.4.4.5): `int` unprefixed or `L` (`wchar_t`), `char8_t`
-    /// (`unsigned char`) for `u8`, `char16_t` (`unsigned short`) for `u`, `char32_t` (`unsigned int`) for `U`.
+    /// A character constant's value and type (C23 6.4.4.5): `int` unprefixed, `wchar_t` for `L`, `char8_t`
+    /// (`unsigned char`) for `u8`, `char16_t` (`unsigned short`) for `u`, `char32_t` (`unsigned int`) for `U`. A
+    /// single-byte unprefixed constant has the value of a `char`, whose signedness is the target's.
     private func characterConstant(_ raw: String) -> IntConst? {
-        let value = UInt64(bitPattern: CLiteral.characterValue(raw))
+        let value = UInt64(bitPattern: CLiteral.characterValue(raw, charIsSigned: dataLayout.charIsSigned))
         if raw.hasPrefix("u8") { return makeConst(value, .uchar) }
         if raw.hasPrefix("u") { return makeConst(value, .ushort) }
         if raw.hasPrefix("U") { return makeConst(value, .uint) }
+        if raw.hasPrefix("L") { return makeConst(value, dataLayout.wcharType) }
         return makeConst(value, .int)
     }
 
@@ -2698,7 +3612,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             let text = spelling(of: TokenId(UInt32(i)), in: tokens)
             if text.hasPrefix("u8") { element = .uchar }
             else if text.hasPrefix("u") { element = .ushort }
-            else if text.hasPrefix("U") || text.hasPrefix("L") { element = text.hasPrefix("U") ? .uint : .int }
+            else if text.hasPrefix("U") || text.hasPrefix("L") { element = text.hasPrefix("U") ? .uint : dataLayout.wcharType }
             pieces.append(text)
             i += 1
         }
@@ -2711,5 +3625,59 @@ public struct CSemanticAnalyzer: ~Copyable {
             }
         }
         return (element, units + 1)
+    }
+
+    /// The code units of a string literal and the literals concatenated with it (C23 6.4.5p5-6), in the target's
+    /// (little-endian) byte order, with the terminator: UTF-8 for ordinary and `u8` literals, UTF-16 for `u`, UTF-32
+    /// for `U`, and `wchar_t` (32-bit) for `L`. An octal or hexadecimal escape is one code unit.
+    private func stringLiteralConstant(_ first: TokenId, tokens: borrowing TokenBuffer) -> StringConstant {
+        var encoding = StringEncoding.ordinary
+        var bodies: [Substring] = []
+        var i = Int(first.rawIndex)
+        while i < tokens.count, CTokenKind(rawValue: tokens.kind(of: TokenId(UInt32(i)))) == .stringLiteral {
+            let text = spelling(of: TokenId(UInt32(i)), in: tokens)
+            if text.hasPrefix("u8") { encoding = .utf8 }
+            else if text.hasPrefix("u") { encoding = .utf16 }
+            else if text.hasPrefix("U") { encoding = .utf32 }
+            else if text.hasPrefix("L") { encoding = .wide }
+            bodies.append(CLiteral.body(of: text, quote: "\""))
+            i += 1
+        }
+        let unitSize: Int
+        switch encoding {
+        case .ordinary, .utf8: unitSize = 1
+        case .utf16: unitSize = 2
+        case .utf32, .wide: unitSize = 4
+        }
+        var units: [UInt32] = []
+        for body in bodies { units += CLiteral.codeUnits(body, unitSize: unitSize) }
+        units.append(0)
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(units.count * unitSize)
+        for unit in units {
+            for b in 0..<unitSize { bytes.append(UInt8(truncatingIfNeeded: unit >> UInt32(8 * b))) }
+        }
+        return StringConstant(bytes: bytes, elementSize: unitSize, encoding: encoding)
+    }
+
+    /// The format of a floating type.
+    private func floatFormat(of type: TypeId) -> FloatFormat? {
+        typePool.floatFormat(of: type)
+    }
+
+    /// A floating constant's spelling without digit separators and its suffix (`f`, `l`, `f16`, `f32x`, ...).
+    private func floatingConstantBody(_ raw: String) -> String {
+        var s = raw.filter { $0 != "'" }
+        let lower = s.lowercased()
+        let isHex = lower.hasPrefix("0x")
+        for suffix in ["f32x", "f64x", "f128", "bf16", "f16", "f32", "f64", "df", "dd", "dl"] where lower.hasSuffix(suffix) {
+            // A hexadecimal constant's digits never end a binary exponent, so its suffix is never mistaken for one
+            s.removeLast(suffix.count)
+            return s
+        }
+        if let last = lower.last, last == "l" || (last == "f" && (!isHex || lower.contains("p"))) {
+            s.removeLast()
+        }
+        return s
     }
 }

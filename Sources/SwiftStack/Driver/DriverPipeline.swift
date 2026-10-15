@@ -23,6 +23,8 @@ public struct DriverOptions {
     public var compileOnly: Bool = false
     public var targetArch: AssemblerArch = .x86_64
     public var dumpStage: String? = nil
+    /// `--verify-each`: run the IR verifiers after each stage that has one (SemIR now; AIR from M3 phase 2).
+    public var verifyEach: Bool = false
     public var showStats: Bool = false
     public var timePhases: Bool = false
     public var profilePath: String? = nil
@@ -187,6 +189,7 @@ public final class DriverPipeline {
         var parseTokens = TokenBuffer()
         let pp = CPreprocessor(sourceManager: sourceManager)
         pp.includePaths.append(contentsOf: options.includePaths)
+        pp.configureTargetArch(options.targetArch.description)
         for def in options.defines {
             pp.defineMacro(def.name, replacement: def.value)
         }
@@ -263,7 +266,7 @@ public final class DriverPipeline {
             }
 
             // Phase 3: Semantic Analysis / SemIR
-            let typePool = TypePool()
+            let typePool = TypePool(dataLayout: DataLayout.forArch(options.targetArch))
             var sem: SemResult? = nil
             let p3_start = ss_monotonic_time_ns()
             Profiler.shared.timeBlock(name: "Phase 3: Semantic Analysis", category: "sem") {
@@ -290,6 +293,15 @@ public final class DriverPipeline {
                 let rendered = DiagnosticRenderer.render(diagnostics: semRes.semModule.diagnosticBag, sourceManager: sourceManager)
                 FileHandle.standardError.write(Data(rendered.utf8))
                 return 1
+            }
+
+            if options.verifyEach {
+                let issues = SemIRVerifier.verify(semRes.semModule)
+                if !issues.isEmpty {
+                    let text = issues.prefix(50).map { "SemIR verifier: \($0)" }.joined(separator: "\n")
+                    FileHandle.standardError.write(Data((text + "\n").utf8))
+                    return 1
+                }
             }
 
             if options.dumpStage == "sem-ir" {

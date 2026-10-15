@@ -34,6 +34,8 @@ extension DriverOptions {
                 options.runBinary = true
             } else if arg.hasPrefix("--dump=") {
                 options.dumpStage = String(arg.dropFirst("--dump=".count))
+            } else if arg == "--verify-each" {
+                options.verifyEach = true
             } else if arg == "--stats" {
                 options.showStats = true
             } else if arg == "--time-phases" {

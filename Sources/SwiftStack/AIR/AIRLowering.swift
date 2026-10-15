@@ -12,6 +12,9 @@ public struct AIRLowering {
     /// Resolves token spellings in any buffer (included headers, macro expansions, pasted tokens).
     private let sourceManager: SourceManager?
     public private(set) var hasLoweringError: Bool = false
+    /// Frame offsets (below the frame pointer) of the current function's parameters and locals, by declaration:
+    /// sema assigns no frame locations, so this throwaway lowering lays the frame out as it meets each object.
+    private var frameSlots: [DeclId: UInt32] = [:]
 
     public init(
         tree: UnsafePointer<ParseTree>,
@@ -71,26 +74,30 @@ public struct AIRLowering {
                 name: sig.name,
                 returnType: sig.returnType,
                 paramTypes: sig.paramTypes,
-                stackFrameSize: sig.stackFrameSize
+                stackFrameSize: 0
             )
+            frameSlots = [:]
 
             let entryBlock = airFn.createBlock()
             var currentBlock = entryBlock
 
             // Lower parameters into stack slots
             for (idx, pName) in sig.paramNames.enumerated() {
-                if !pName.isEmpty, let sym = lookupParam(pName, in: sig) {
+                // Every parameter has a slot, so the frame layout matches the order of declaration
+                let pType = QualType(typeId: sig.paramTypes[idx])
+                let pDecl = idx < sig.paramDecls.count ? sig.paramDecls[idx] : .nilId
+                let absOff = slot(for: pDecl, type: pType, in: &airFn)
+                if !pName.isEmpty {
                     let pVal = ValueId.instResult(airFn.appendInstruction(
                         opcode: .param,
-                        type: sym.type.typeId,
+                        type: pType.typeId,
                         aux: UInt32(idx),
                         inBlock: currentBlock
                     ))
-                    if case .param(_, let offset) = sym.storage {
-                        let absOff = UInt32(abs(offset))
+                    do {
                         let ptrVal = ValueId.instResult(airFn.appendInstruction(
                             opcode: .alloca,
-                            type: typePool.pointerTo(sym.type),
+                            type: typePool.pointerTo(pType),
                             aux: absOff,
                             inBlock: currentBlock
                         ))
@@ -117,6 +124,8 @@ public struct AIRLowering {
                     inBlock: currentBlock
                 )
             }
+            // 16-byte align the stack frame
+            airFn.stackFrameSize = (airFn.stackFrameSize + 15) & ~15
 
             module.addFunction(consume airFn)
         }
@@ -124,13 +133,14 @@ public struct AIRLowering {
         return consume module
     }
 
-    private func lookupParam(_ name: String, in sig: FunctionSignature) -> CSymbol? {
-        for (idx, pName) in sig.paramNames.enumerated() where pName == name {
-            let ty = sig.paramTypes[idx]
-            let offset: Int32 = -Int32(idx + 1) * 8
-            return CSymbol(name: name, type: QualType(typeId: ty), storage: .param(index: idx, offset: offset))
-        }
-        return nil
+    /// The frame offset of a parameter's or local's slot: assigned on first use, 8-byte aligned, at least 8 bytes.
+    private mutating func slot(for decl: DeclId, type: QualType, in airFn: inout AIRFunctionSoA) -> UInt32 {
+        if decl.isValid, let existing = frameSlots[decl] { return existing }
+        let size = max(8, typePool.size(of: type.typeId))
+        airFn.stackFrameSize += Int32((size + 7) & ~7)
+        let offset = UInt32(airFn.stackFrameSize)
+        if decl.isValid { frameSlots[decl] = offset }
+        return offset
     }
 
     private mutating func lowerStatement(
@@ -156,8 +166,12 @@ public struct AIRLowering {
                    tree.pointee.kind(of: children[idx + 1]) != .attributeSpec {
                     initVal = lowerExpression(children[idx + 1], airFn: &airFn, currentBlock: &currentBlock)
                 }
-                guard let sym = semResult.symbolRefs[declarator], case .local(let offset) = sym.storage else { continue }
-                let absOff = UInt32(abs(offset))
+                guard let sym = semResult.symbolRefs[declarator] else { continue }
+                switch sym.storage {
+                case .local, .staticLocal: break
+                default: continue
+                }
+                let absOff = slot(for: sym.declId, type: sym.type, in: &airFn)
                 let ptrVal = ValueId.instResult(airFn.appendInstruction(
                     opcode: .alloca,
                     type: typePool.pointerTo(sym.type),
@@ -350,8 +364,8 @@ public struct AIRLowering {
         case .identExpr:
             if let sym = semResult.symbolRefs[exprNode] {
                 switch sym.storage {
-                case .local(let offset), .param(_, let offset):
-                    let absOff = UInt32(abs(offset))
+                case .local, .staticLocal, .param:
+                    let absOff = slot(for: sym.declId, type: sym.type, in: &airFn)
                     let ptrInst = airFn.appendInstruction(
                         opcode: .alloca,
                         type: typePool.pointerTo(sym.type),
@@ -399,8 +413,8 @@ public struct AIRLowering {
 
             if tree.pointee.kind(of: lhs) == .identExpr, let sym = semResult.symbolRefs[lhs] {
                 switch sym.storage {
-                case .local(let offset), .param(_, let offset):
-                    let absOff = UInt32(abs(offset))
+                case .local, .staticLocal, .param:
+                    let absOff = slot(for: sym.declId, type: sym.type, in: &airFn)
                     let ptrInst = airFn.appendInstruction(
                         opcode: .alloca,
                         type: typePool.pointerTo(sym.type),
@@ -658,8 +672,8 @@ public struct AIRLowering {
             case .amp: // address-of &x
                 if tree.pointee.kind(of: child) == .identExpr, let sym = semResult.symbolRefs[child] {
                     switch sym.storage {
-                    case .local(let offset), .param(_, let offset):
-                        let absOff = UInt32(abs(offset))
+                    case .local, .staticLocal, .param:
+                        let absOff = slot(for: sym.declId, type: sym.type, in: &airFn)
                         let ptrInst = airFn.appendInstruction(
                             opcode: .alloca,
                             type: typePool.pointerTo(sym.type),

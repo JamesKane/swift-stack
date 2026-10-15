@@ -123,6 +123,33 @@ public final class CPreprocessor {
             defineMacro("__amd64__", replacement: "1")
             defineMacro("__amd64", replacement: "1")
         }
+        configureDataLayoutMacros(DataLayout.forArchName(arch))
+    }
+
+    /// The predefined macros that follow the target's data layout (`DataLayout`), with clang 22's values: `char`
+    /// signedness, `wchar_t`, and the `long double` format.
+    private func configureDataLayoutMacros(_ layout: DataLayout) {
+        if layout.charIsSigned { undefMacro("__CHAR_UNSIGNED__") } else { defineMacro("__CHAR_UNSIGNED__", replacement: "1") }
+        let wcharUnsigned = layout.wcharType == .uint
+        defineMacro("__WCHAR_TYPE__", replacement: wcharUnsigned ? "unsigned int" : "int")
+        if wcharUnsigned { defineMacro("__WCHAR_UNSIGNED__", replacement: "1") } else { undefMacro("__WCHAR_UNSIGNED__") }
+        let ldbl: [(String, String)]
+        switch layout.longDoubleFormat {
+        case .x87Extended:
+            ldbl = [("__LDBL_MANT_DIG__", "64"), ("__LDBL_DIG__", "18"), ("__LDBL_MIN_EXP__", "(-16381)"), ("__LDBL_MIN_10_EXP__", "(-4931)"),
+                    ("__LDBL_MAX_EXP__", "16384"), ("__LDBL_MAX_10_EXP__", "4932"), ("__LDBL_MAX__", "1.18973149535723176502e+4932L"),
+                    ("__LDBL_EPSILON__", "1.08420217248550443401e-19L"), ("__LDBL_MIN__", "3.36210314311209350626e-4932L"),
+                    ("__LDBL_DENORM_MIN__", "3.64519953188247460253e-4951L"), ("__LDBL_DECIMAL_DIG__", "21"), ("__DECIMAL_DIG__", "21")]
+        case .ieeeQuad:
+            ldbl = [("__LDBL_MANT_DIG__", "113"), ("__LDBL_DIG__", "33"), ("__LDBL_MIN_EXP__", "(-16381)"), ("__LDBL_MIN_10_EXP__", "(-4931)"),
+                    ("__LDBL_MAX_EXP__", "16384"), ("__LDBL_MAX_10_EXP__", "4932"),
+                    ("__LDBL_MAX__", "1.18973149535723176508575932662800702e+4932L"),
+                    ("__LDBL_EPSILON__", "1.92592994438723585305597794258492732e-34L"),
+                    ("__LDBL_MIN__", "3.36210314311209350626267781732175260e-4932L"),
+                    ("__LDBL_DENORM_MIN__", "6.47517511943802511092443895822764655e-4966L"), ("__LDBL_DECIMAL_DIG__", "36"),
+                    ("__DECIMAL_DIG__", "36")]
+        }
+        for (name, value) in ldbl { defineMacro(name, replacement: value) }
     }
 
     /// Enables `assembler-with-cpp` mode for `.S` assembly source files (05-assembler.md §4.1).

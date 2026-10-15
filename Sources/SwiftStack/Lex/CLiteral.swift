@@ -115,15 +115,16 @@ public enum CLiteral {
     }
 
     /// Value of a character constant (C23 6.4.4.5). A plain single-byte constant has type `int` with the
-    /// value of a (signed, on the supported targets' C ABIs for x86-64) `char`; a multi-character constant
-    /// combines its bytes big-endian, as GCC and Clang do. Prefixed constants (`u'x'`, `L'x'`) are unsigned.
-    public static func characterValue(_ raw: String) -> Int64 {
+    /// value of a `char` (signed on x86-64, unsigned on AArch64 and RISC-V: `charIsSigned`); a multi-character
+    /// constant combines its bytes big-endian, as GCC and Clang do. Prefixed constants (`u'x'`, `L'x'`) are unsigned.
+    public static func characterValue(_ raw: String, charIsSigned: Bool = true) -> Int64 {
         let units = decodeEscapes(body(of: raw, quote: "'"))
         let isPrefixed = !raw.hasPrefix("'")
         guard let first = units.first else { return 0 }
         if isPrefixed { return Int64(units.last ?? first) }
         if units.count == 1 {
-            return first <= 0xFF ? Int64(Int8(truncatingIfNeeded: first)) : Int64(first)
+            guard first <= 0xFF else { return Int64(first) }
+            return charIsSigned ? Int64(Int8(truncatingIfNeeded: first)) : Int64(first)
         }
         var v: Int64 = 0
         for unit in units { v = (v << 8) | Int64(unit & 0xFF) }
@@ -139,6 +140,22 @@ public enum CLiteral {
                 out.append(UInt8(truncatingIfNeeded: unit.value))
             } else if let scalar = Unicode.Scalar(unit.value) {
                 out.append(contentsOf: Array(String(Character(scalar)).utf8))
+            }
+        }
+        return out
+    }
+
+    /// Code units of a string literal's body (C23 6.4.5p5) of `unitSize` bytes: UTF-8 bytes (as `stringBytes`), UTF-16
+    /// code units (a character above U+FFFF is a surrogate pair), or UTF-32 code points. An octal or hexadecimal
+    /// escape is one code unit, truncated to the unit's width.
+    public static func codeUnits<S: StringProtocol>(_ body: S, unitSize: Int) -> [UInt32] {
+        if unitSize == 1 { return stringBytes(body).map { UInt32($0) } }
+        var out: [UInt32] = []
+        for unit in decodeUnits(body) {
+            if unit.isByteEscape || unitSize == 4 {
+                out.append(unitSize == 2 ? unit.value & 0xFFFF : unit.value)
+            } else if let scalar = Unicode.Scalar(unit.value) {
+                out.append(contentsOf: String(Character(scalar)).utf16.map { UInt32($0) })
             }
         }
         return out

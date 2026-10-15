@@ -12,8 +12,11 @@ enum CFrontendCheck {
     struct Outcome {
         let accepted: Bool
         let firstError: String
+        /// The unit's SemIR, when it was accepted.
+        var module: SemModule? = nil
     }
 
+    /// Runs the C front end with the target's data layout (x86-64 when there is no target).
     static func run(path: String, includePaths: [String] = [], target: CTarget? = nil) throws -> Outcome {
         let sm = SourceManager()
         let fileId = try sm.loadFile(path: path)
@@ -55,12 +58,14 @@ enum CFrontendCheck {
             }
             return Outcome(accepted: false, firstError: "syntax error" + at)
         }
-        let analyzer = CSemanticAnalyzer(typePool: TypePool(), sourceBuffer: sf.buffer.baseAddress!, sourceLength: sf.length, sourceManager: sm)
+        let layout = target.map { DataLayout.forArchName($0.arch) } ?? .x86_64
+        let analyzer = CSemanticAnalyzer(typePool: TypePool(dataLayout: layout), sourceBuffer: sf.buffer.baseAddress!, sourceLength: sf.length,
+                                         sourceManager: sm)
         let sem = analyzer.analyze(tree: tree, tokens: tokens)
         if sem.semModule.diagnosticBag.errorCount > 0 {
             return Outcome(accepted: false, firstError: firstLine(DiagnosticRenderer.render(diagnostics: sem.semModule.diagnosticBag, sourceManager: sm)))
         }
-        return Outcome(accepted: true, firstError: "")
+        return Outcome(accepted: true, firstError: "", module: sem.semModule)
     }
 
     static func clangAccepts(path: String, includePaths: [String] = [], target: CTarget? = nil) throws -> Bool {
