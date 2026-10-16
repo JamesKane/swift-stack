@@ -26,6 +26,8 @@ public struct CSemanticAnalyzer: ~Copyable {
     private var staticSymbols: [DeclId: String] = [:]
     /// GNU `asm("name")` labels of objects and functions with linkage, by C name (`SemModule.asmLabels`).
     private var asmLabels: [String: String] = [:]
+    /// Block-scope `register` variables declared with `asm("reg")` (`SemModule.registerVariables`).
+    private var registerVariables: [DeclId: String] = [:]
     /// Explicit alignments (`alignas`, `aligned`) of objects.
     private var objectAlignments: [DeclId: Int] = [:]
 
@@ -223,6 +225,7 @@ public struct CSemanticAnalyzer: ~Copyable {
         finalMod.globals = semGlobals
         finalMod.staticSymbols = staticSymbols
         finalMod.asmLabels = asmLabels
+        finalMod.registerVariables = registerVariables
         finalMod.objectAlignments = objectAlignments
         finalMod.moduleAsm = moduleAsm
 
@@ -367,7 +370,8 @@ public struct CSemanticAnalyzer: ~Copyable {
                     case "_Float16", "__bf16": named = QualType(typeId: .float16)
                     case "_Float32": named = .float
                     case "_Float64", "_Float32x": named = .double
-                    case "__float128", "_Float128", "_Float64x", "__float80", "__ibm128": named = QualType(typeId: .longdouble)
+                    case "__float128", "_Float128": named = QualType(typeId: typePool.float128Type())
+                    case "_Float64x", "__float80", "__ibm128": named = QualType(typeId: .longdouble)
                     case "__int128", "__int128_t": int128 = true
                     case "__uint128_t": int128 = true; unsigned = true
                     case "_Complex", "__complex__", "__complex", "_Imaginary": complex = true
@@ -686,6 +690,12 @@ public struct CSemanticAnalyzer: ~Copyable {
             } else {
                 declareVariable(name, type: type, spec: spec, declarator: declarator, initializer: initializer, isFileScope: isFileScope,
                                 alignment: alignment, at: nameTok, into: &stmts, tree: tree, tokens: tokens)
+                // A block-scope `register` variable with an `asm("reg")` label: the register its value is in as an
+                // `asm` operand (GCC's local register variables)
+                if !isFileScope, !spec.isExtern, !spec.isStatic, let label = asmLabel(attributes, tree: tree, tokens: tokens),
+                   let decl = currentScope.lookupOrdinary(name)?.declId {
+                    registerVariables[decl] = label
+                }
             }
         }
         pendingVLALengths.removeAll()
@@ -1769,6 +1779,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             return .void
         default:
             if name.hasPrefix("__atomic_") || name.hasPrefix("__sync_") || name.hasPrefix("__c11_atomic_") { return pointee(0) }
+            if let math = CMathBuiltins.lookup(name) { return math.suffix == "f" ? .float : math.suffix == "l" ? .longdouble : .double }
             return nil
         }
     }
@@ -2003,12 +2014,12 @@ public struct CSemanticAnalyzer: ~Copyable {
         bitFieldPromotedType(value) ?? typeOf(value)
     }
 
-    /// The default argument promotions (C23 6.5.2.2p6): `float` (and `_Float16`) to `double`, and the integer
-    /// promotions.
+    /// The default argument promotions (C23 6.5.2.2p6): `float` to `double` (not `_Float16`, as Clang and GCC agree),
+    /// and the integer promotions.
     private func argumentPromoted(_ value: SemInstId) -> SemInstId {
         guard isTyped(value) else { return value }
         let t = typeOf(value)
-        if typePool.isFloating(type: t.typeId), typePool.size(of: typePool.canonical(of: t.typeId)) < 8 {
+        if typePool.canonical(of: t.typeId) == .float {
             return convertImplicitly(value, to: .double, reason: .argPromotion, node: nodeOf(value))
         }
         return promoted(value, reason: .argPromotion)
@@ -3866,15 +3877,17 @@ public struct CSemanticAnalyzer: ~Copyable {
         let isHex = bytes.count > 1 && bytes[0] == UInt8(ascii: "0") && bytes[1] == UInt8(ascii: "x")
         func isDigit(_ c: UInt8) -> Bool { c >= UInt8(ascii: "0") && c <= UInt8(ascii: "9") }
         func isMantissaDigit(_ c: UInt8) -> Bool { isDigit(c) || (isHex && c >= UInt8(ascii: "a") && c <= UInt8(ascii: "f")) }
-        for (suffix, t) in [("f16", TypeId.float), ("f32", .float), ("f64", .double), ("f128", .longdouble), ("f32x", .double), ("f64x", .longdouble)]
+        for (suffix, t) in [("f16", TypeId.float16), ("f32", .float), ("f64", .double), ("f128", typePool.float128Type()), ("f32x", .double),
+                            ("f64x", .longdouble)]
             where bytes.count > suffix.utf8.count && bytes.suffix(suffix.utf8.count).elementsEqual(suffix.utf8) {
             bytes.removeLast(suffix.utf8.count)
             type = t
             break
         }
-        // A trailing `f` is a suffix unless it is a hexadecimal digit (no binary exponent yet)
-        if type == .double, let last = bytes.last, last == UInt8(ascii: "l") || (last == UInt8(ascii: "f") && (!isHex || bytes.contains(UInt8(ascii: "p")))) {
-            type = last == UInt8(ascii: "f") ? .float : .longdouble
+        // A trailing `f` is a suffix unless it is a hexadecimal digit (no binary exponent yet); GNU `q` is `__float128`
+        if type == .double, let last = bytes.last, last == UInt8(ascii: "l") || last == UInt8(ascii: "q")
+            || (last == UInt8(ascii: "f") && (!isHex || bytes.contains(UInt8(ascii: "p")))) {
+            type = last == UInt8(ascii: "f") ? .float : last == UInt8(ascii: "q") ? typePool.float128Type() : .longdouble
             bytes.removeLast()
         }
         var i = isHex ? 2 : 0
@@ -3977,7 +3990,7 @@ public struct CSemanticAnalyzer: ~Copyable {
             s.removeLast(suffix.count)
             return s
         }
-        if let last = lower.last, last == "l" || (last == "f" && (!isHex || lower.contains("p"))) {
+        if let last = lower.last, last == "l" || last == "q" || (last == "f" && (!isHex || lower.contains("p"))) {
             s.removeLast()
         }
         return s

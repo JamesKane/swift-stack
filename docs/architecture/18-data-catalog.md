@@ -65,7 +65,7 @@ Expected sizes are **order-of-magnitude estimates** for 100K lines of source (ab
 |---|---|---|---|---|---|---|---|
 | AIR instructions | [03](03-intermediate-representation.md) §4.1 | lowering, passes → passes, isel | SCCP and GVN: `opcode` and operands; ADCE: `opcode` and operands; type queries: `type`; isel: everything | sequential through `blockOrder`, plus random def lookups | ~10⁶ (more after specialization and inlining) | **SoA** (17 B/inst) | Many passes read `opcode` and operands without `type` or `aux`. Defensible, but random def lookups pay one cache line per column. Measure the AoS alternative on the slice. |
 | AIR blocks and edges | [03](03-intermediate-representation.md) §4.1 | lowering, CFG edits → dominators, liveness, all passes | CSR offsets and edges | sequential | ~10⁵ blocks | **CSR** | Edge lists are variable-length, so CSR avoids per-block allocation. |
-| LIR instructions | [04](04-backend.md) §4.3 | isel → liveness, regalloc, encoder | liveness and regalloc: `opcodes` + all operands; encoder: **whole row** | sequential, whole-row for the encoder | ~10⁶ | currently SoA (28 B/inst); **AoS candidate** | The two heaviest consumers read nearly every field per instruction. A 32-byte AoS row (with `imm` 8-aligned) is one cache-line half per instruction instead of seven streams. See [04](04-backend.md) §4.3. |
+| LIR instructions | [04](04-backend.md) §4.3 | isel → liveness, regalloc, encoder | liveness and regalloc: `opcodes` + all operands; encoder: **whole row** | sequential, whole-row for the encoder | ~10⁶ | **AoS** since M3 (12-byte instruction rows, 32-byte operand rows) | The two heaviest consumers read nearly every field per instruction. A 32-byte AoS row (with `imm` 8-aligned) is one cache-line half per instruction instead of seven streams. See [04](04-backend.md) §4.3. |
 | Live intervals | [04](04-backend.md) §4.5 | liveness → linear scan, resolution | start, end, register hint, assigned register, spill slot: **whole row** | sorted sweep, whole-row | ~10⁴ per large function | **AoS** | The scan reads every field of each interval it touches. Range lists stay in a CSR side table. |
 
 ### 5.4 Objects, linking, and debug info
@@ -82,7 +82,7 @@ Expected sizes are **order-of-magnitude estimates** for 100K lines of source (ab
 
 Each of these is resolved by measurement on the vertical slice. Until then, the owning chapter's layout stands, marked as a hypothesis.
 
-1. **LIR instructions** ([04](04-backend.md) §4.3): documented as SoA. The encoder and register allocator consume whole rows, so AoS is the leading candidate.
+1. **LIR instructions** ([04](04-backend.md) §4.3): resolved in M3 as AoS, because the allocator, frame lowering and printer each consume whole rows. Measuring it against SoA remains open.
 2. **SemIR instructions** ([10](10-semantic-ir-and-name-resolution.md) §4.1): documented as SoA. AIR lowering reads whole rows.
 3. **Live intervals** and **relocations**: AoS is expected. Their owning chapters should not specify SoA.
 4. **AIR instructions** ([03](03-intermediate-representation.md) §4.1): SoA is defensible, but it is the most-measured decision in the catalog, because the middle end is where compile time goes.

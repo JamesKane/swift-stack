@@ -117,7 +117,7 @@ The C half of AIR is built (`AIR/AIRFunction.swift`, lowered from SemIR by `AIRL
 - An aggregate result is written through the `call`'s destination operand, and a function returns one with `ret` of its address.
 - An aggregate parameter is the address of the callee's copy.
 
-How each one travels is decided by the ABI lowering ([04](04-backend.md) §4.7.1), which reads the C function type that every `call` carries.
+How each one travels is decided by the ABI lowering ([04](04-backend.md) §4.7.1), which reads the C function type that every `call` carries. A variadic call carries its call-site type: the named parameters, then the (promoted) type of each further argument, so that a structure passed through `...` can be classified like a named one.
 
 **At `-O0`, every named local lives in a stack slot.** Each slot is an `alloca` in the entry block, sized and aligned by the function's `slots` table. On x86-64, an array variable of 16 bytes or more is 16-byte aligned (psABI §3.1.2). Temporaries are SSA values. `&&`, `||` and `?:` merge through `phi`s.
 
@@ -133,14 +133,15 @@ The opcodes, with operand layouts documented on `AIROpcode`:
 | Conversion | `trunc` `zext` `sext` `fptrunc` `fpext` `fptosi` `fptoui` `sitofp` `uitofp` `ptrtoint` `inttoptr` `bitcast` |
 | Calls, variadics | `call`, `va_start` `va_end` `va_copy`, `va_arg` (yields the argument's address; the ABI lowering computes it) |
 | Atomics | `atomic_load` `atomic_store` `atomic_rmw` (xchg, add, sub, and, or, xor, nand) `cmpxchg` `fence`, orderings numbered as `__ATOMIC_*` |
-| Other | `asm` (template, constraints, output addresses, inputs, clobbers), `frame_address`, `return_address`, `phi` |
+| Other | `asm` (template, clobbers, and per operand its constraint, name, C type, and address or value), `frame_address`, `return_address`, `phi` |
 | Terminators | `br` `cond_br` `switch` `indirect_br` `ret` `unreachable` `trap` `asm_goto` |
 
 **How C constructs lower:**
 - **Bit-fields** are accessed as exactly the bytes they span, from the byte holding their first bit. A packed field is therefore never read past its record, and a 40-bit field at bit 9 is an `i48`.
 - **VLAs.** A VLA's length is stored in a slot when its declaration (or the parameter's, on entry) is reached. Its storage is released by restoring the stack pointer saved before it: at the end of its block, and by a `break`, `continue` or `goto` that leaves it.
 - **GNU case ranges** of up to 64 values become `switch` cases; wider ranges are tested on the way to the default.
-- **Builtins** become operations or calls to the library function they name. For example, `__builtin_add_overflow` computes the exact result in an integer wide enough to hold it.
+- **Builtins** become operations or calls to the library function they name. For example, `__builtin_add_overflow` computes the exact result in an integer wide enough to hold it, and `__builtin_ceil` calls `ceil`.
+- **`asm` operands.** An output is the address of its lvalue. An input is its object's address when its constraint allows only memory, and its value otherwise. Each operand records its C type, which sizes the register its template names. A `register` variable declared with `asm("reg")` that is an operand has the constraint `{reg}`: GCC guarantees such a variable is in that register only as an `asm` operand, so that is the one place it is modeled.
 
 **Symbols.** A module's symbols are its functions and objects, defined or referred to. As Clang does, an internal definition is emitted only when something emitted refers to it (`static` functions, block-scope statics, string literals). An inline-only definition (C23 6.7.5, or GNU `extern inline`) is not emitted, and its name refers to an external definition.
 

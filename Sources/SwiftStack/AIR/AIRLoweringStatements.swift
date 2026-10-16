@@ -440,13 +440,26 @@ extension FunctionLowering {
 
     mutating func asmStatement(_ id: SemInstId) {
         guard let asm = SemAsm(id, in: c.block) else { report("malformed asm statement"); return }
-        func operand(_ o: SemAsm.Operand, output: Bool) -> [UInt32] {
+        /// The register a local `register` variable is bound to, if the operand names one: GCC places it there.
+        func registerVariable(_ v: SemInstId) -> String? {
+            var e = v
+            if kind(e) == .lvalueToRvalue { e = arg0(e) }
+            guard kind(e) == .declRef else { return nil }
+            return sem.registerVariables[DeclId(arg0(e).rawIndex)]
+        }
+        /// The constraint, with a register variable's register (as LLVM writes it, `{reg}`) in place of its class.
+        func constraint(_ o: SemAsm.Operand) -> String {
+            guard let reg = registerVariable(o.value) else { return o.constraint }
+            let prefix = o.constraint.prefix { "=+&".contains($0) }
+            return prefix + "{" + reg.trimmingCharacters(in: CharacterSet(charactersIn: "%")) + "}"
+        }
+        func operand(_ o: SemAsm.Operand) -> [UInt32] {
             let name = o.name.isEmpty ? AIRAsm.noName : module.intern(string: o.name)
-            return [module.intern(string: o.constraint), name, 0]
+            return [module.intern(string: constraint(o)), name, 0, type(o.value).typeId.rawIndex]
         }
         var outputs: [UInt32] = [], inputs: [UInt32] = []
         for o in asm.outputs {
-            var entry = operand(o, output: true)
+            var entry = operand(o)
             switch lvalue(o.value) {
             case .memory(let address, _, _): entry[2] = address.rawIndex
             case .bitField: report("a bit-field as an asm output")
@@ -454,7 +467,8 @@ extension FunctionLowering {
             outputs += entry
         }
         for o in asm.inputs {
-            var entry = operand(o, output: false)
+            var entry = operand(o)
+            // An input whose constraint allows only memory is its object's address; any other is its value
             if kind(o.value).isLvalue, case .memory(let address, _, _) = lvalue(o.value) {
                 entry[2] = address.rawIndex
             } else {

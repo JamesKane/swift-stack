@@ -58,7 +58,7 @@ Carried forward:
   - Clang 22 emits an initialized array of `_BitInt(N > 128)`, or a record holding one, with LLVM's larger allocation size: `_BitInt(300) a[6]` has `sizeof` 240 but a 280-byte symbol. The image probes keep these out.
   - The D7 profile predefines clang 19's `__clang_version__` and GCC 14's `__GNUC__`, so a string built from them differs from clang 22's (SQLite's compile options).
 
-**Phase 2 is done** (2026-10-15). AIR is the design of [03](../03-intermediate-representation.md) §4.1, with the C types and operations of §4.1.1. `AIRLowering` lowers SemIR to it. The M0.5 AIR is kept as `SliceAIR*` until phase 3 replaces the code generator that reads it.
+**Phase 2 is done** (2026-10-15). AIR is the design of [03](../03-intermediate-representation.md) §4.1, with the C types and operations of §4.1.1. `AIRLowering` lowers SemIR to it. (The M0.5 AIR was kept as `SliceAIR*` until phase 3 replaced the code generator that read it.)
 
 The gate:
 - **The AIR verifier passes on every corpus,** with no construct left unlowered. The verifier checks structure, types, calls against their C types, `phi` edges, and SSA dominance. The corpora:
@@ -111,6 +111,53 @@ Not modeled yet:
 - `_Complex`;
 - vector extensions;
 - `__builtin_va_arg_pack`, which only appears in `gnu_inline` bodies, and those are never emitted.
+
+**Phase 3 is done** (2026-10-15). The x86-64 code generator is LIR ([04](../04-backend.md) §4.3), instruction selection (§4.4), linear scan on SSA with lifetime holes, splitting and parallel-move resolution (§4.5, as built: §4.5.6), frame lowering (§4.6), the System V ABI (§4.7.1), switch lowering (§4.8.1), and inline `asm` (§4.4.2). It writes AT&T assembly, which Swift-Stack's assembler turns into an object. `ld.lld` links it (through `clang -fuse-ld=lld`) until phase 5. The driver compiles C to an executable, to an object (`-c`) or to assembly (`-S`). The M0.5 slice (its AIR, selector, allocator, emitter and `StaticELFWriter`) is removed.
+
+The gate: **c-testsuite execution has started, and passes.**
+- **c-testsuite.** 219 of its 220 `single-exec` programs compile, link and print their expected output. The other, `00209`, calls a function declared `int (*)()` with an argument, which C23 rejects, as `clang -std=c23` does.
+- **Further checks.**
+  - **Code generation on every corpus.** SQLite, Lua, VectraOS and the constraint probes all go through selection, allocation (with an interference check) and assembly with no issue.
+  - **Lua 5.4.7.** The interpreter, built entirely by Swift-Stack, passes Lua's own test suite (`all.lua`).
+  - **The SQLite shell** runs a SQL workload (20,000 rows: indexes, joins, window functions, JSON, `printf`, dates) and prints exactly what a clang-built shell prints.
+  - **ABI against clang.** Generated programs make calls with random signatures across clang and Swift-Stack objects in both directions:
+    - integers from `_Bool` to `_BitInt(200)`, `_Float16`, `float`, `double`, `long double`, `_Float128` and pointers;
+    - structs and unions of these, with arrays and bit-fields;
+    - variadic arguments.
+
+    400 programs of 60 functions agree with clang in every mix.
+  - **Arithmetic against clang.** Generated expressions cover every integer width (including odd `_BitInt`s and `_BitInt(511)`), `float`, `double` and `long double`, with conversions, comparisons and `?:`. 400 programs of 150 expressions agree with clang, or with GCC where clang is wrong (below).
+  - The test suite runs 16 programs of each generator by default; `SWIFTSTACK_ABI_SEEDS` and `SWIFTSTACK_ARITH_SEEDS` raise that.
+- **The x87 subset** of the encoder matches llvm-mc on every form: 8,286 accepted lines and 6,303 distinct encodings, and the disassembler agrees with it.
+
+The checks found and fixed these, besides the code generator's own bugs:
+- **`_Float128` and `__float128`.** They had been `long double`; they are now IEEE binary128, with the `f128` and `q` literal suffixes.
+- **`_Float16` arguments to `...`.** They had been promoted to `double`, which C23 does not do.
+- **`#pragma push_macro`/`pop_macro`.** These were ignored.
+- **`__builtin_` math functions** (`__builtin_ceil`, ...) were unsupported.
+- **`register` variables with `asm("reg")`.** As `asm` operands they are now placed in their registers. VectraOS's x86-64 syscall wrappers need this.
+- **Variadic calls** now carry the types of their extra arguments, so structures passed through `...` are classified like named ones.
+- **`asm` operands** now carry their C types, and an input is passed by address only when its constraint allows only memory.
+
+A clang divergence, not a defect: Clang 22 converts an unsigned `_BitInt` above 128 bits whose top bit is set to a floating type with the wrong sign (for example, `(long double)(unsigned _BitInt(511))-1` is negative). GCC and Swift-Stack agree with each other, and the arithmetic test takes GCC's result where clang's differs.
+
+Carried forward:
+- **Phase 4:**
+  - The code generator should fill a `RelocatableObject` directly. Today `-c` is the `-S` output assembled.
+  - `-fPIC` addressing of preemptible definitions. Today a symbol the module defines is addressed directly and any other through the GOT, which is right for executables, PIE or not.
+  - Epilogue CFI and `-march` feature sets.
+- **M5:**
+  - loop-aware block order and split positions;
+  - memory operands for spilled values;
+  - shared spill slots;
+  - folding loads into ALU operands;
+  - jump-table and tree tuning.
+- **Not supported:**
+  - stack objects aligned to more than 16 bytes (reported as an error);
+  - moves on a computed `goto`'s edges (reported if the allocator needs them, which `-O0` code has not);
+  - the x87 `t`, `u` and `f` constraints in `asm`;
+  - `_Complex` and vector extensions, as before.
+- **`_Float16` arithmetic** rounds after every operation. Clang's default keeps excess precision in `float` within an expression, so results can differ. Phase 6 needs a decision on which to follow.
 
 ## 4. Decisions taken in scoping
 

@@ -83,6 +83,8 @@ public final class CPreprocessor {
     public var assemblerMode: Bool = false
 
     private var macros: [String: PPMacro] = [:]
+    /// `#pragma push_macro`: per name, the definitions saved (nil where the name was not defined).
+    private var pushedMacros: [String: [PPMacro?]] = [:]
     private var pragmaOnceFiles: Set<String> = []
     /// `#pragma pack`: the current maximum member alignment (0: the default), the `push` stack, and each change with
     /// the index of the first processed token it applies to.
@@ -983,6 +985,15 @@ public final class CPreprocessor {
             handlePragmaPack(tokens.dropFirst(2).prefix { $0.kind != .rParen }.filter { $0.kind != .comma })
             if packChanges.last?.index == outputCount { packChanges.removeLast() }
             packChanges.append((outputCount, packAlignment))
+        } else if let directive = tokens.first?.spelling, directive == "push_macro" || directive == "pop_macro",
+                  tokens.count >= 4, tokens[1].kind == .lParen, tokens[2].spelling.count >= 2, tokens[2].spelling.hasPrefix("\"") {
+            // `#pragma push_macro("name")` saves the definition of `name`; `pop_macro` restores the last one saved
+            let name = String(tokens[2].spelling.dropFirst().dropLast())
+            if directive == "push_macro" {
+                pushedMacros[name, default: []].append(macros[name])
+            } else if let saved = pushedMacros[name]?.popLast() {
+                macros[name] = saved
+            }
         }
     }
 

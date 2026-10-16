@@ -57,7 +57,7 @@ enum ClangRoundTripCorpus {
                 ("lib/rt/string.c", kernel + codegen + bti),
                 ("lib/rt/int128.c", kernel + codegen + bti),
                 ("lib/rt/stack_protector.c", kernel + codegen + bti + ["-fno-stack-protector"]),
-                ("user/test/usertest.c", user + ["-fno-omit-frame-pointer", "-fno-stack-protector", "-fno-builtin", "-fno-pic", "-fno-pie"] + userInclude),
+                ("user/test/usertest.c", user + ["-fno-omit-frame-pointer", "-fno-stack-protector", "-fno-builtin", "-fno-pic", "-fno-pie"] + userInclude + ["-I\(root)/lib/ring"]),
                 ("user/vdso/vdso.c", user + ["-fno-omit-frame-pointer", "-fno-stack-protector", "-fno-builtin", "-fPIE", "-fvisibility=hidden"] + userInclude),
             ]
             if arch == .aarch64 {

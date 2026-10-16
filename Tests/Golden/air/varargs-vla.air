@@ -45,7 +45,7 @@ bb1:
   store f32 %a0, %1, align 4
   %3 = load f32, %1, align 4
   %4 = fpext f32 %3 to f64
-  %5 = call f64 @sum(i32 2, f64 %4, i32 1) : double (int, ...)
+  %5 = call f64 @sum(i32 2, f64 %4, i32 1) : double (int, double, int, ...)
   ret f64 %5
 function @matrix(i32 %a0, i32 %a1) -> i64 : long (int, int)
   slot s0: 4 bytes align 4 (rows)

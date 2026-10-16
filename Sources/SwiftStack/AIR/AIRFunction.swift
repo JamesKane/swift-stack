@@ -582,15 +582,20 @@ public struct AIRFunction: ~Copyable {
 }
 
 /// The extra list of `inlineAsm`/`asmGoto`: [template, flags, output count, input count, clobber count, label count,
-/// per output (constraint, name, address), per input (constraint, name, value or address), clobbers, label
-/// BlockIds]. Strings are indices into `AIRModule.strings`; a missing name is `AIRAsm.noName`.
+/// per output (constraint, name, address, C type), per input (constraint, name, value or address, C type), clobbers,
+/// label BlockIds]. Strings are indices into `AIRModule.strings`; a missing name is `AIRAsm.noName`. An input is its
+/// object's address when its constraint allows only memory (`SemAsm.isMemoryOnly`), else its value. A `register`
+/// variable bound to a register (`asm("reg")`) has the constraint `{reg}` (with any `=`, `+` or `&`).
 public struct AIRAsm {
     public static let noName = UInt32.max
+    static let operandItems = 4
 
     public struct Operand {
         public let constraint: UInt32
         public let name: UInt32
         public let value: ValueId
+        /// The operand's C type.
+        public let type: TypeId
     }
 
     public let template: UInt32
@@ -603,16 +608,20 @@ public struct AIRAsm {
 
     public init?(_ items: [UInt32]) {
         guard items.count >= 6 else { return nil }
+        let n = Self.operandItems
         let nOut = Int(items[2]), nIn = Int(items[3]), nClobber = Int(items[4]), nLabel = Int(items[5])
-        guard items.count == 6 + 3 * (nOut + nIn) + nClobber + nLabel else { return nil }
-        func operands(_ start: Int, _ n: Int) -> [Operand] {
-            (0..<n).map { Operand(constraint: items[start + 3 * $0], name: items[start + 3 * $0 + 1], value: ValueId(items[start + 3 * $0 + 2])) }
+        guard items.count == 6 + n * (nOut + nIn) + nClobber + nLabel else { return nil }
+        func operands(_ start: Int, _ count: Int) -> [Operand] {
+            (0..<count).map {
+                Operand(constraint: items[start + n * $0], name: items[start + n * $0 + 1], value: ValueId(items[start + n * $0 + 2]),
+                        type: TypeId(items[start + n * $0 + 3]))
+            }
         }
         template = items[0]
         flags = items[1]
         outputs = operands(6, nOut)
-        inputs = operands(6 + 3 * nOut, nIn)
-        let c = 6 + 3 * (nOut + nIn)
+        inputs = operands(6 + n * nOut, nIn)
+        let c = 6 + n * (nOut + nIn)
         clobbers = Array(items[c..<(c + nClobber)])
         labels = items[(c + nClobber)...].map { BlockId($0) }
     }
@@ -620,9 +629,10 @@ public struct AIRAsm {
     /// The positions in the list of the operand values and of the labels.
     static func valuePositions(_ items: [UInt32]) -> (values: [Int], labels: [Int]) {
         guard items.count >= 6 else { return ([], []) }
+        let n = operandItems
         let nOut = Int(items[2]), nIn = Int(items[3]), nClobber = Int(items[4])
-        let values = (0..<(nOut + nIn)).map { 6 + 3 * $0 + 2 }
-        let labelStart = 6 + 3 * (nOut + nIn) + nClobber
+        let values = (0..<(nOut + nIn)).map { 6 + n * $0 + 2 }
+        let labelStart = 6 + n * (nOut + nIn) + nClobber
         return (values, Array(labelStart..<items.count))
     }
 }

@@ -52,6 +52,10 @@ extension DriverOptions {
                 options.language = .assembly
             } else if arg == "-c" {
                 options.compileOnly = true
+            } else if arg == "-S" {
+                options.emitAssembly = true
+            } else if arg.hasPrefix("-l") && arg.count > 2 {
+                options.libraries.append(String(arg.dropFirst(2)))
             } else if arg.hasPrefix("--arch=") {
                 switch String(arg.dropFirst("--arch=".count)).lowercased() {
                 case "x86_64", "amd64": options.targetArch = .x86_64

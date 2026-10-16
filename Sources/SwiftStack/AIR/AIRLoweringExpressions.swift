@@ -554,7 +554,13 @@ extension FunctionLowering {
         var values: [ValueId] = []
         for a in args { values.append(value(a)) }
         b.node = c.block.nodes[id]
-        let fnType = typePool.canonical(of: pointee(calleeType).typeId)
+        var fnType = typePool.canonical(of: pointee(calleeType).typeId)
+        // A variadic call is typed with its arguments' (promoted) types after the named ones, so that the ABI
+        // lowering knows how each one travels
+        if case .function(let ret, let params, true) = typePool.typeInfo(of: fnType).kind, args.count > params.count {
+            fnType = typePool.functionType(returnType: ret, paramTypes: params + args.dropFirst(params.count).map { type($0) },
+                                           isVariadic: true)
+        }
         return emitCall(callee, functionType: fnType, args: values, result: t)
     }
 

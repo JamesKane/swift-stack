@@ -17,11 +17,12 @@ enum CFrontendCheck {
     }
 
     /// Runs the C front end with the target's data layout (x86-64 when there is no target).
-    static func run(path: String, includePaths: [String] = [], target: CTarget? = nil) throws -> Outcome {
+    static func run(path: String, includePaths: [String] = [], target: CTarget? = nil, defines: [(String, String)] = []) throws -> Outcome {
         let sm = SourceManager()
         let fileId = try sm.loadFile(path: path)
         let pp = CPreprocessor(sourceManager: sm)
         pp.includePaths.append(contentsOf: includePaths)
+        for (name, value) in defines { pp.defineMacro(name, replacement: value) }
         if let target {
             // `-ffreestanding --target=<triple>`: the target's arch macros, no hosted OS, and the compiler's own
             // freestanding headers (`<stdint.h>`, `<stddef.h>`, `<stdbool.h>`) in place of glibc's.
@@ -168,7 +169,8 @@ enum CCorpora {
             for name in ["start", "stdout", "malloc", "timing", "image"] {
                 files.append(file("user/lib/runtime/\(name).c", userInc, t.userFlags))
             }
-            files.append(file("user/test/usertest.c", userInc, t.userFlags))
+            // VectraOS's build gives the test its debuglog ring's header (kernel/CMakeLists.txt)
+            files.append(file("user/test/usertest.c", userInc + ["lib/ring"], t.userFlags))
             files.append(file("user/vdso/vdso.c", userInc, t.userFlags))
         }
         return files.filter { FileManager.default.fileExists(atPath: $0.path) }

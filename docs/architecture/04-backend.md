@@ -68,47 +68,60 @@ Object.RelocatableObject (ELF64 or Mach-O section model) ──► Linker (06) o
 
 ### 4.3 LIR representation
 
-**Layout is an open choice** between SoA and AoS, tracked in [18](18-data-catalog.md) §5.3 and §6 and decided by measurement on the M0.5 vertical slice ([09](09-roadmap.md)).
-
-- **The case for SoA** (the layout shown below). A naive Swift struct of `{UInt16, UInt16, UInt16, UInt16, Int64, UInt16}` has a size of 18 but a **stride of 24** because of `Int64` alignment, and columns avoid that padding. Liveness touches only opcodes and operands.
-- **The case for AoS.** The two heaviest consumers, the register allocator and the encoder, read nearly every field of each instruction in order. With fields ordered for alignment (`imm` first), a 32-byte row costs half a cache line per instruction. That is one stream instead of seven, with no per-column address arithmetic.
-
-The SoA definition below is the starting point, not a decision. Either way, `LIRInstId` 0 is a nil row (a `.nil` opcode, no operands), per the nil-row rule ([18](18-data-catalog.md) §4).
+**Layout: rows (decided in M3).** [18](18-data-catalog.md) §5.3 left SoA against AoS open. M3 chose rows, because every consumer of LIR reads whole instructions in order: the allocator's liveness and rewrite passes, frame lowering, and the printer and encoder. The x86-64 LIR (`Sources/SwiftStack/LIR/LIR.swift`):
 
 ```swift
-public struct LIRFunction: ~Copyable {
-    // Per instruction (indexed by LIRInstId):
-    public var opcodes:   Column<UInt16>   // 2 B  target opcode (X86_ADD_RR, A64_ADD_IMM, RV_ADDI, ...)
-    public var dst:       Column<Operand>  // 4 B  register operand or .none
-    public var src1:      Column<Operand>  // 4 B
-    public var src2:      Column<Operand>  // 4 B
-    public var imm:       Column<Int64>    // 8 B  immediate / displacement / SymbolId (per flags)
-    public var flags:     Column<UInt16>   // 2 B  width, condition code, addressing mode, scale
-    public var extra:     Column<UInt32>   // 4 B  offset into `extraOperands` (calls, parallel moves), or 0
-    public var extraOperands: Column<Operand>
-
-    // Per block (indexed by LIRBlockId), CSR-encoded edges:
-    public var blockFirstInst: Column<UInt32>
-    public var blockInstCount: Column<UInt32>
-    public var succOffsets:    Column<UInt32>
-    public var succs:          Column<UInt32>
-    public var predOffsets:    Column<UInt32>
-    public var preds:          Column<UInt32>
-
-    public var stackFrameSize: UInt32
-    public var calleeSavedMask: UInt64
+public struct LIRInst {          // 12 bytes
+    var op: LIROp                // UInt16: an x86 instruction, or a pseudo-instruction
+    var size: UInt8              // operation size in bytes (1, 2, 4, 8; 10 for x87 memory, 16 for XMM)
+    var cond: X86Cond            // condition code of jcc/setcc/cmovcc
+    var lock: Bool
+    var operandCount: UInt16
+    var firstOperand: UInt32     // into LIRFunction.operands
 }
 
-/// A register operand. Bit 31 set = physical register (low 8 bits index the
-/// target register file); clear = virtual register number (up to 2^31 - 1).
-public struct Operand: BitwiseCopyable, Hashable {
-    public var raw: UInt32
+public struct LIROperand {       // 32 bytes
+    var kind: Kind               // reg, imm, mem, block, symbol
+    var flags: Flags             // use, def, implicit, earlyClobber
+    var size, scale: UInt8
+    var modifier: LIRSymbolModifier  // @PLT, @GOTPCREL, @tpoff, @gottpoff
+    var segment: UInt8           // %fs / %gs
+    var reg, index: LIRReg       // a register; a memory operand's base and index
+    var slot: UInt32             // a stack slot, resolved by frame lowering to a frame-pointer offset
+    var symbol: UInt32
+    var value: Int64             // immediate, displacement, or block
 }
+
+public struct LIRReg { var raw: UInt32 }  // 0: none; bit 31 set: a physical register; else a virtual register
 ```
 
-- **Footprint (SoA hypothesis):** 28 bytes of column data per instruction, with no padding, plus overflow operands for calls and parallel moves. This is honest accounting, not a minimum. Moving `imm` to a side table indexed only by instructions that need it is an open question (§6).
-- **Virtual registers are 32-bit.** A 16-bit register field would cap a function at 65,536 values. Large generated C functions and fully inlined Swift code can exceed that.
-- **Memory operands** use `src1` as base, `src2` as index, scale and mode in `flags`, and displacement or symbol in `imm`. Symbol references set a flag so that `imm` is read as a `SymbolId` and the emitter records a relocation.
+- **Operands are a variable-length list**, in Intel order (destination first), each marked read, written, implicit or early-clobber. A two-address instruction has one operand that is both read and written. A call lists the argument registers it reads and the caller-saved registers it clobbers as implicit operands. The allocator needs no table of what each opcode does.
+- **Instructions are kept per block** (`LIRBlock.insts`). Phis are a separate per-block list (`LIRPhi`: the register defined, and the register each predecessor supplies). The allocator removes them.
+- **Pseudo-instructions:**
+  - `copy` (a register move, removed when both sides get one register) and `zero`;
+  - `entry` (defines the argument registers) and `callFrameSetup`/`callFrameDestroy` (the stack adjustment around a call that passes arguments in memory);
+  - `inlineAsm` and `cfi`.
+- **Stack slots** (`LIRStackSlot`) hold `alloca`s, spill slots, temporaries, the register save area of a variadic function, and incoming stack arguments (fixed slots at positive frame-pointer offsets).
+- **Virtual registers** are 32-bit, as before, with a class each: GPR or XMM.
+
+### 4.3.1 Values
+
+At `-O0` (M3) instruction selection represents each AIR value as follows:
+
+| AIR value | LIR |
+|---|---|
+| integer of 1–64 bits, pointer | one GPR, the value in its low bits; the bits above its width are unspecified |
+| integer of 65–128 bits | two GPRs (low, high word) |
+| integer of 129–8192 bits | a stack slot of 64-bit words, least significant first |
+| `f16`, `f32`, `f64`, `f128` | one XMM register |
+| `f80` | a 16-byte stack slot, computed on the x87 stack (`fldt` ... `fstpt`) |
+
+- **Extension on demand.** An integer narrower than its register is extended where the result depends on the bits above it: division, right shifts, comparisons, conversions, and arguments and results narrower than 32 bits (which are extended to 32, as GCC and Clang do). Other operations run at 32 bits (for widths up to 32) or 64.
+- **Runtime calls:**
+  - integers of more than 128 bits: libgcc's `_BitInt` routines (`__mulbitint3`, `__divmodbitint4`, `__floatbitint*`, `__fix*bitint`), each operand's precision negated when it is signed;
+  - `__int128` division and variable shifts: `__divti3` and its relatives;
+  - `_Float128`: the `__*tf*` soft-float routines;
+  - `_Float16` arithmetic: in `float`, through `__extendhfsf2`/`__truncsfhf2`.
 
 ### 4.4 Instruction selection
 
@@ -131,7 +144,27 @@ A value with several uses is materialized once into a virtual register and every
                                     IMUL v3, v1, v2   ; two-address form, see §4.5.4
 ```
 
+**What M3 folds** (`X86ISel*.swift`; the patterns are code, not yet tables):
+- a single-use `ptradd` into the address of the load, store or atomic that uses it;
+- an `alloca` into a frame-slot operand, and a global into a RIP-relative one (through the GOT if the module does not define it);
+- a single-use comparison into the branch or `select` that uses it.
+
+Loads are not folded into ALU operands. Constants, `alloca`s and globals are rematerialized at each use rather than kept live. A two-address operation is selected as `copy` into the result followed by the operation on it, and the copy disappears when the allocator gives both one register (§4.5.4).
+
 **Immediate folding:** a constant becomes an immediate operand only when it fits the encoding: x86-64 sign-extended imm8/imm32; AArch64 12-bit unsigned (optionally shifted by 12) for arithmetic, and the bitmask-immediate encoding for logical ops; RV64 12-bit signed. Otherwise it is materialized (x86 `MOV r64, imm64`; AArch64 `MOVZ`/`MOVK`; RV64 the `li` expansion from [05](05-assembler.md)).
+
+### 4.4.2 Inline assembly
+
+A GNU `asm` statement becomes one `inlineAsm` instruction, whose operands are bound by their constraints (the first alternative of each):
+- **Registers:** `r` `q` `Q` `R` `l` any GPR; `a` `b` `c` `d` `S` `D` one GPR; `x` `v` an XMM register; `{reg}` a `register` variable's register.
+- **Memory:** `m` `o` `V` `<` `>`.
+- **Immediates:** `i` `n` `I`–`O` `e` `Z` `s`, and `g` `X` when the value is a constant.
+- **Other:**
+  - `0`–`9` and `[name]` tie an input to an output;
+  - `+` reads an output too, and `&` makes it early-clobber;
+  - `=@cc<cond>` outputs a condition.
+
+Clobbered registers become implicit definitions, so the allocator keeps values out of them. The template is written out after allocation, with `%N`, `%[name]`, `%lN` (labels of `asm goto`), `%=` and `%%`, and the modifiers `b` `h` `w` `k` `q` `x` `c` `P` `n` `a` `z` `V`. Outputs are stored to their lvalues after the statement (on the fallthrough path of `asm goto`).
 
 ### 4.4.1 Vector operations
 
@@ -195,12 +228,36 @@ For each interval taken from `unhandled` in start order:
 - The moves on one edge form a **parallel move**. It is sequentialized by emitting moves whose destination is not read by another pending move, and breaking any remaining cycle with a scratch register (on x86-64, `XCHG` for general-purpose register cycles), or a stack slot if no register is free.
 - Spill slots are assigned after allocation. Intervals whose spilled ranges do not overlap share slots.
 
+#### 4.5.6 As built in M3
+
+M3 builds the allocator once, on the design above (`Sources/SwiftStack/Codegen/RegAlloc/`), with these choices and simplifications, which M5 revisits:
+
+- **Positions.** Instruction *n* has four:
+  - 4*n*+3, the gap before it, where inserted moves go;
+  - 4*n*+4, where it reads its inputs (an input's range ends at 4*n*+5);
+  - 4*n*+5, between its reads and its writes;
+  - 4*n*+6, where it writes its outputs.
+
+  An instruction's inputs and outputs may therefore share a register. An early-clobber output starts at 4*n*+4 instead, so it does not.
+- **Linear order and liveness.** Blocks keep selection order: AIR's block order, each block selection creates placed after its origin, and split edges last. They are not yet in loop-contiguous RPO. Liveness is an iterative backward dataflow to a fixpoint, which is correct for any order. Intervals are objects holding arrays of ranges and uses, not columns.
+- **Uses.** Every use position requires a register; memory operands do not yet take spilled values.
+- **Splitting.** An interval is split at the gap before the position that forces it, without the loop-aware choice of §4.5.3. When an interval is evicted at another's definition (4*n*+6), the spill store goes in the gap before instruction *n*: the register still holds the value there.
+- **Constraints.** A call's clobbers are implicit definitions of every caller-saved register. A two-address operation is `copy` followed by the operation reading and writing the copy, and the hint makes the copy vanish when the source dies there.
+- **Resolution.** An edge's moves go at the end of its source block if that block has one successor, or else at the start of its target. Splitting critical edges also retargets jump tables and `asm goto` labels. Only a computed `goto`'s edges cannot be split, and needing moves on one is reported as an error. A parallel move's cycle of two GPRs is broken with `xchg`; any other goes through the machine stack (`push`/`pop`, or 16 bytes below `rsp` for XMM), so no register is reserved. A move between two stack slots uses `push` and `pop`.
+- **Spill slots.** Each value split onto the stack gets one slot for all its parts. Slots are not shared between values yet.
+- **Checking.** `--verify-each` and the tests check every allocation for two intervals holding one register at once, and for an interval overlapping a fixed register.
+
 ### 4.6 Frame layout and frame-pointer policy
 
 - **Frame pointers MUST be kept by default on all targets** (`RBP`, `X29`, `s0`/`fp`), with the standard frame record (saved FP and return address adjacent at the FP). This lets CUD ([07](07-debugging-and-sdi.md)) unwind most frames with one load each, and lets external profilers walk stacks. A later flag MAY allow leaf functions to omit the frame; CUD describes such frames with its frameless mode ([07](07-debugging-and-sdi.md) §5.5).
 - **Stack alignment:** 16 bytes at every call boundary on all three architectures.
 - **Red zone:** v1 does not use a red zone on any target. Tier 0 and kernel-adjacent code on VectraOS cannot rely on one (its kernels build with `-mno-red-zone`). Using SysV's 128-byte red zone for hosted Linux and FreeBSD leaf functions is a later optimization.
-- **Layout (growing down):** return address → saved FP → callee-saved register area → spill slots → locals and allocas → outgoing argument area. On AArch64, `STP`/`LDP` pairs save and restore registers. On RV64, the C extension's `c.sdsp`/`c.ldsp` are used when encodable.
+- **Layout (growing down):** return address → saved FP → callee-saved register area → spill slots → locals and allocas → outgoing argument area.
+- **x86-64 in M3** (`X86FrameLowering`):
+  - The prologue is `push %rbp; mov %rsp, %rbp`, a push of each callee-saved register the allocator used, then `sub` of the slot area rounded so that `%rsp` is 16-byte aligned. Its CFI directives are emitted with it.
+  - Every slot is addressed from `%rbp`, so `%rsp` is free to move: a call that passes arguments in memory subtracts their size (a multiple of 16) around the call, and dynamic allocations need no frame changes.
+  - The epilogue restores `%rsp` from `%rbp`, pops, and returns.
+  - A slot aligned to more than 16 bytes is reported as unsupported. On AArch64, `STP`/`LDP` pairs save and restore registers. On RV64, the C extension's `c.sdsp`/`c.ldsp` are used when encodable.
 
 ### 4.7 Calling conventions
 
@@ -213,6 +270,20 @@ For each interval taken from `unhandled` in start order:
 - **Varargs:** `AL` carries an upper bound on the number of vector registers used. `va_list` is the psABI structure with a register save area.
 - **`long double`** is the 80-bit x87 format (X87 class).
 - **Callee-saved:** `RBX, RBP, R12–R15`.
+- **Classification as Clang does it** (`X86ABI`, checked against Clang by generated calls in both directions, below):
+  - Each field of an aggregate is classified on its own (a nested aggregate as a whole, with the post-merger cleanup applied to it) and merged into its parent, so the result depends on nesting as Clang's does. A union holding `long double` and a pointer is MEMORY, and adding a nested struct with a `float` beside it can make it INTEGER.
+  - Unnamed bit-fields take no part. A field misaligned for its type makes its aggregate MEMORY.
+  - `_BitInt(N)`: INTEGER up to 64 bits; two INTEGER eightbytes up to 128 (8-byte aligned on the stack, where `__int128` is 16-aligned); MEMORY above.
+  - `_Float16`: SSE. `_Float128`: SSE+SSEUP, one XMM register. `long double`: X87, so in memory as an argument and in `%st(0)` as a result (a result is popped even when unused).
+- **Calls from Swift-Stack:** `bool`, `char` and `short` arguments and results are extended to 32 bits, as GCC and Clang do. A variadic call sets `%al` to the number of vector registers used. A variadic function saves all six GPRs and eight XMM registers on entry, and `va_arg` reads from the register save area or the overflow area (the address computed on both paths, joined by a phi).
+
+**Checking.** `M3ABITests` generates programs with random signatures:
+- integers of every width, including `_BitInt` up to 200 bits;
+- `_Float16`, `float`, `double`, `long double`, `_Float128`, pointers;
+- structs and unions of these, with arrays and bit-fields inside;
+- variadic functions.
+
+Callees and callers are compiled into separate objects by Clang and by Swift-Stack. All four mixes must print what the all-Clang program prints.
 
 #### 4.7.2 C ABI: AAPCS64 and the Apple arm64 variant
 
@@ -266,6 +337,7 @@ The full Swift calling convention and the type-lowering rules that decide which 
 - **Dense switches** (at least 4 cases and density of at least 40% over the value range; to be tuned per [14](14-measurement-methodology.md)) become a bounds check followed by a **jump table** in `.rodata`.
 - Table entries are **32-bit offsets relative to the table base**. This keeps the table position-independent and free of dynamic relocations on PIE hosts.
 - Sparse switches become a balanced binary tree of compares. Clusters of dense cases inside a sparse switch get their own sub-tables.
+- **M3 x86-64:** a range of cases is a table when it has at least 4 cases, a density of at least 40%, and spans at most 65,536 values. The tree splits at the middle case, and at 3 cases or fewer compares them in turn; each subtree is tested for density again. Cases compare as signed 64-bit values. The table holds `.long .LBB-.LJTI` entries in `.rodata`, read with `movslq` and added to the table's address.
 
 #### 4.8.2 Branch relaxation
 

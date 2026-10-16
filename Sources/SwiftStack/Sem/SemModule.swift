@@ -128,6 +128,9 @@ public final class SemModule: @unchecked Sendable {
     /// GNU `asm("name")` labels: the symbol of each object or function with linkage declared with one, by C name
     /// (glibc's `__REDIRECT` names `stat` `stat64` under `_FILE_OFFSET_BITS=64`).
     public var asmLabels: [String: String] = [:]
+    /// Block-scope `register` variables declared with `asm("reg")`, and their registers: as `asm` operands their values
+    /// are in those registers (GCC's local register variables).
+    public var registerVariables: [DeclId: String] = [:]
     /// Explicit alignments (`alignas`, `__attribute__((aligned))`) of objects, by declaration; a local object's
     /// stack slot takes the larger of this and its type's alignment.
     public var objectAlignments: [DeclId: Int] = [:]

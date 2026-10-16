@@ -167,17 +167,24 @@ Both are resolved by type-checking the operand without evaluating it, except tha
 - **Builtins.** A documented `__builtin_*` catalog, covering what the profiled headers reference: `__builtin_va_*`, `__builtin_expect`, `__builtin_bswap*`, `__builtin_clz*`, `__builtin_offsetof`, `__builtin_unreachable`, and the overflow builtins.
   - A builtin is declared implicitly on first use, as `long (...)`, so its arguments get the default argument promotions.
   - A call to one takes the builtin's own result type (`builtinResultType`). For example, `__builtin_inff` gives `float`, and `__atomic_load_n` gives the type its pointer argument points to.
+  - The `__builtin_` forms of the C library's math functions (`__builtin_ceil`, `__builtin_powf`, ...) take and return their suffix's floating type (`CMathBuiltins`), and are calls of the function.
   - AIR lowering implements them ([03](03-intermediate-representation.md) §4.1.1).
 - **Inline `asm`.** Basic and extended inline `asm`, with the constraint subset that VectraOS's C needs (`r`, `m`, `i`, `=`, `+`, `&`, register-pinned operands, `memory`/`cc` clobbers).
   - SemIR models the template, the qualifiers, each operand with its constraint and `[name]`, the clobbers and the `goto` labels (`asmStmt`, decoded by `SemAsm`).
   - Outputs are lvalues. An input is an lvalue if its constraint allows only memory, and a value otherwise.
   - A file-scope `asm` goes to `SemModule.moduleAsm`.
-  - A `register` variable's register (`register T x asm("x17")`) is not modeled yet.
+  - A block-scope `register` variable declared with `asm("reg")` records its register (`SemModule.registerVariables`). GCC guarantees the variable is in that register only where it is an `asm` operand, and that is where it takes effect ([03](03-intermediate-representation.md) §4.1.1).
 - **Inline definitions.** Like Clang in C23 mode, the profile predefines `__GNUC_STDC_INLINE__`, and `__NO_INLINE__` (nothing is inlined at `-O0`). A definition is inline-only (`SemFunction.isInlineOnly`) in two cases:
   - it is `inline`, and no file-scope declaration of the function lacks `inline` or has `extern` (C23 6.7.5p7);
   - it is GNU `extern inline` with `gnu_inline`, as glibc's wrappers are.
 
   An inline-only definition is not emitted, and its name refers to the external definition.
+- **`#pragma push_macro("name")` and `pop_macro`** save and restore a macro's definition (or its absence).
+- **Floating types beyond C's three.**
+  - `_Float16` (and `__bf16`, approximated by it) is IEEE binary16. It is not promoted by the default argument promotions, which change only `float` (C23 6.5.2.2p6; Clang and GCC agree).
+  - `_Float128` and `__float128` are IEEE binary128: a type of their own on x86-64, ranked above `long double` in the usual arithmetic conversions as GCC ranks it; on AArch64 and RISC-V, `long double` itself.
+  - `_Float64x` and `__float80` are `long double`.
+  - The literal suffixes `f16`, `f128` and GNU `q` give these types.
 - **Nullability qualifiers** (`_Nonnull`, `_Nullable`, `_Nullable_result`, `_Null_unspecified`) are kept as type sugar for Swift import (§4.6). VectraOS's kernel, loader and runtime headers annotate every pointer with them, including inside array parameter brackets (`uint32_t out[_Nonnull 4]`).
 - **Vector extensions.** `__attribute__((vector_size(N)))`, `ext_vector_type(N)`, `__builtin_shufflevector` and `__builtin_convertvector`. They map to the TypePool's builtin vector types, shared with Swift `SIMDn` ([17](17-simd-and-vectorization.md) §5.7), and macOS `<simd/simd.h>` needs them. Target intrinsics headers are a non-goal.
 

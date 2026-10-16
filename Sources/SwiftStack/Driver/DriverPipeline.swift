@@ -21,6 +21,10 @@ public struct DriverOptions {
     public var outputBinaryPath: String? = nil
     public var runBinary: Bool = false
     public var compileOnly: Bool = false
+    /// `-S`: write the assembly instead of an object or executable.
+    public var emitAssembly: Bool = false
+    /// `-l` libraries to link.
+    public var libraries: [String] = []
     public var targetArch: AssemblerArch = .x86_64
     public var dumpStage: String? = nil
     /// `--verify-each`: run the IR verifiers after each stage that has one (SemIR now; AIR from M3 phase 2).
@@ -84,7 +88,6 @@ public final class DriverPipeline {
     public private(set) var airCommittedBytes: Int = 0
     public private(set) var airReservedBytes: Int = 0
     public private(set) var lirInstructionCount: Int = 0
-    public private(set) var encodedFunctions: [EncodedFunction] = []
     public private(set) var lastObjectSectionCount: Int = 0
     public private(set) var lastObjectSymbolCount: Int = 0
     public private(set) var lastObjectRelocCount: Int = 0
@@ -309,146 +312,82 @@ public final class DriverPipeline {
                 return 0
             }
 
-            // AIR from SemIR (M3 phase 2). The M0.5 slice below still generates code from its own AIR until phase 3.
-            if options.dumpStage == "air" || options.verifyEach {
-                let lowering = AIRLowering.lower(semRes.semModule)
-                if !lowering.issues.isEmpty {
-                    let text = lowering.issues.prefix(50).map { "AIR lowering: \($0)" }.joined(separator: "\n")
+            // AIR from SemIR (M3 phase 2)
+            let p4_start = ss_monotonic_time_ns()
+            let lowering = AIRLowering.lower(semRes.semModule)
+            if !lowering.issues.isEmpty {
+                let text = lowering.issues.prefix(50).map { "AIR lowering: \($0)" }.joined(separator: "\n")
+                FileHandle.standardError.write(Data((text + "\n").utf8))
+                return 1
+            }
+            if options.verifyEach {
+                let issues = AIRVerifier.verify(lowering.module)
+                if !issues.isEmpty {
+                    let text = issues.prefix(50).map { "AIR verifier: \($0)" }.joined(separator: "\n")
                     FileHandle.standardError.write(Data((text + "\n").utf8))
                     return 1
                 }
-                if options.verifyEach {
-                    let issues = AIRVerifier.verify(lowering.module)
-                    if !issues.isEmpty {
-                        let text = issues.prefix(50).map { "AIR verifier: \($0)" }.joined(separator: "\n")
-                        FileHandle.standardError.write(Data((text + "\n").utf8))
-                        return 1
-                    }
-                }
-                if options.dumpStage == "air" {
-                    print(lowering.module.dumpText(), terminator: "")
-                    return 0
-                }
             }
-
-            if semRes.functionOrder.isEmpty {
-                FileHandle.standardError.write(Data("Error: no function definitions found in source\n".utf8))
-                return 1
-            }
-
-            // Phase 4: AIR Lowering
-            var airMod: SliceAIRModule? = nil
-            var hasLoweringError = false
-            let p4_start = ss_monotonic_time_ns()
-            withUnsafePointer(to: tree) { treePtr in
-                Profiler.shared.timeBlock(name: "Phase 4: AIR Lowering", category: "air") {
-                    var lowering = SliceAIRLowering(
-                        tree: treePtr,
-                        tokens: tokPtr,
-                        semResult: semRes,
-                        typePool: typePool,
-                        sourceBuffer: sourcePtr,
-                        sourceLength: sourceFile.length,
-                        sourceManager: sourceManager
-                    )
-                    airMod = lowering.lower()
-                    hasLoweringError = lowering.hasLoweringError
-                }
-            }
-            let p4_end = ss_monotonic_time_ns()
-            let p4_dur = Double(p4_end - p4_start) / 1_000_000_000.0
-            let airInstCount = Int(airMod?.totalInstructions ?? 0)
-            phaseTimings.append(PhaseTiming(
-                name: "AIR Lowering",
-                durationSeconds: p4_dur,
-                bytesProcessed: totalBytes,
-                itemsProcessed: airInstCount
-            ))
-
-            if hasLoweringError {
-                FileHandle.standardError.write(Data("Error: unsupported construct in backend lowering\n".utf8))
-                return 1
-            }
-
-            guard let module = airMod else { return 1 }
-            self.airInstructionCount = module.totalInstructions
-            self.airCommittedBytes = module.bytesCommitted
-            self.airReservedBytes = module.bytesReserved
-
-
-            // Phase 5: Codegen (Isel + Linear Scan RegAlloc + x86-64 Encoding)
-            var encoded: [EncodedFunction] = []
-            var totalLIRCount = 0
-            let p5_start = ss_monotonic_time_ns()
-            Profiler.shared.timeBlock(name: "Phase 5: Codegen", category: "codegen") {
-                var selector = InstructionSelector()
-                let regAlloc = LinearScanRegAlloc()
-                var encoder = X86CodeEmitter()
-
-                var calleeMap: [UInt32: String] = [
-                    1: "write",
-                    2: "exit"
-                ]
-                for (idx, name) in semRes.functionOrder.enumerated() {
-                    calleeMap[UInt32(3 + idx)] = name
-                }
-
-                for i in 0..<module.functionCount {
-                    module.withFunction(i) { airFn in
-                        let lir = selector.select(function: airFn)
-                        totalLIRCount += Int(lir.instructionCount)
-                        let allocFn = regAlloc.allocate(function: lir)
-
-                        let enc = encoder.encode(
-                            function: allocFn,
-                            stringTable: semRes.stringLiterals,
-                            calleeNames: calleeMap
-                        )
-                        encoded.append(enc)
-                    }
-                }
-            }
-            let p5_end = ss_monotonic_time_ns()
-            let p5_dur = Double(p5_end - p5_start) / 1_000_000_000.0
-            phaseTimings.append(PhaseTiming(
-                name: "Codegen & Encoding",
-                durationSeconds: p5_dur,
-                bytesProcessed: totalBytes,
-                itemsProcessed: totalLIRCount
-            ))
-
-            self.encodedFunctions = encoded
-            self.lirInstructionCount = totalLIRCount
-
-            if options.dumpStage == "asm" || options.dumpStage == "code" {
-                dumpCode(functions: encoded)
+            self.airInstructionCount = UInt32(lowering.module.totalInstructions)
+            phaseTimings.append(PhaseTiming(name: "AIR Lowering", durationSeconds: Double(ss_monotonic_time_ns() - p4_start) / 1e9,
+                                            bytesProcessed: totalBytes, itemsProcessed: lowering.module.totalInstructions))
+            if options.dumpStage == "air" {
+                print(lowering.module.dumpText(), terminator: "")
                 return 0
             }
 
-            // Phase 6: Static ELF Linking
-            let outputPath = options.outputBinaryPath ?? (options.runBinary ? "/tmp/ss_m05_exec" : "a.out")
-            let p6_start = ss_monotonic_time_ns()
-            try Profiler.shared.timeBlock(name: "Phase 6: Static ELF Linking", category: "linker") {
-                let writer = StaticELFWriter()
-                try writer.linkAndWrite(
-                    functions: encoded,
-                    stringLiterals: module.orderedStrings,
-                    outputPath: outputPath
-                )
+            // Code generation (M3 phase 3): selection, allocation, frame layout, assembly
+            let p5_start = ss_monotonic_time_ns()
+            let generated = X86CodeGenerator.generate(lowering.module, verifyAllocation: options.verifyEach)
+            if !generated.issues.isEmpty {
+                let text = generated.issues.prefix(50).map { "codegen: \($0)" }.joined(separator: "\n")
+                FileHandle.standardError.write(Data((text + "\n").utf8))
+                return 1
             }
-            let p6_end = ss_monotonic_time_ns()
-            let p6_dur = Double(p6_end - p6_start) / 1_000_000_000.0
+            self.lirInstructionCount = generated.functions.reduce(0) { $0 + $1.blocks.reduce(0) { $0 + $1.insts.count } }
+            phaseTimings.append(PhaseTiming(name: "Codegen", durationSeconds: Double(ss_monotonic_time_ns() - p5_start) / 1e9,
+                                            bytesProcessed: totalBytes, itemsProcessed: lirInstructionCount))
+            if options.dumpStage == "asm" || options.emitAssembly {
+                if let out = options.outputBinaryPath, options.emitAssembly {
+                    try generated.assembly.write(toFile: out, atomically: true, encoding: .utf8)
+                } else {
+                    print(generated.assembly, terminator: "")
+                }
+                return 0
+            }
 
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: outputPath),
-               let sz = attrs[.size] as? Int {
+            // Assembly to an object by Swift-Stack's assembler
+            var asmDiagnostics = DiagnosticBag()
+            let object = Assembler.assemble(source: generated.assembly, arch: .x86_64, fileName: options.inputFiles[0] + ".s",
+                                            options: options.assemblerOptions, sourceManager: sourceManager, diagnostics: &asmDiagnostics)
+            if asmDiagnostics.errorCount > 0 {
+                let rendered = DiagnosticRenderer.render(diagnostics: asmDiagnostics, sourceManager: sourceManager)
+                FileHandle.standardError.write(Data(rendered.utf8))
+                return 1
+            }
+            let elf = ELFObjectWriter.write(object)
+            if options.compileOnly {
+                let out = options.outputBinaryPath ?? (URL(fileURLWithPath: options.inputFiles[0]).deletingPathExtension().lastPathComponent + ".o")
+                try Data(elf).write(to: URL(fileURLWithPath: out))
+                return 0
+            }
+
+            // Linking: by ld.lld through clang's driver, until Swift-Stack's linker (M3 phase 5)
+            let outputPath = options.outputBinaryPath ?? (options.runBinary ? "/tmp/ss_m3_exec_\(getpid())" : "a.out")
+            let p6_start = ss_monotonic_time_ns()
+            let objectPath = outputPath + ".ss.o"
+            try Data(elf).write(to: URL(fileURLWithPath: objectPath))
+            defer { try? FileManager.default.removeItem(atPath: objectPath) }
+            let linkStatus = Self.link(objects: [objectPath], output: outputPath, libraries: options.libraries)
+            if linkStatus != 0 {
+                FileHandle.standardError.write(Data("Error: linking failed (status \(linkStatus))\n".utf8))
+                return 1
+            }
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: outputPath), let sz = attrs[.size] as? Int {
                 lastOutputSize = sz
             }
-            phaseTimings.append(PhaseTiming(
-                name: "Static ELF Linking",
-                durationSeconds: p6_dur,
-                bytesProcessed: totalBytes,
-                itemsProcessed: lastOutputSize
-            ))
+            phaseTimings.append(PhaseTiming(name: "Linking (ld.lld)", durationSeconds: Double(ss_monotonic_time_ns() - p6_start) / 1e9,
+                                            bytesProcessed: totalBytes, itemsProcessed: lastOutputSize))
 
             // Stats & Timings
             if options.showStats {
@@ -476,6 +415,20 @@ public final class DriverPipeline {
             }
 
             return 0
+        }
+    }
+
+    /// Links objects into an executable with `clang -fuse-ld=lld` (the C runtime and libc as clang links them).
+    public static func link(objects: [String], output: String, libraries: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["clang", "-fuse-ld=lld"] + objects + ["-o", output] + libraries.map { "-l" + $0 } + ["-lm"]
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            return 127
         }
     }
 
@@ -568,24 +521,6 @@ public final class DriverPipeline {
 
     public func dumpSemIR(sem: SemResult) {
         sem.semModule.dump()
-    }
-
-    public func dumpCode(functions: [EncodedFunction]) {
-        print("=== Encoded Machine Code (\(functions.count) functions) ===")
-        for fn in functions {
-            print("Function '\(fn.name)' (\(fn.code.count) bytes):")
-            var hex = ""
-            for (idx, b) in fn.code.enumerated() {
-                hex += String(format: "%02X ", b)
-                if (idx + 1) % 16 == 0 {
-                    print("  " + hex)
-                    hex = ""
-                }
-            }
-            if !hex.isEmpty {
-                print("  " + hex)
-            }
-        }
     }
 
     public func printStats(totalBytes: Int) {

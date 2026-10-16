@@ -321,7 +321,9 @@ public final class TypePool {
         let l = canonical(of: lhs)
         let r = canonical(of: rhs)
 
-        // Floating point rules
+        // Floating point rules: `_Float128` (binary128, a distinct type where `long double` is the x87 format)
+        // holds every `long double` value, so it ranks above it as in GCC
+        if isFloat128(l) || isFloat128(r) { return isFloat128(l) ? l : r }
         if l == .longdouble || r == .longdouble { return .longdouble }
         if l == .double || r == .double { return .double }
         if l == .float || r == .float { return .float }
@@ -431,6 +433,22 @@ public final class TypePool {
     }
 
     /// `__int128` / `unsigned __int128`: 16 bytes, 16-byte aligned (unlike `_BitInt(128)`).
+    /// `_Float128` and `__float128`: IEEE binary128. Where `long double` is binary128 too (AArch64, RISC-V) they
+    /// are `long double`; on x86-64 a type of their own.
+    public func float128Type() -> TypeId {
+        if dataLayout.longDoubleFormat != .x87Extended { return .longdouble }
+        let key = -2
+        if let existing = integerCache[key] { return existing }
+        let id = TypeId(UInt32(types.count))
+        types.append(CTypeInfo(kind: .float(width: 128), size: 16, alignment: 16, canonical: id))
+        integerCache[key] = id
+        return id
+    }
+
+    func isFloat128(_ t: TypeId) -> Bool {
+        dataLayout.longDoubleFormat == .x87Extended && integerCache[-2] == t
+    }
+
     public func int128Type(isSigned: Bool) -> TypeId {
         if isSigned { return .int128 }
         let key = -1
@@ -667,5 +685,26 @@ public final class TypePool {
         case .nullptr: return named("nullptr_t")
         case .error: return named("<unknown type>")
         }
+    }
+}
+
+/// The `__builtin_` forms of C library math functions whose arguments and result share one floating type (`double`,
+/// or `float`/`long double` with an `f`/`l` suffix). Each is a call of the library function.
+public enum CMathBuiltins {
+    static let unary: Set<String> = ["ceil", "floor", "trunc", "round", "rint", "nearbyint", "sin", "cos", "tan", "asin", "acos",
+                                     "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "exp", "exp2", "expm1", "log",
+                                     "log2", "log10", "log1p", "logb", "cbrt", "erf", "erfc", "tgamma", "lgamma"]
+    static let binary: Set<String> = ["fmod", "pow", "atan2", "fmin", "fmax", "hypot", "remainder", "fdim", "nextafter"]
+
+    /// For `__builtin_<f>`, the library function's name, its argument count, and the suffix naming its type.
+    public static func lookup(_ name: String) -> (library: String, arity: Int, suffix: Character?)? {
+        guard name.hasPrefix("__builtin_") else { return nil }
+        let base = String(name.dropFirst("__builtin_".count))
+        for (stem, suffix) in [(base, nil), (String(base.dropLast()), base.last)] as [(String, Character?)] {
+            if suffix != nil && suffix != "f" && suffix != "l" { continue }
+            if unary.contains(stem) { return (base, 1, suffix) }
+            if binary.contains(stem) { return (base, 2, suffix) }
+        }
+        return nil
     }
 }

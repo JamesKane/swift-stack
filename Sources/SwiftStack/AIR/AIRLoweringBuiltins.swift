@@ -222,6 +222,11 @@ extension FunctionLowering {
             return overflowArithmetic(name, args)
         default:
             if let r = atomic(name, args: args, type: t) { return r }
+            if let math = CMathBuiltins.lookup(name) {
+                guard need(math.arity) else { return zero(at) }
+                return libraryCall(math.library, returns: t, params: Array(repeating: t, count: math.arity),
+                                   args: Array(args.prefix(math.arity)))
+            }
             report("unsupported builtin '\(name)'")
             for a in args { effect(a) }
             b.emit(.trap)
