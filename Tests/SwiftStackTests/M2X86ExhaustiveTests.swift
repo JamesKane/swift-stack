@@ -51,6 +51,7 @@ enum X86Sweep {
         case .cr:       return (0..<16).map { X86Reg.cr($0) }
         case .dr:       return (0..<16).map { X86Reg.dr($0) }
         case .rip:      return [.rip]
+        case .x87:      return (0..<8).map { X86Reg.st($0) }
         }
     }
 
@@ -61,6 +62,7 @@ enum X86Sweep {
         switch rc {
         case .seg: return X86Reg.seg(UInt8(n % 6))!
         case .gpr8High: return .ch
+        case .x87: return .st(lowIdx[n % 4] + (extended ? 4 : 0)) // no extension bits: a higher stack register
         default: return regs(rc)[Int(hw)]
         }
     }
@@ -319,6 +321,12 @@ enum X86Sweep {
             return [.imm([0x60, 0, 0x7F, 0x80, 0xFF]), .fixed(.reg(accumulator(desc.operandSize)))]
         case .ioAccToImm:
             return [.fixed(.reg(accumulator(desc.operandSize))), .imm([0x60, 0, 0x7F, 0x80, 0xFF])]
+        case .x87Reg:
+            return [.reg(.x87)]
+        case .x87RegToSt0:
+            return [.reg(.x87), .fixed(.reg(.st))]
+        case .x87St0ToReg:
+            return [.fixed(.reg(.st)), .reg(.x87)]
         }
     }
 
@@ -547,6 +555,10 @@ private func isDocumentedGNURejection(_ desc: X86InstrDesc) -> Bool {
 
 private func isDocumentedGNUDifference(ours: [UInt8], gnu: [UInt8], desc: X86InstrDesc, mode: X86CodeMode, text: String) -> Bool {
     let disassembler = X86Disassembler()
+    if desc.mandatoryPrefix == .p9B, ours.first == 0x9B, gnu.first == 0x9B {
+        // The waiting x87 forms (`fstcw`): `wait`, then the instruction, which may differ as any other does.
+        return isDocumentedGNUDifference(ours: Array(ours.dropFirst()), gnu: Array(gnu.dropFirst()), desc: desc, mode: mode, text: text)
+    }
     if text.contains("%ds:"), ours.first == 0x3E {
         // Possibly together with one of the other differences.
         let rest = Array(ours.dropFirst())
@@ -612,6 +624,17 @@ struct M2X86ExhaustiveTests {
                 }
                 covered.insert(used)
                 let bytes = encoded.bytes
+                if table[used].mandatoryPrefix == .p9B {
+                    // `fstcw` & co. are two instructions, `wait` and the `fn...` form, as LLVM MC encodes and decodes
+                    // them; M3X87ExhaustiveTests compares their disassembly with LLVM's. Here: both decode and re-encode.
+                    let decoded = try? disassembler.disassemble(bytes, codeMode: c.inst.codeMode)
+                    let reencoded = decoded.flatMap { try? $0.flatMap { try encoder.encode($0).bytes } }
+                    if decoded?.count != 2 || decoded?.first?.mnemonic != "wait" || reencoded != bytes {
+                        failures.append("round trip: \(text) [\(hex(bytes))] -> \(decoded?.map(\.attString).joined(separator: "; ") ?? "?")")
+                    }
+                    outcomes.append(X86SweepOutcome(source: c, text: text, bytes: bytes, descriptorIndex: used, disassembly: nil, isBranch: branch))
+                    continue
+                }
                 do {
                     let (decoded, length) = try disassembler.disassembleOne(bytes, at: 0, codeMode: c.inst.codeMode)
                     let reencoded = try encoder.encode(decoded)
@@ -627,8 +650,9 @@ struct M2X86ExhaustiveTests {
 
         // Assemble the generated text and our disassembly with LLVM (one batch per code mode).
         var checked = 0
+        func isWaiting(_ o: X86SweepOutcome) -> Bool { table[o.source.descriptorIndex].mandatoryPrefix == .p9B }
         for mode in [X86CodeMode.mode64, .mode16] {
-            let group = outcomes.filter { $0.source.inst.codeMode == mode && !$0.isBranch }
+            let group = outcomes.filter { $0.source.inst.codeMode == mode && !$0.isBranch && !isWaiting($0) }
             guard !group.isEmpty else { continue }
             var lines: [String] = []
             lines.reserveCapacity(group.count * 2)
@@ -658,6 +682,29 @@ struct M2X86ExhaustiveTests {
                     }
                 }
                 checked += 1
+            }
+        }
+
+        // Waiting x87 forms (`fstcw` = `wait; fnstcw`): LLVM MC prints two encodings for each line, `wait` and the rest.
+        let waiting = outcomes.filter(isWaiting)
+        if !waiting.isEmpty {
+            let r = try ExternalTool.run(mc, ["-triple=x86_64", "-show-encoding"], stdin: waiting.map(\.text).joined(separator: "\n") + "\n")
+            var encodings: [[UInt8]] = []
+            for line in r.stdout.split(separator: "\n") {
+                guard let lb = line.range(of: "encoding: ["), let rb = line[lb.upperBound...].firstIndex(of: "]") else { continue }
+                encodings.append(line[lb.upperBound..<rb].split(separator: ",").compactMap { UInt8($0.dropFirst(2), radix: 16) })
+            }
+            if r.stderr.contains("error") || encodings.count != 2 * waiting.count {
+                failures.append("waiting x87 forms: llvm-mc gave \(encodings.count) encodings for \(waiting.count) lines: \(r.stderr.prefix(300))")
+            } else {
+                for (k, o) in waiting.enumerated() {
+                    let theirs = encodings[2 * k] + encodings[2 * k + 1]
+                    if encodings[2 * k] != [0x9B] || o.bytes != theirs {
+                        failures.append("encoding: \(o.text) ours=[\(o.bytes.map(hex) ?? "rejected")] llvm=[\(hex(theirs))]")
+                    } else {
+                        checked += 1
+                    }
+                }
             }
         }
 

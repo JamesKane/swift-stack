@@ -2,7 +2,7 @@
 //
 // Table-driven x86-64 instruction encoder and disassembler (04-backend.md §4.9, 05-assembler.md §4.6).
 // Covers legacy prefixes, REX, 2-byte (C5) and 3-byte (C4) VEX, ModR/M, SIB,
-// opcode maps (primary, 0F, 0F 38, 0F 3A), GPR, system/privileged, SSE, and AVX instructions.
+// opcode maps (primary, 0F, 0F 38, 0F 3A), GPR, system/privileged, x87, SSE, and AVX instructions.
 //
 // Layering rule: Encode/ MUST NOT reference Parse/, Sem/, AIR/, Opt/, LIR/, Codegen/, Object/, Asm/, or Linker/.
 
@@ -24,6 +24,7 @@ public enum X86RegClass: UInt8, BitwiseCopyable, Sendable, Equatable, Hashable {
     case seg        = 8 // es=0, cs=1, ss=2, ds=3, fs=4, gs=5
     case cr         = 9 // cr0..cr15
     case dr         = 10 // dr0..dr15
+    case x87        = 11 // x87 register stack %st(0)..%st(7), and %st (the stack top)
 }
 
 /// Explicit or inferred operand size in bytes.
@@ -129,6 +130,12 @@ public enum X86Reg: UInt8, BitwiseCopyable, Sendable, CaseIterable, Equatable, H
     case dr0 = 144, dr1 = 145, dr2 = 146, dr3 = 147, dr4 = 148, dr5 = 149, dr6 = 150, dr7 = 151
     case dr8 = 152, dr9 = 153, dr10 = 154, dr11 = 155, dr12 = 156, dr13 = 157, dr14 = 158, dr15 = 159
 
+    // x87 register stack (160..167 -> %st(0)..%st(7)), and `%st` (168), the stack top ST(0) as AT&T syntax
+    // spells an implicit operand (`fadd %st(1), %st`). `%st` and `%st(0)` are the same register and are
+    // interchangeable in input; the disassembler prints `%st` only for the implicit operand, as LLVM MC does.
+    case st0 = 160, st1 = 161, st2 = 162, st3 = 163, st4 = 164, st5 = 165, st6 = 166, st7 = 167
+    case st = 168
+
     /// The register's size / functional class.
     @inlinable
     public var regClass: X86RegClass {
@@ -143,6 +150,7 @@ public enum X86Reg: UInt8, BitwiseCopyable, Sendable, CaseIterable, Equatable, H
         if r >= 96 && r < 112 { return .ymm }
         if r >= 112 && r < 118 { return .seg }
         if r >= 128 && r < 144 { return .cr }
+        if r >= 160 && r <= 168 { return .x87 }
         return .dr
     }
 
@@ -157,6 +165,7 @@ public enum X86Reg: UInt8, BitwiseCopyable, Sendable, CaseIterable, Equatable, H
         if r >= 96 && r < 112 { return r - 96 }
         if r >= 112 && r < 118 { return r - 112 }
         if r >= 128 && r < 144 { return r - 128 }
+        if r >= 160 && r <= 168 { return r == 168 ? 0 : r - 160 }
         return r - 144
     }
 
@@ -195,6 +204,7 @@ public enum X86Reg: UInt8, BitwiseCopyable, Sendable, CaseIterable, Equatable, H
         case .gpr64, .rip, .cr, .dr: return .qword
         case .xmm:             return .xmm128
         case .ymm:             return .ymm256
+        case .x87:             return .unsized
         }
     }
 
@@ -284,6 +294,18 @@ public enum X86Reg: UInt8, BitwiseCopyable, Sendable, CaseIterable, Equatable, H
         X86Reg(rawValue: 144 + (hw & 0x0F))!
     }
 
+    /// x87 stack register `%st(i)`.
+    @inlinable
+    public static func st(_ i: UInt8) -> X86Reg {
+        X86Reg(rawValue: 160 + (i & 0x07))!
+    }
+
+    /// True for the x87 stack top ST(0), spelled `%st` or `%st(0)`.
+    @inlinable
+    public var isX87StackTop: Bool {
+        self == .st || self == .st0
+    }
+
     /// Bare register name without leading `%`.
     public var name: String {
         switch self {
@@ -332,6 +354,10 @@ public enum X86Reg: UInt8, BitwiseCopyable, Sendable, CaseIterable, Equatable, H
         case .dr4: return "dr4"; case .dr5: return "dr5"; case .dr6: return "dr6"; case .dr7: return "dr7"
         case .dr8: return "dr8"; case .dr9: return "dr9"; case .dr10: return "dr10"; case .dr11: return "dr11"
         case .dr12: return "dr12"; case .dr13: return "dr13"; case .dr14: return "dr14"; case .dr15: return "dr15"
+
+        case .st0: return "st(0)"; case .st1: return "st(1)"; case .st2: return "st(2)"; case .st3: return "st(3)"
+        case .st4: return "st(4)"; case .st5: return "st(5)"; case .st6: return "st(6)"; case .st7: return "st(7)"
+        case .st: return "st"
         }
     }
 
@@ -447,7 +473,8 @@ public struct X86Mem: Sendable, Equatable, Hashable, CustomStringConvertible {
                 result += b.attName
             }
             if let idx = index {
-                result += ",\(idx.attName),\(scale)"
+                // LLVM MC omits a scale of 1: `(%rax,%rbx)`.
+                result += scale == 1 ? ",\(idx.attName)" : ",\(idx.attName),\(scale)"
             }
             result += ")"
         }
@@ -655,6 +682,10 @@ public enum X86MandatoryPrefix: UInt8, BitwiseCopyable, Sendable, Equatable, Has
     case pF2  = 3 // 0xF2, VEX pp = 3
     case p66F2 = 4 // 0x66 + 0xF2 (used by crc32w)
     case p67   = 5 // 0x67 address-size prefix that selects the instruction (`jecxz`); legacy only
+    /// `wait` (0x9B) ahead of the instruction: the waiting x87 control forms (`fstcw` = `wait; fnstcw`, `fstsw`,
+    /// `fclex`, `finit`, `fstenv`, `fsave`). LLVM MC emits them as two instructions and decodes 0x9B as `wait` on
+    /// its own, so the disassembler never matches these descriptors; it decodes `wait` and then the `fn...` form.
+    case p9B   = 6
 
     @inlinable
     public var vexPP: UInt8 {
@@ -765,6 +796,13 @@ public enum X86OperandFormat: Sendable, Equatable, Hashable {
     case ioAccToDx
     case ioImmToAcc
     case ioAccToImm
+    /// x87 register forms. The stack register `%st(i)` is in `ModRM.rm` with `mod = 3` and `/digit` in `ModRM.reg`.
+    /// 1 operand `%st(i)` (`fld %st(i)` D9 C0+i, `fxch`, `fucom`, `ffree`).
+    case x87Reg
+    /// 2 operands `%st(i), %st`: ST(0) is the destination (`fadd %st(i), %st` D8 C0+i, `fucomi`, `fcmovb`).
+    case x87RegToSt0
+    /// 2 operands `%st, %st(i)`: ST(i) is the destination (`fadd %st, %st(i)` DC C0+i, `faddp` DE C0+i).
+    case x87St0ToReg
 }
 
 /// Implicit operand of a string instruction, as AT&T syntax spells it.
@@ -2260,6 +2298,107 @@ public enum X86InstructionTable {
         }
         sse("sha256rnds2", .map0F38, .none, 0xCB, .xmm0RmToReg(rmClass: X, regClass: X))
 
+        // -----------------------------------------------------------------
+        // 4.9 x87 floating point (the subset `long double` code needs, and the rest of the D8..DF space)
+        // -----------------------------------------------------------------
+        // AT&T spells the memory operand size in the mnemonic: `s` (32-bit float, 16-bit integer), `l` (64-bit
+        // float, 32-bit integer), `t` (80-bit extended), `ll`/`q` (64-bit integer). These are separate mnemonics,
+        // not `X86OperandSize` suffixes: every x87 descriptor is unsized. Register forms are `D8+n /digit` with
+        // `mod = 3` and the stack register in `ModRM.rm`. As in LLVM MC and GNU `as` (the SysV "fsub bug"), the
+        // `%st, %st(i)` forms of `fsub`/`fsubr`/`fdiv`/`fdivr` and the popping forms `fsubp`/`fsubrp`/`fdivp`/`fdivrp`
+        // use the opposite Intel opcode: `fsubp %st, %st(1)` is DE E1 (Intel FSUBRP). Shorthand operand forms
+        // (`fxch`, `faddp`, `fadd`, `fucomi %st(2)`, `fnstsw`) are expanded by the encoder (`expandX87Shorthand`).
+        func x87Mem(_ name: String, _ op: UInt8, _ slash: UInt8, aliases: [String] = [], wait: Bool = false) {
+            list.append(X86InstrDesc(mnemonic: name, aliases: aliases, mandatoryPrefix: wait ? .p9B : .none, opcode: op, modrmSlash: slash, operandFormat: .rm(.memOnly)))
+        }
+        func x87(_ name: String, _ op: UInt8, _ slash: UInt8, _ format: X86OperandFormat, aliases: [String] = []) {
+            list.append(X86InstrDesc(mnemonic: name, aliases: aliases, opcode: op, modrmSlash: slash, operandFormat: format))
+        }
+        func x87Implied(_ name: String, _ op: UInt8, _ second: UInt8, wait: Bool = false) {
+            list.append(X86InstrDesc(mnemonic: name, mandatoryPrefix: wait ? .p9B : .none, opcode: op, secondaryOpcode: second, operandFormat: .implied))
+        }
+
+        // Loads and stores
+        x87Mem("flds", 0xD9, 0); x87Mem("fldl", 0xDD, 0); x87Mem("fldt", 0xDB, 5)
+        x87("fld", 0xD9, 0, .x87Reg)
+        x87Mem("fsts", 0xD9, 2); x87Mem("fstl", 0xDD, 2)
+        x87("fst", 0xDD, 2, .x87Reg)
+        x87Mem("fstps", 0xD9, 3); x87Mem("fstpl", 0xDD, 3); x87Mem("fstpt", 0xDB, 7)
+        x87("fstp", 0xDD, 3, .x87Reg)
+        x87Mem("filds", 0xDF, 0); x87Mem("fildl", 0xDB, 0); x87Mem("fildll", 0xDF, 5, aliases: ["fildq"])
+        x87Mem("fists", 0xDF, 2); x87Mem("fistl", 0xDB, 2)
+        x87Mem("fistps", 0xDF, 3); x87Mem("fistpl", 0xDB, 3); x87Mem("fistpll", 0xDF, 7, aliases: ["fistpq"])
+        x87Mem("fisttps", 0xDF, 1); x87Mem("fisttpl", 0xDB, 1); x87Mem("fisttpll", 0xDD, 1, aliases: ["fisttpq"])
+        x87("fxch", 0xD9, 1, .x87Reg)
+        x87("ffree", 0xDD, 0, .x87Reg)
+        x87("ffreep", 0xDF, 0, .x87Reg)
+
+        // Constants (D9 E8..EE)
+        for (name, second) in [("fld1", UInt8(0xE8)), ("fldl2t", 0xE9), ("fldl2e", 0xEA), ("fldpi", 0xEB), ("fldlg2", 0xEC), ("fldln2", 0xED), ("fldz", 0xEE)] {
+            x87Implied(name, 0xD9, second)
+        }
+
+        // Arithmetic: `s`/`l` memory (D8 / DC), `%st(i), %st` (D8), `%st, %st(i)` (DC), popping `%st, %st(i)` (DE),
+        // and the integer memory forms (DE 16-bit, DA 32-bit). `%st(i), %st` comes first: `fadd %st, %st(0)` is D8 C0.
+        for (name, slash) in [("add", UInt8(0)), ("mul", 1), ("sub", 4), ("subr", 5), ("div", 6), ("divr", 7)] {
+            x87Mem("f\(name)s", 0xD8, slash); x87Mem("f\(name)l", 0xDC, slash)
+            x87("f\(name)", 0xD8, slash, .x87RegToSt0)
+            x87("f\(name)", 0xDC, slash, .x87St0ToReg)
+            x87("f\(name)p", 0xDE, slash, .x87St0ToReg)
+            x87Mem("fi\(name)s", 0xDE, slash); x87Mem("fi\(name)l", 0xDA, slash)
+        }
+
+        // Compares
+        for (name, slash) in [("fcom", UInt8(2)), ("fcomp", 3)] {
+            x87Mem(name + "s", 0xD8, slash); x87Mem(name + "l", 0xDC, slash)
+            x87(name, 0xD8, slash, .x87Reg)
+            let integer = "fi" + String(name.dropFirst())
+            x87Mem(integer + "s", 0xDE, slash); x87Mem(integer + "l", 0xDA, slash)
+        }
+        x87Implied("fcompp", 0xDE, 0xD9)
+        x87("fucom", 0xDD, 4, .x87Reg)
+        x87("fucomp", 0xDD, 5, .x87Reg)
+        x87Implied("fucompp", 0xDA, 0xE9)
+        x87("fcomi", 0xDB, 6, .x87RegToSt0)
+        x87("fucomi", 0xDB, 5, .x87RegToSt0)
+        x87("fcompi", 0xDF, 6, .x87RegToSt0, aliases: ["fcomip"])
+        x87("fucompi", 0xDF, 5, .x87RegToSt0, aliases: ["fucomip"])
+        x87Implied("ftst", 0xD9, 0xE4)
+        x87Implied("fxam", 0xD9, 0xE5)
+
+        // Conditional moves (DA: b, e, be, u; DB: the negations), with LLVM MC's alias spellings.
+        for (name, op, slash, aliases) in [("fcmovb", UInt8(0xDA), UInt8(0), ["fcmovnae"]), ("fcmove", 0xDA, 1, ["fcmovz"]),
+                                           ("fcmovbe", 0xDA, 2, ["fcmovna"]), ("fcmovu", 0xDA, 3, []),
+                                           ("fcmovnb", 0xDB, 0, ["fcmovae"]), ("fcmovne", 0xDB, 1, []),
+                                           ("fcmovnbe", 0xDB, 2, ["fcmova"]), ("fcmovnu", 0xDB, 3, [])] {
+            x87(name, op, slash, .x87RegToSt0, aliases: aliases)
+        }
+
+        // Operations on the stack top (D9 E0..FF)
+        for (name, second) in [("fchs", UInt8(0xE0)), ("fabs", 0xE1), ("f2xm1", 0xF0), ("fyl2x", 0xF1), ("fptan", 0xF2),
+                               ("fpatan", 0xF3), ("fxtract", 0xF4), ("fprem1", 0xF5), ("fdecstp", 0xF6), ("fincstp", 0xF7),
+                               ("fprem", 0xF8), ("fyl2xp1", 0xF9), ("fsqrt", 0xFA), ("fsincos", 0xFB), ("frndint", 0xFC),
+                               ("fscale", 0xFD), ("fsin", 0xFE), ("fcos", 0xFF), ("fnop", 0xD0)] {
+            x87Implied(name, 0xD9, second)
+        }
+
+        // Control: the non-waiting `fn...` forms, then the waiting forms (`wait` + the `fn...` form).
+        list.append(X86InstrDesc(mnemonic: "wait", aliases: ["fwait"], opcode: 0x9B, operandFormat: .implied))
+        x87Mem("fldcw", 0xD9, 5, aliases: ["fldcww"])
+        x87Mem("fldenv", 0xD9, 4)
+        x87Mem("frstor", 0xDD, 4)
+        for wait in [false, true] {
+            let n = wait ? "f" : "fn"
+            x87Mem(n + "stcw", 0xD9, 7, aliases: [n + "stcww"], wait: wait)
+            x87Mem(n + "stenv", 0xD9, 6, wait: wait)
+            x87Mem(n + "save", 0xDD, 6, wait: wait)
+            x87Mem(n + "stsw", 0xDD, 7, aliases: [n + "stsww"], wait: wait)
+            list.append(X86InstrDesc(mnemonic: n + "stsw", aliases: [n + "stsww"], mandatoryPrefix: wait ? .p9B : .none, opcode: 0xDF,
+                                     secondaryOpcode: 0xE0, operandFormat: .fixedReg(.ax)))
+            x87Implied(n + "clex", 0xDB, 0xE2, wait: wait)
+            x87Implied(n + "init", 0xDB, 0xE3, wait: wait)
+        }
+
         return list
     }
 }
@@ -2318,7 +2457,53 @@ public struct X86TableEncoder: Sendable {
 
         // Expand SSE/AVX compare-predicate pseudo-ops (`cmpltps`, `vcmpeq_uqpd`) into `$imm8` form
         expandComparePredicate(&inst)
+        expandX87Shorthand(&inst)
         return inst
+    }
+
+    /// x87 register-form mnemonics whose operands LLVM MC lets the source abbreviate.
+    private static let x87ImplicitSt1: Set<String> = ["fxch", "fcom", "fcomp", "fucom", "fucomp"]
+    private static let x87CompareToSt0: Set<String> = ["fcomi", "fucomi", "fcompi", "fucompi", "fcomip", "fucomip"]
+    private static let x87Arithmetic: Set<String> = ["fadd", "fsub", "fsubr", "fmul", "fdiv", "fdivr"]
+    private static let x87PoppingArithmetic: Set<String> = ["faddp", "fsubp", "fsubrp", "fmulp", "fdivp", "fdivrp"]
+
+    /// Expands the abbreviated x87 operand forms LLVM MC accepts into the table forms:
+    /// - `fxch`, `fcom`, `fcomp`, `fucom`, `fucomp` alone mean `%st(1)`;
+    /// - `fcomi` & co. alone mean `%st(1), %st`, and `fcomi %st(i)` means `%st(i), %st`;
+    /// - `fadd` & co. alone mean `faddp %st, %st(1)` (the popping form), and `fadd %st(i)` means `%st(i), %st`;
+    /// - `faddp` & co. alone mean `%st, %st(1)`; `faddp %st(i)` and `faddp %st(i), %st` mean `%st, %st(i)`;
+    /// - `fnstsw` and `fstsw` (also spelled `fnstsww`, `fstsww`) alone mean `%ax`.
+    private static func expandX87Shorthand(_ inst: inout X86Instruction) {
+        let m = inst.mnemonic
+        guard m.hasPrefix("f") else { return }
+        let ops = inst.operands
+        func isStack(_ op: X86Operand) -> Bool {
+            if case .reg(let r) = op { return r.regClass == .x87 }
+            return false
+        }
+        func isTop(_ op: X86Operand) -> Bool {
+            if case .reg(let r) = op { return r.isX87StackTop }
+            return false
+        }
+        if x87ImplicitSt1.contains(m) {
+            if ops.isEmpty { inst.operands = [.reg(.st1)] }
+        } else if x87CompareToSt0.contains(m) {
+            if ops.isEmpty { inst.operands = [.reg(.st1), .reg(.st)] }
+            else if ops.count == 1, isStack(ops[0]) { inst.operands = [ops[0], .reg(.st)] }
+        } else if x87Arithmetic.contains(m) {
+            if ops.isEmpty {
+                inst.mnemonic = m + "p"
+                inst.operands = [.reg(.st), .reg(.st1)]
+            } else if ops.count == 1, isStack(ops[0]) {
+                inst.operands = [ops[0], .reg(.st)]
+            }
+        } else if x87PoppingArithmetic.contains(m) {
+            if ops.isEmpty { inst.operands = [.reg(.st), .reg(.st1)] }
+            else if ops.count == 1, isStack(ops[0]) { inst.operands = [.reg(.st), ops[0]] }
+            else if ops.count == 2, isStack(ops[0]), !isTop(ops[0]), isTop(ops[1]) { inst.operands = [ops[1], ops[0]] }
+        } else if m == "fnstsw" || m == "fstsw" || m == "fnstsww" || m == "fstsww" {
+            if ops.isEmpty { inst.operands = [.reg(.ax)] }
+        }
     }
 
     /// Tries candidate descriptors in table order and returns the first encoding. A VEX encoding that needs
@@ -3077,6 +3262,16 @@ public struct X86TableEncoder: Sendable {
             let expAcc: X86Reg = desc.operandSize == .byte ? .al : (desc.operandSize == .word ? .ax : .eax)
             guard acc == expAcc else { return nil }
             guard encodeImm(ops[1], immSize: .byte, signExtendedTo: .byte) else { return nil }
+
+        case .x87Reg, .x87RegToSt0, .x87St0ToReg:
+            // `%st(i)` (any stack register, `%st` included) and, for the 2-operand forms, the stack top.
+            let (stackIndex, topIndex): (Int, Int?) = desc.operandFormat == .x87Reg ? (0, nil) : (desc.operandFormat == .x87RegToSt0 ? (0, 1) : (1, 0))
+            guard ops.count == (topIndex == nil ? 1 : 2), case .reg(let sti) = ops[stackIndex], sti.regClass == .x87 else { return nil }
+            if let t = topIndex {
+                guard case .reg(let top) = ops[t], top.isX87StackTop else { return nil }
+            }
+            hasModRM = true
+            modrmByte = 0xC0 | ((desc.modrmSlash ?? 0) << 3) | sti.low3
         }
 
         // Assemble final instruction bytes
@@ -3085,6 +3280,7 @@ public struct X86TableEncoder: Sendable {
 
         // 1. Legacy prefixes in LLVM MC / GNU `as` order: rep, segment, address size, operand size, lock. A string
         //    instruction has the address size before the segment, as LLVM MC emits it.
+        if desc.mandatoryPrefix == .p9B { out.append(0x9B) } // `wait`, a separate instruction ahead of all prefixes
         if inst.repPrefix != .none { out.append(inst.repPrefix.rawValue) }
         if case .stringOp = desc.operandFormat {
             if addressSizeOverride { out.append(0x67) }
@@ -3137,6 +3333,7 @@ public struct X86TableEncoder: Sendable {
             case .pF2:   out.append(0xF2)
             case .p66F2: out.append(0x66); out.append(0xF2)
             case .p67:   out.append(0x67)
+            case .p9B:   break // emitted first, above
             }
 
             // REX prefix (in 64-bit mode)
@@ -3489,6 +3686,9 @@ public struct X86Disassembler: Sendable {
                 guard has66 && !hasF2 && !hasF3 else { return nil }
             case .p67:
                 guard has67 && !hasF2 && !hasF3 else { return nil }
+            case .p9B:
+                // 0x9B decodes as `wait` on its own (LLVM MC); the `fn...` form follows as the next instruction.
+                return nil
             case .none:
                 if case .stringOp = desc.operandFormat {
                     if hasF3 { repPrefix = .rep }
@@ -3909,6 +4109,19 @@ public struct X86Disassembler: Sendable {
             let immVal = try readImm(size: .byte)
             let acc: X86Reg = desc.operandSize == .byte ? .al : (desc.operandSize == .word ? .ax : .eax)
             operands = [.reg(acc), .imm(immVal & 0xFF)]
+
+        case .x87Reg, .x87RegToSt0, .x87St0ToReg:
+            guard cursor < bytes.count else { return nil }
+            let modrm = bytes[cursor]
+            guard modrm >> 6 == 3, (modrm >> 3) & 0x07 == (desc.modrmSlash ?? 0) else { return nil }
+            cursor += 1
+            // LLVM MC prints the stack register as `%st(i)` (also `%st(0)`), and the implicit stack top as `%st`.
+            let sti = X86Operand.reg(.st(modrm & 0x07))
+            switch desc.operandFormat {
+            case .x87Reg:      operands = [sti]
+            case .x87RegToSt0: operands = [sti, .reg(.st)]
+            default:           operands = [.reg(.st), sti]
+            }
         }
 
         // Include explicit size suffix when needed (e.g. memory destination without register operand)
@@ -3944,6 +4157,7 @@ public struct X86Disassembler: Sendable {
         case .seg:      return .seg(hw) ?? .ds
         case .cr:       return .cr(hw)
         case .dr:       return .dr(hw)
+        case .x87:      return .st(hw)
         }
     }
 }
@@ -3974,6 +4188,7 @@ extension X86InstructionTable {
             case .seg:      return .ds
             case .cr:       return .cr3
             case .dr:       return .dr6
+            case .x87:      return .st(index)
             }
         }
 
@@ -4149,6 +4364,15 @@ extension X86InstructionTable {
             case .ioAccToImm:
                 let acc: X86Reg = desc.operandSize == .byte ? .al : (desc.operandSize == .word ? .ax : .eax)
                 ops = [.reg(acc), .imm(0x60)]
+
+            case .x87Reg:
+                ops = [.reg(.st3)]
+
+            case .x87RegToSt0:
+                ops = [.reg(.st3), .reg(.st)]
+
+            case .x87St0ToReg:
+                ops = [.reg(.st), .reg(.st3)]
             }
 
             // Respect register-only / memory-only `r/m` forms.
@@ -4164,6 +4388,15 @@ extension X86InstructionTable {
             }
             let inst = X86Instruction(mnemonic: desc.memMnemonic ?? desc.mnemonic, sizeSuffix: suffix, operands: ops, codeMode: mode)
             let encoded = try encoder.encode(inst)
+            if desc.mandatoryPrefix == .p9B {
+                // Two instructions (`wait`, then the `fn...` form); not a single-instruction sample.
+                let decoded = try disassembler.disassemble(encoded.bytes, codeMode: mode)
+                let reencoded = try decoded.flatMap { try encoder.encode($0).bytes }
+                guard decoded.count == 2, decoded[0].mnemonic == "wait", reencoded == encoded.bytes else {
+                    throw X86CodecError.invalidOperands(mnemonic: desc.mnemonic, operands: ops)
+                }
+                continue
+            }
             let (decoded, len) = try disassembler.disassembleOne(encoded.bytes, at: 0, codeMode: mode)
             let reencoded = try encoder.encode(decoded)
 
@@ -4263,7 +4496,7 @@ extension X86InstrDesc {
         switch mandatoryPrefix {
         case .none, .pF3, .pF2: return true
         case .p66, .p66F2:      return false
-        case .p67:              return true
+        case .p67, .p9B:        return true
         }
     }
 }
